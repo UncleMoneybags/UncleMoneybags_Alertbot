@@ -1,4 +1,5 @@
 import time
+import requests
 from datetime import datetime, timedelta
 from telegram import Bot
 from polygon import RESTClient
@@ -29,26 +30,54 @@ def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
     except Exception as e:
         print("Telegram error:", e)
 
-# === TICKER UNIVERSE ===
-def fetch_low_float_tickers():
-    return ["GME", "TOP", "CVNA", "AI", "SNTG", "TIO"]  # Replace or expand
-
 # === VWAP CALCULATION ===
 def calculate_vwap(candles):
     cumulative_vp = sum(c.v * ((c.h + c.l + c.c) / 3) for c in candles)
     cumulative_vol = sum(c.v for c in candles)
     return cumulative_vp / cumulative_vol if cumulative_vol != 0 else 0
 
+# === DYNAMIC TICKER FETCH ===
+def fetch_tickers_from_exchange():
+    tickers = []
+    url = "https://api.polygon.io/v3/reference/tickers"
+    params = {
+        "market": "stocks",
+        "active": "true",
+        "limit": 1000,
+        "apiKey": POLYGON_API_KEY
+    }
+
+    while True:
+        try:
+            response = requests.get(url, params=params)
+            data = response.json()
+            for t in data["results"]:
+                if (
+                    t.get("primary_exchange") in ["XNAS", "XNYS"]
+                    and t.get("type") == "CS"
+                    and t.get("currency_name") == "USD"
+                ):
+                    tickers.append(t["ticker"])
+            if "next_url" in data:
+                url = f"https://api.polygon.io{data['next_url']}&apiKey={POLYGON_API_KEY}"
+                params = None  # Already in URL
+            else:
+                break
+        except Exception as e:
+            print("Error fetching tickers:", e)
+            break
+    return tickers
+
 # === MAIN SCANNER ===
 def scan_stocks():
-    tickers = fetch_low_float_tickers()
+    tickers = fetch_tickers_from_exchange()
     now_utc = datetime.utcnow()
     start_time = (now_utc - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_time = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for symbol in tickers:
         try:
-            # 1-minute candles (last 30 mins)
+            # Get 1-min candles (30-minute window)
             candles = list(client.get_aggs(
                 symbol=symbol,
                 multiplier=1,
@@ -60,14 +89,13 @@ def scan_stocks():
             if len(candles) < 5:
                 continue
 
-            # Yesterday's daily volume
+            # Daily volume for relative volume
             daily = client.get_aggs(symbol, 1, "day", limit=2)
             if not daily or len(daily) < 2:
                 continue
             avg_vol = daily[-2].v
 
-            # Float rotation & relative volume
-            float_shares = 5_000_000  # Replace w/ dynamic lookup if needed
+            float_shares = 5_000_000  # You can upgrade this with float scraping later
             total_vol = sum(c.v for c in candles)
             float_rotation = total_vol / float_shares
             rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
@@ -75,8 +103,7 @@ def scan_stocks():
             vwap = calculate_vwap(candles)
             above_vwap = price > vwap
 
-            # Cooldown + Alert logic
-            cooldown = 300  # 5 min
+            cooldown = 300
             now_ts = time.time()
 
             if (
@@ -96,5 +123,3 @@ if __name__ == "__main__":
         except Exception as e:
             print("Scanner error:", e)
         time.sleep(60)
-
-    
