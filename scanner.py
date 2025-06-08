@@ -100,7 +100,7 @@ def check_volume_spikes(tickers):
                 limit=30,
                 adjusted=True
             )
-            candles = list(aggs)candles = list(aggs)
+            candles = list(aggs)
             if len(candles) < 5:
                 continue
 
