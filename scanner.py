@@ -150,6 +150,6 @@ if __name__ == "__main__":
             print("Test alert failed:", e)
 
     # Uncomment this line to run the test once:
-    send_test_alert()
+    # send_test_alert()
 
     run_scanner()
