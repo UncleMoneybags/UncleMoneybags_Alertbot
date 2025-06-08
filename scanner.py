@@ -137,4 +137,19 @@ def run_scanner():
         time.sleep(60)
 
 if __name__ == "__main__":
+    # === TEST ALERT ===
+    def send_test_alert():
+        try:
+            bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text="🚨 TEST ALERT: Uncle Moneybags is watching. The tape better wake up.",
+                parse_mode="HTML"
+            )
+            print("✅ Test alert sent.")
+        except Exception as e:
+            print("Test alert failed:", e)
+
+    # Uncomment this line to run the test once:
+    send_test_alert()
+
     run_scanner()
