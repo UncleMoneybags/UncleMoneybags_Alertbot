@@ -3,6 +3,7 @@ import requests
 from datetime import datetime, timedelta
 from telegram import Bot
 from polygon import RESTClient  # Requires: pip install polygon-api-client
+import random
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
@@ -71,6 +72,50 @@ def fetch_all_tickers():
         print("Error fetching tickers:", e)
         return ["GME", "CVNA", "AI", "NVDA"]
 
+# === SEC OFFERING SCAN ===
+def check_for_dilution(symbol):
+    try:
+        url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={symbol}&type=&output=atom"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers)
+        if any(term in r.text.lower() for term in ["s-1", "424b5", "at-the-market", "offering"]):
+            bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"🚨 DILUTION THREAT DETECTED: ${symbol}\n\n💀 SEC filing suggests offering/shelf risk. Prepare for dump.",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        print(f"Dilution check failed for {symbol}:", e)
+
+# === SYMPATHY LOGIC ===
+sympathy_map = {
+    "GME": ["AMC", "BBBY", "KOSS"],
+    "NVDA": ["AMD", "SMCI", "ARM"],
+    "TSLA": ["RIVN", "LCID", "NIO"],
+    "AI": ["BBAI", "SOUN", "CXAI"]
+}
+
+def alert_sympathy_runners(symbol):
+    peers = sympathy_map.get(symbol, [])
+    for peer in peers:
+        try:
+            candles = list(client.get_aggs(peer, 1, "minute", limit=10))
+            if not candles:
+                continue
+            avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
+            total_vol = sum(c.v for c in candles)
+            rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
+            float_shares = get_float_from_polygon(peer)
+            float_rotation = total_vol / float_shares
+            price = candles[-1].c
+            vwap = calculate_vwap(candles)
+            above_vwap = price > vwap
+
+            if float_rotation > 0.5 and rel_vol > 1.5 and above_vwap:
+                send_telegram_alert(peer, float_rotation, rel_vol, above_vwap)
+        except Exception as e:
+            print(f"Error scanning sympathy {peer}:", e)
+
 # === SCAN LOGIC ===
 def check_volume_spikes(tickers):
     global last_message_time
@@ -108,6 +153,8 @@ def check_volume_spikes(tickers):
                 and float_rotation >= 1.0 and rel_vol >= 2.5 and above_vwap
             ):
                 send_telegram_alert(symbol, float_rotation, rel_vol, above_vwap)
+                alert_sympathy_runners(symbol)
+                check_for_dilution(symbol)
                 last_alert_time[symbol] = now_ts
                 last_message_time = now_ts
         except Exception as e:
