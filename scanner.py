@@ -1,4 +1,4 @@
-import time
+mport time
 import requests
 from datetime import datetime, timedelta
 from telegram import Bot
@@ -117,7 +117,8 @@ def check_volume_spikes(tickers):
 def maybe_send_roast():
     global last_message_time
     now = time.time()
-    if now - last_message_time >= 1200:  # 20 min
+    today = datetime.now().weekday()
+    if today < 5 and now - last_message_time >= 1200:  # Weekdays only, every 20 min
         roast = random.choice(roast_lines)
         try:
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=roast)
@@ -125,7 +126,6 @@ def maybe_send_roast():
         except Exception as e:
             print("Roast send failed:", e)
 
-# === SATURDAY ROAST ===
 def saturday_check():
     now = datetime.now()
     if now.weekday() == 5 and now.hour == 12 and now.minute == 0:
