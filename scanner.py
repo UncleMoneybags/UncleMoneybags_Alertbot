@@ -24,7 +24,7 @@ roast_lines = [
     "📪 Tape's so empty, I thought it was Sunday."
 ]
 
-saturday_roast = "😈 It’s Saturday and the poors are out looking for stock tips like it’s buried treasure. Meanwhile, I’m in silk pajamas rebalancing my gains."
+saturday_roast = "😈 It’s Saturday and the poors are out looking for stock tips but all they need is my Stock Guide For The Poors."
 
 # === ALERT FUNCTION ===
 def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
