@@ -1,5 +1,4 @@
 import time
-import requests
 from datetime import datetime, timedelta
 from telegram import Bot
 from polygon import RESTClient
@@ -10,11 +9,9 @@ TELEGRAM_CHAT_ID = "-1002266463234"
 POLYGON_API_KEY = "0rQmpovH_B6UJU14D5HP3fIrj8F_rrDd"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 client = RESTClient(api_key=POLYGON_API_KEY)
-
-# === COOLDOWN TRACKER ===
 last_alert_time = {}
 
-# === ALERT FUNCTION ===
+# === ALERT FORMAT ===
 def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
     message = f"""
 🚨 TARGET ACQUIRED: ${symbol}
@@ -33,10 +30,15 @@ def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
 
 # === TICKERS TO SCAN ===
 def fetch_low_float_tickers():
-    # Replace with dynamic ticker list later if needed
     return ["GME", "TOP", "CVNA", "AI", "SNTG", "TIO"]
 
-# === SCANNER CORE ===
+# === VWAP CALCULATION ===
+def calculate_vwap(candles):
+    cumulative_vp = sum(c.v * ((c.h + c.l + c.c) / 3) for c in candles)
+    cumulative_vol = sum(c.v for c in candles)
+    return cumulative_vp / cumulative_vol if cumulative_vol != 0 else 0
+
+# === MAIN SCANNER ===
 def scan_stocks():
     tickers = fetch_low_float_tickers()
     now_utc = datetime.utcnow()
@@ -45,28 +47,27 @@ def scan_stocks():
 
     for symbol in tickers:
         try:
-            aggs = client.get_aggs(
+            candles = list(client.get_aggs(
                 symbol=symbol,
                 multiplier=1,
                 timespan="minute",
                 from_=start_time,
                 to=end_time,
                 limit=30
-            )
-            candles = list(aggs)
+            ))
             if len(candles) < 5:
                 continue
 
-            float_shares = 5_000_000  # Placeholder, replace with real float if needed
+            float_shares = 5_000_000  # Replace with dynamic float later
             total_vol = sum(c.v for c in candles)
             avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
             rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
             float_rotation = total_vol / float_shares
             price = candles[-1].c
-            vwap = sum(c.v * ((c.h + c.l + c.c) / 3) for c in candles) / total_vol
+            vwap = calculate_vwap(candles)
             above_vwap = price > vwap
 
-            cooldown = 300  # 5 minutes
+            cooldown = 300  # 5 min
             now_ts = time.time()
 
             if (
@@ -78,7 +79,10 @@ def scan_stocks():
         except Exception as e:
             print(f"Error scanning {symbol}:", e)
 
-# === MAIN LOOP ===
-while True:
-    scan_stocks()
-    time.sleep(60)
+# === LOOP ===
+if __name__ == "__main__":
+    while True:
+        scan_stocks()
+        time.sleep(60)
+
+    
