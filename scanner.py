@@ -108,11 +108,11 @@ def alert_sympathy_runners(symbol):
             end_time = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
             candles = client.get_aggs(
-                ticker=peer,
-                multiplier=1,
-                timespan="minute",
-                from_=start_time,
-                to=end_time,
+                peer,
+                1,
+                "minute",
+                start_time,
+                end_time,
                 limit=10
             )
             if not candles:
@@ -143,11 +143,11 @@ def check_volume_spikes(tickers):
     for symbol in tickers:
         try:
             candles = client.get_aggs(
-                ticker=symbol,
-                multiplier=1,
-                timespan="minute",
-                from_=start_time,
-                to=end_time,
+                symbol,
+                1,
+                "minute",
+                start_time,
+                end_time,
                 limit=30
             )
             if len(candles) < 5:
