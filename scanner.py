@@ -1,4 +1,4 @@
-mport time
+import time
 import requests
 from datetime import datetime, timedelta
 from telegram import Bot
