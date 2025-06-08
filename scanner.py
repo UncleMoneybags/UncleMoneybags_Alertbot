@@ -7,6 +7,7 @@ from polygon import RESTClient
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 POLYGON_API_KEY = "0rQmpovH_B6UJU14D5HP3fIrj8F_rrDd"
+
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 client = RESTClient(api_key=POLYGON_API_KEY)
 last_alert_time = {}
@@ -28,9 +29,9 @@ def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
     except Exception as e:
         print("Telegram error:", e)
 
-# === TICKERS TO SCAN ===
+# === TICKER UNIVERSE ===
 def fetch_low_float_tickers():
-    return ["GME", "TOP", "CVNA", "AI", "SNTG", "TIO"]
+    return ["GME", "TOP", "CVNA", "AI", "SNTG", "TIO"]  # Replace or expand
 
 # === VWAP CALCULATION ===
 def calculate_vwap(candles):
@@ -47,6 +48,7 @@ def scan_stocks():
 
     for symbol in tickers:
         try:
+            # 1-minute candles (last 30 mins)
             candles = list(client.get_aggs(
                 symbol=symbol,
                 multiplier=1,
@@ -58,15 +60,22 @@ def scan_stocks():
             if len(candles) < 5:
                 continue
 
-            float_shares = 5_000_000  # Replace with dynamic float later
+            # Yesterday's daily volume
+            daily = client.get_aggs(symbol, 1, "day", limit=2)
+            if not daily or len(daily) < 2:
+                continue
+            avg_vol = daily[-2].v
+
+            # Float rotation & relative volume
+            float_shares = 5_000_000  # Replace w/ dynamic lookup if needed
             total_vol = sum(c.v for c in candles)
-            avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
-            rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
             float_rotation = total_vol / float_shares
+            rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
             price = candles[-1].c
             vwap = calculate_vwap(candles)
             above_vwap = price > vwap
 
+            # Cooldown + Alert logic
             cooldown = 300  # 5 min
             now_ts = time.time()
 
@@ -79,10 +88,13 @@ def scan_stocks():
         except Exception as e:
             print(f"Error scanning {symbol}:", e)
 
-# === LOOP ===
+# === EXECUTION LOOP ===
 if __name__ == "__main__":
     while True:
-        scan_stocks()
+        try:
+            scan_stocks()
+        except Exception as e:
+            print("Scanner error:", e)
         time.sleep(60)
 
     
