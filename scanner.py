@@ -69,6 +69,8 @@ def fetch_all_tickers():
         url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
         r = requests.get(url)
         data = r.json()
+        if "results" not in data:
+            raise ValueError("No results key in Polygon response")
         return [item["ticker"] for item in data["results"] if item["primary_exchange"] in ["XNYS", "XNAS"]]
     except Exception as e:
         print("Error fetching tickers:", e)
@@ -101,7 +103,18 @@ def alert_sympathy_runners(symbol):
     peers = sympathy_map.get(symbol, [])
     for peer in peers:
         try:
-            candles = list(client.get_aggs(peer, 1, "minute", limit=10))
+            now_utc = datetime.utcnow()
+            start_time = (now_utc - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_time = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            candles = client.get_aggs(
+                ticker=peer,
+                multiplier=1,
+                timespan="minute",
+                from_=start_time,
+                to=end_time,
+                limit=10
+            )
             if not candles:
                 continue
             avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
@@ -129,15 +142,14 @@ def check_volume_spikes(tickers):
 
     for symbol in tickers:
         try:
-            aggs = client.get_aggs(
-                symbol=symbol,
+            candles = client.get_aggs(
+                ticker=symbol,
                 multiplier=1,
                 timespan="minute",
                 from_=start_time,
                 to=end_time,
                 limit=30
             )
-            candles = list(aggs)
             if len(candles) < 5:
                 continue
 
