@@ -18,7 +18,7 @@ last_message_time = time.time()
 # === FLOAT LOOKUP ===
 def get_float_from_polygon(symbol, retries=3):
     url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
-    for attempt in range(1, retries+1):
+    for attempt in range(1, retries + 1):
         try:
             r = requests.get(url)
             data = r.json()
@@ -69,22 +69,24 @@ def fetch_all_tickers():
 def check_volume_spikes(tickers):
     global last_message_time
     now_utc = datetime.utcnow()
-    start_time = int((now_utc - timedelta(minutes=30)).timestamp())
-    end_time = int(now_utc.timestamp())
+    # Use milliseconds for Polygon API
+    start_time = int((now_utc - timedelta(minutes=30)).timestamp() * 1000)
+    end_time = int(now_utc.timestamp() * 1000)
     cooldown = 300  # 5 minutes
     now_ts = time.time()
 
     scanned = 0
-    max_scans = 3  # throttle control, reduce to avoid rate limit
+    max_scans = 1  # Reduce this to 1 to avoid rate limit issues
 
     for symbol in tickers:
         if scanned >= max_scans:
             break
 
-        # Added exponential backoff for Polygon rate limit handling
+        # Exponential backoff for Polygon rate limit handling
+        candles = []
         for attempt in range(1, 4):
             try:
-                time.sleep(3)  # increase sleep to reduce API rate
+                time.sleep(10)  # Increase sleep to 10s to avoid API rate limiting
                 candles = client.get_aggs(
                     symbol,
                     1,
