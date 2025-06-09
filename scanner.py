@@ -78,12 +78,13 @@ def check_volume_spikes(tickers):
 
         try:
             time.sleep(1.5)  # throttle to stay within free-tier limits
+            # FIXED: Use from_ and to instead of start and end
             candles = client.get_aggs(
                 symbol,
                 1,
                 "minute",
-                start=start_time,
-                end=end_time,
+                from_=start_time,
+                to=end_time,
                 limit=30
             )
             if len(candles) < 5:
