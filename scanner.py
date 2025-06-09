@@ -140,7 +140,7 @@ def check_volume_spikes(tickers):
     cooldown = 300  # 5 minutes
     now_ts = time.time()
 
-    for symbol in tickers:
+    for symbol in tickers[:50]:  # TEMP THROTTLE FIX: limit to 50 stocks per cycle
         try:
             candles = client.get_aggs(
                 symbol,
@@ -218,22 +218,7 @@ def run_scanner():
             morning_open_countdown()
         except Exception as e:
             print("Main loop error:", e)
-        time.sleep(60)
-
-# === TEST ALERT ===
-def send_test_alert():
-    try:
-        bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text="🚨 TEST ALERT: Uncle Moneybags is watching. The tape better wake up.",
-            parse_mode="HTML"
-        )
-        print("✅ Test alert sent.")
-    except Exception as e:
-        print("Test alert failed:", e)
-
-# Uncomment to send a test
-# send_test_alert()
+        time.sleep(90)  # TEMP THROTTLE FIX
 
 if __name__ == "__main__":
     run_scanner()
