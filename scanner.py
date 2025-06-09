@@ -16,15 +16,20 @@ last_alert_time = {}
 last_message_time = time.time()
 
 # === FLOAT LOOKUP ===
-def get_float_from_polygon(symbol):
-    try:
-        url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
-        r = requests.get(url)
-        data = r.json()
-        return data["results"].get("share_class_shares_outstanding", 5_000_000)
-    except Exception as e:
-        print(f"Float lookup failed for {symbol}:", e)
-        return 5_000_000
+def get_float_from_polygon(symbol, retries=3):
+    url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
+    for attempt in range(1, retries+1):
+        try:
+            r = requests.get(url)
+            data = r.json()
+            return data["results"].get("share_class_shares_outstanding", 5_000_000)
+        except Exception as e:
+            print(f"Float lookup failed for {symbol}, attempt {attempt}: {e}")
+            if hasattr(r, 'text'):
+                print("Polygon response:", r.text)
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+    return 5_000_000
 
 # === VWAP CALCULATION ===
 def calculate_vwap(candles):
@@ -55,7 +60,7 @@ def fetch_all_tickers():
         data = r.json()
         if "results" not in data:
             raise ValueError("No results key in Polygon response")
-        return [item["ticker"] for item in data["results"] if item["primary_exchange"] in ["XNYS", "XNAS"]]
+        return [item["ticker"] for item in data["results"] if item.get("primary_exchange") in ["XNYS", "XNAS"]]
     except Exception as e:
         print("Error fetching tickers:", e)
         return []
@@ -64,62 +69,67 @@ def fetch_all_tickers():
 def check_volume_spikes(tickers):
     global last_message_time
     now_utc = datetime.utcnow()
-    start_time = (now_utc - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_time = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_time = int((now_utc - timedelta(minutes=30)).timestamp())
+    end_time = int(now_utc.timestamp())
     cooldown = 300  # 5 minutes
     now_ts = time.time()
 
     scanned = 0
-    max_scans = 10  # throttle control
+    max_scans = 3  # throttle control, reduce to avoid rate limit
 
     for symbol in tickers:
         if scanned >= max_scans:
             break
 
-        try:
-            time.sleep(1.5)  # throttle to stay within free-tier limits
-            # FIXED: Use from_ and to instead of start and end
-            candles = client.get_aggs(
-                symbol,
-                1,
-                "minute",
-                from_=start_time,
-                to=end_time,
-                limit=30
-            )
-            if len(candles) < 5:
-                continue
+        # Added exponential backoff for Polygon rate limit handling
+        for attempt in range(1, 4):
+            try:
+                time.sleep(3)  # increase sleep to reduce API rate
+                candles = client.get_aggs(
+                    symbol,
+                    1,
+                    "minute",
+                    from_=start_time,
+                    to=end_time,
+                    limit=30
+                )
+                break  # success, exit retry loop
+            except Exception as e:
+                print(f"Error scanning {symbol}, attempt {attempt}: {e}")
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+                else:
+                    candles = []
+        if not candles or len(candles) < 5:
+            continue
 
-            avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
-            if avg_vol < 100000:
-                continue
+        avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
+        if avg_vol < 100000:
+            continue
 
-            total_vol = sum(c.v for c in candles)
-            if total_vol < 500000:
-                continue
+        total_vol = sum(c.v for c in candles)
+        if total_vol < 500000:
+            continue
 
-            rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
-            float_shares = get_float_from_polygon(symbol)
-            if float_shares > 20_000_000:
-                continue
+        rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
+        float_shares = get_float_from_polygon(symbol)
+        if float_shares > 20_000_000:
+            continue
 
-            float_rotation = total_vol / float_shares
-            price = candles[-1].c
-            vwap = calculate_vwap(candles)
-            above_vwap = price > vwap
+        float_rotation = total_vol / float_shares
+        price = candles[-1].c
+        vwap = calculate_vwap(candles)
+        above_vwap = price > vwap
 
-            if (
-                (symbol not in last_alert_time or now_ts - last_alert_time[symbol] > cooldown)
-                and float_rotation >= 1.0 and rel_vol >= 2.5 and above_vwap
-            ):
-                send_telegram_alert(symbol, float_rotation, rel_vol, above_vwap)
-                last_alert_time[symbol] = now_ts
-                last_message_time = now_ts
+        if (
+            (symbol not in last_alert_time or now_ts - last_alert_time[symbol] > cooldown)
+            and float_rotation >= 1.0 and rel_vol >= 2.5 and above_vwap
+        ):
+            send_telegram_alert(symbol, float_rotation, rel_vol, above_vwap)
+            last_alert_time[symbol] = now_ts
+            last_message_time = now_ts
 
-            scanned += 1
-
-        except Exception as e:
-            print(f"Error scanning {symbol}:", e)
+        scanned += 1
 
 # === RUN LOOP ===
 def run_scanner():
