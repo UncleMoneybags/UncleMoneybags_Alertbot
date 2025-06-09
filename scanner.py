@@ -1,6 +1,7 @@
 import time
 import requests
 from datetime import datetime, timedelta
+import pytz
 from telegram import Bot
 from polygon import RESTClient  # Requires: pip install polygon-api-client
 
@@ -11,11 +12,38 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 client = RESTClient(api_key=POLYGON_API_KEY)
 
-# === COOLDOWN TRACKER ===
+EASTERN = pytz.timezone('US/Eastern')
+SCAN_START_HOUR = 4  # 4:00 AM ET
+SCAN_END_HOUR = 20   # 8:00 PM ET
+
 last_alert_time = {}
 last_message_time = time.time()
 
-# === FLOAT LOOKUP ===
+def is_market_hours():
+    now = datetime.now(EASTERN)
+    return now.weekday() < 5 and SCAN_START_HOUR <= now.hour < SCAN_END_HOUR
+
+def sleep_until_market_open():
+    now = datetime.now(EASTERN)
+    if now.hour >= SCAN_END_HOUR or now.weekday() >= 5:
+        # Sleep until next weekday 4am
+        days_ahead = (7 - now.weekday()) % 7
+        if now.hour >= SCAN_END_HOUR or now.weekday() == 4:  # Friday after 8pm or Sat/Sun
+            days_ahead = (7 - now.weekday() + 0) % 7  # Next Monday
+            if days_ahead == 0:
+                days_ahead = 7
+        else:
+            days_ahead = 1
+        next_open = (now + timedelta(days=days_ahead)).replace(hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0)
+    else:
+        # Sleep until 4am today
+        next_open = now.replace(hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0)
+        if now > next_open:
+            next_open += timedelta(days=1)
+    sleep_seconds = (next_open - now).total_seconds()
+    print(f"Sleeping {int(sleep_seconds)} seconds until next market open at {next_open}")
+    time.sleep(sleep_seconds)
+
 def get_float_from_polygon(symbol, retries=3):
     url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
     for attempt in range(1, retries + 1):
@@ -31,13 +59,11 @@ def get_float_from_polygon(symbol, retries=3):
                 time.sleep(2 ** attempt)
     return 5_000_000
 
-# === VWAP CALCULATION ===
 def calculate_vwap(candles):
     cumulative_vp = sum(c.v * ((c.h + c.l + c.c) / 3) for c in candles)
     cumulative_vol = sum(c.v for c in candles)
     return cumulative_vp / cumulative_vol if cumulative_vol != 0 else 0
 
-# === ALERT FUNCTION ===
 def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
     message = f"""
 🚨 VOLUME SPIKE: ${symbol}
@@ -52,7 +78,6 @@ def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
     except Exception as e:
         print("Telegram error:", e)
 
-# === TICKERS TO SCAN ===
 def fetch_all_tickers():
     try:
         url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
@@ -65,7 +90,6 @@ def fetch_all_tickers():
         print("Error fetching tickers:", e)
         return []
 
-# === SCAN LOGIC ===
 def check_volume_spikes(tickers):
     global last_message_time
     now_utc = datetime.utcnow()
@@ -76,17 +100,16 @@ def check_volume_spikes(tickers):
     now_ts = time.time()
 
     scanned = 0
-    max_scans = 1  # Reduce this to 1 to avoid rate limit issues
+    max_scans = 1  # Only scan 1 ticker per loop (slow down for free plan)
 
     for symbol in tickers:
         if scanned >= max_scans:
             break
 
-        # Exponential backoff for Polygon rate limit handling
         candles = []
         for attempt in range(1, 4):
             try:
-                time.sleep(10)  # Increase sleep to 10s to avoid API rate limiting
+                time.sleep(15)  # Slow down to avoid rate limits
                 candles = client.get_aggs(
                     symbol,
                     1,
@@ -97,7 +120,12 @@ def check_volume_spikes(tickers):
                 )
                 break  # success, exit retry loop
             except Exception as e:
-                print(f"Error scanning {symbol}, attempt {attempt}: {e}")
+                err_msg = str(e)
+                if 'NOT_AUTHORIZED' in err_msg or 'Your plan doesn\'t include this data timeframe' in err_msg:
+                    print(f"Skipping {symbol}: {err_msg}")
+                    candles = []
+                    break  # Don't retry if plan doesn't allow it
+                print(f"Error scanning {symbol}, attempt {attempt}: {err_msg}")
                 if attempt < 3:
                     time.sleep(2 ** attempt)
                 else:
@@ -133,15 +161,20 @@ def check_volume_spikes(tickers):
 
         scanned += 1
 
-# === RUN LOOP ===
 def run_scanner():
     while True:
+        if not is_market_hours():
+            print("Outside of scanning hours. Sleeping until market open.")
+            sleep_until_market_open()
+            continue
         try:
             tickers = fetch_all_tickers()
             check_volume_spikes(tickers)
         except Exception as e:
             print("Main loop error:", e)
+        # Slow loop, scan 1 ticker per ~90 seconds.
         time.sleep(90)
 
 if __name__ == "__main__":
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Scanner bot has started and will scan only during market hours!")
     run_scanner()
