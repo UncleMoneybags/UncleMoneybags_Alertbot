@@ -64,10 +64,11 @@ def calculate_vwap(candles):
     cumulative_vol = sum(c.v for c in candles)
     return cumulative_vp / cumulative_vol if cumulative_vol != 0 else 0
 
-def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap):
+def send_telegram_alert(symbol, float_rot, rel_vol, above_vwap, reason=""):
     message = f"""
-🚨 VOLUME SPIKE: ${symbol}
+🚨 ALERT: ${symbol}
 
+Reason: {reason}
 🔁 Float Rotation: {float_rot:.2f}x
 📊 Relative Volume: {rel_vol:.2f}x
 📍 VWAP Position: {'ABOVE ✅' if above_vwap else 'BELOW ❌'}
@@ -93,7 +94,6 @@ def fetch_all_tickers():
 def check_volume_spikes(tickers):
     global last_message_time
     now_utc = datetime.utcnow()
-    # Use milliseconds for Polygon API
     start_time = int((now_utc - timedelta(minutes=30)).timestamp() * 1000)
     end_time = int(now_utc.timestamp() * 1000)
     cooldown = 300  # 5 minutes
@@ -102,6 +102,11 @@ def check_volume_spikes(tickers):
     scanned = 0
     max_scans = 1  # Only scan 1 ticker per loop (slow down for free plan)
 
+    # Track alert times per symbol and condition
+    global last_alert_time
+    if not isinstance(last_alert_time, dict):
+        last_alert_time = {}
+
     for symbol in tickers:
         if scanned >= max_scans:
             break
@@ -109,7 +114,7 @@ def check_volume_spikes(tickers):
         candles = []
         for attempt in range(1, 4):
             try:
-                time.sleep(15)  # Slow down to avoid rate limits
+                time.sleep(15)
                 candles = client.get_aggs(
                     symbol,
                     1,
@@ -118,13 +123,13 @@ def check_volume_spikes(tickers):
                     to=end_time,
                     limit=30
                 )
-                break  # success, exit retry loop
+                break
             except Exception as e:
                 err_msg = str(e)
                 if 'NOT_AUTHORIZED' in err_msg or 'Your plan doesn\'t include this data timeframe' in err_msg:
                     print(f"Skipping {symbol}: {err_msg}")
                     candles = []
-                    break  # Don't retry if plan doesn't allow it
+                    break
                 print(f"Error scanning {symbol}, attempt {attempt}: {err_msg}")
                 if attempt < 3:
                     time.sleep(2 ** attempt)
@@ -151,12 +156,30 @@ def check_volume_spikes(tickers):
         vwap = calculate_vwap(candles)
         above_vwap = price > vwap
 
-        if (
-            (symbol not in last_alert_time or now_ts - last_alert_time[symbol] > cooldown)
-            and float_rotation >= 1.0 and rel_vol >= 2.5 and above_vwap
-        ):
-            send_telegram_alert(symbol, float_rotation, rel_vol, above_vwap)
-            last_alert_time[symbol] = now_ts
+        triggered_conditions = []
+
+        # Separate cooldown for each condition per symbol
+        symbol_alerts = last_alert_time.setdefault(symbol, {})
+
+        # Float rotation alert
+        if float_rotation >= 1.0 and now_ts - symbol_alerts.get('float_rotation', 0) > cooldown:
+            send_telegram_alert(symbol, float_rotation, rel_vol, above_vwap, reason="Float Rotation ≥ 1.0x")
+            symbol_alerts['float_rotation'] = now_ts
+            triggered_conditions.append('float_rotation')
+
+        # Relative volume alert
+        if rel_vol >= 2.5 and now_ts - symbol_alerts.get('rel_vol', 0) > cooldown:
+            send_telegram_alert(symbol, float_rotation, rel_vol, above_vwap, reason="Relative Volume ≥ 2.5x")
+            symbol_alerts['rel_vol'] = now_ts
+            triggered_conditions.append('rel_vol')
+
+        # Above VWAP alert
+        if above_vwap and now_ts - symbol_alerts.get('above_vwap', 0) > cooldown:
+            send_telegram_alert(symbol, float_rotation, rel_vol, above_vwap, reason="Price ABOVE VWAP")
+            symbol_alerts['above_vwap'] = now_ts
+            triggered_conditions.append('above_vwap')
+
+        if triggered_conditions:
             last_message_time = now_ts
 
         scanned += 1
