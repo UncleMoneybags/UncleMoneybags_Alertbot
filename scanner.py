@@ -199,5 +199,5 @@ def run_scanner():
         time.sleep(90)
 
 if __name__ == "__main__":
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Scanner bot has started and will scan only during market hours!")
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="lets find some bangers!")
     run_scanner()
