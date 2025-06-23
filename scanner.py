@@ -7,6 +7,22 @@ from polygon import RESTClient
 import threading
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+from collections import defaultdict
+
+# === LOGGING SETUP ===
+logging.basicConfig(
+    filename='scanner.log',
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
+
+error_counts = defaultdict(int)
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
@@ -42,6 +58,12 @@ KEYWORDS = [
 last_news_ids = set()
 news_lock = threading.Lock()
 
+def log_error_summary():
+    for err, count in error_counts.items():
+        if count > 0:
+            logging.error(f"{err}: occurred {count} times")
+    error_counts.clear()
+
 def is_market_hours():
     now = datetime.now(EASTERN)
     return now.weekday() < 5 and SCAN_START_HOUR <= now.hour < SCAN_END_HOUR
@@ -52,7 +74,7 @@ def send_news_telegram_alert(symbol, headline, keyword):
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
         alerted_tickers.add(symbol)
     except Exception as e:
-        print("Telegram News error:", e)
+        logging.error(f"Telegram News error: {e}")
 
 def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol):
     message = f"🚨 ${symbol} — Volume Spike\nRel: {rel_vol:.2f} Tot: {total_vol} Avg: {avg_vol}"
@@ -60,7 +82,7 @@ def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol):
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
         alerted_tickers.add(symbol)
     except Exception as e:
-        print("Telegram volume alert error:", e)
+        logging.error(f"Telegram volume alert error: {e}")
 
 def send_hod_telegram_alert(symbol, price, open_price):
     percent = (price - open_price) / open_price * 100 if open_price else 0
@@ -68,14 +90,14 @@ def send_hod_telegram_alert(symbol, price, open_price):
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
     except Exception as e:
-        print("Telegram HOD alert error:", e)
+        logging.error(f"Telegram HOD alert error: {e}")
 
 def send_ema_stack_alert(symbol, price, timeframe, confidence):
     message = f"📈🔥 ${symbol} — EMA STACK ({timeframe}): 8 > 13 > 21\nCurrent Price: {price:.2f}\nConfidence: {confidence}/10"
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
     except Exception as e:
-        print("Telegram EMA stack alert error:", e)
+        logging.error(f"Telegram EMA stack alert error: {e}")
 
 def fetch_all_tickers():
     """
@@ -91,8 +113,8 @@ def fetch_all_tickers():
             resp = requests.get(url, timeout=15)
             data = resp.json()
             results = data.get('results', [])
-            print(f"Polygon page {page} returned {len(results)} raw tickers")
-            print("Sample raw ticker result:", results[:2])
+            logging.info(f"Polygon page {page} returned {len(results)} raw tickers")
+            logging.info("Sample raw ticker result: %s", results[:2])
             for item in results:
                 symbol = item.get('ticker')
                 if not symbol or symbol in seen:
@@ -107,7 +129,6 @@ def fetch_all_tickers():
                     'preferred', 'adr', 'note', 'bond', 'income'
                 ]):
                     continue
-                # NO price check here!
                 tickers.append(symbol)
             url = data.get('next_url')
             if url:
@@ -117,10 +138,10 @@ def fetch_all_tickers():
                     url += f"&apiKey={POLYGON_API_KEY}"
             page += 1
         except Exception as e:
-            print(f"Polygon fetch error: {e}")
+            error_counts[str(e)] += 1
             break
-    print(f"Fetched {len(tickers)} filtered tickers")
-    print("Sample filtered tickers:", tickers[:10])
+    logging.info(f"Fetched {len(tickers)} filtered tickers")
+    logging.info("Sample filtered tickers: %s", tickers[:10])
     return tickers
 
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
@@ -144,14 +165,14 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
             send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol)
             last_alert_time[symbol] = now_ts
     except Exception as e:
-        print(f"Volume spike error for {symbol}: {e}")
+        error_counts[str(e)] += 1
 
 def volume_spike_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            print(f"Fetched {len(tickers)} tickers [Volume Scanner]")
-            print("Sample tickers:", tickers[:10])
+            logging.info(f"Fetched {len(tickers)} tickers [Volume Scanner]")
+            logging.info("Sample tickers: %s", tickers[:10])
             now_utc = datetime.utcnow()
             cooldown = 60
             now_ts = time.time()
@@ -203,14 +224,14 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
         label = "5-min" if label_5min else ("1-min" if timeframe=="minute" else timeframe)
         send_ema_stack_alert(symbol, closes[-1], label, confidence)
     except Exception as e:
-        print(f"EMA stack error for {symbol}: {e}")
+        error_counts[str(e)] += 1
 
 def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            print(f"Fetched {len(tickers)} tickers [EMA Scanner]")
-            print("Sample tickers:", tickers[:10])
+            logging.info(f"Fetched {len(tickers)} tickers [EMA Scanner]")
+            logging.info("Sample tickers: %s", tickers[:10])
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -242,14 +263,14 @@ def check_hod_worker(symbol):
                 send_hod_telegram_alert(symbol, hod, open_price)
             hod_tracker[symbol] = hod
     except Exception as e:
-        print(f"HOD check error for {symbol}: {e}")
+        error_counts[str(e)] += 1
 
 def hod_scanner():
     while True:
         if is_market_hours():
             tickers = list(alerted_tickers)
-            print(f"Fetched {len(tickers)} tickers [HOD Scanner]")
-            print("Sample tickers:", tickers[:10])
+            logging.info(f"Fetched {len(tickers)} tickers [HOD Scanner]")
+            logging.info("Sample tickers: %s", tickers[:10])
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -258,20 +279,24 @@ def hod_scanner():
 
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
+    semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent requests
+
     async def fetch_news(session, symbol):
-        try:
-            url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit=3&apiKey={POLYGON_API_KEY}"
-            async with session.get(url, timeout=8) as r:
-                data = await r.json()
-            if "error" in data or (data.get("status") == "ERROR"):
-                print(f"News API error for {symbol}: {data}")
-            return symbol, data.get("results", [])
-        except Exception as e:
-            print(f"News error {symbol}: {repr(e)}")
-            return symbol, []
+        async with semaphore:
+            try:
+                url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit=3&apiKey={POLYGON_API_KEY}"
+                async with session.get(url, timeout=8) as r:
+                    data = await r.json()
+                if "error" in data or (data.get("status") == "ERROR"):
+                    logging.error(f"News API error for {symbol}: {data}")
+                return symbol, data.get("results", [])
+            except Exception as e:
+                error_counts[str(e)] += 1
+                return symbol, []
+
     tasks = []
     async with aiohttp.ClientSession() as session:
-        for symbol in tickers:
+        for symbol in tickers[:200]:  # Limit to first 200 tickers for news
             tasks.append(fetch_news(session, symbol))
         for future in asyncio.as_completed(tasks):
             symbol, news_items = await future
@@ -290,8 +315,8 @@ def news_polling_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            print(f"Fetched {len(tickers)} tickers [News Scanner]")
-            print("Sample tickers:", tickers[:10])
+            logging.info(f"Fetched {len(tickers)} tickers [News Scanner]")
+            logging.info("Sample tickers: %s", tickers[:10])
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
         time.sleep(15)
 
@@ -321,15 +346,15 @@ def check_gap_worker(symbol, seen_today):
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
             seen_today.add(key)
     except Exception as e:
-        print(f"Gap scanner error for {symbol}: {e}")
+        error_counts[str(e)] += 1
 
 def gap_scanner():
     seen_today = set()
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            print(f"Fetched {len(tickers)} tickers [Gap Scanner]")
-            print("Sample tickers:", tickers[:10])
+            logging.info(f"Fetched {len(tickers)} tickers [Gap Scanner]")
+            logging.info("Sample tickers: %s", tickers[:10])
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -365,7 +390,7 @@ def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
             seen.add(key)
     except Exception as e:
-        print(f"Premarket/AH scanner error for {symbol}: {e}")
+        error_counts[str(e)] += 1
 
 def premarket_ah_mover_scanner():
     seen = set()
@@ -375,13 +400,18 @@ def premarket_ah_mover_scanner():
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
             tickers = fetch_all_tickers()
-            print(f"Fetched {len(tickers)} tickers [Premarket/AH Scanner]")
-            print("Sample tickers:", tickers[:10])
+            logging.info(f"Fetched {len(tickers)} tickers [Premarket/AH Scanner]")
+            logging.info("Sample tickers: %s", tickers[:10])
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
         time.sleep(15)
+
+def error_summary_thread():
+    while True:
+        time.sleep(300)  # every 5 minutes
+        log_error_summary()
 
 if __name__ == "__main__":
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 THIS IS A TEST ALERT. If you see this, Telegram is working.")
@@ -391,5 +421,6 @@ if __name__ == "__main__":
     threading.Thread(target=news_polling_scanner, daemon=True).start()
     threading.Thread(target=gap_scanner, daemon=True).start()
     threading.Thread(target=premarket_ah_mover_scanner, daemon=True).start()
+    threading.Thread(target=error_summary_thread, daemon=True).start()
     while True:
         time.sleep(60)
