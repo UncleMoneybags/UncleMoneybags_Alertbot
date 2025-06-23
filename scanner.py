@@ -3,11 +3,12 @@ import requests
 from datetime import datetime, timedelta
 import pytz
 from telegram import Bot
-from polygon import RESTClient  # Requires: pip install polygon-api-client
+from polygon import RESTClient
 import threading
 import asyncio
 import websockets
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
@@ -17,131 +18,37 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 client = RESTClient(api_key=POLYGON_API_KEY)
 
 EASTERN = pytz.timezone('US/Eastern')
-SCAN_START_HOUR = 4  # 4:00 AM ET
-SCAN_END_HOUR = 20   # 8:00 PM ET
+SCAN_START_HOUR = 4
+SCAN_END_HOUR = 20
 
 last_alert_time = {}
 last_message_time = time.time()
-
-# Track tickers that have been alerted (for HOD alerts)
 alerted_tickers = set()
 hod_tracker = {}
 
 KEYWORDS = [
-    # User-supplied keywords
-    "fda approval",
-    "fast track",
-    "phase 1",
-    "phase 2",
-    "phase 3",
-    "orphan drug",
-    "IND submission",
-    "IND clearance",
-    "breakthrough therapy",
-    "AI",
-    "AI integration",
-    "blockchain",
-    "cloud contract",
-    "cybersecurity",
-    "machine learning",
-    "acquisition",
-    "merger",
-    "SPAC merger",
-    "strategic partnership",
-    "investment from",
-    "contract",
-    "expansion into",
-    "guidance raised",
-    "record revenue",
-    "divestiture",
-    "signs deal",
-    "launches platform",
-    "awarded",
-    "accepting crypto",
-    "bitcoin",
-    "viral",
-    "buyback",
-    "oral treatment",
-    "preclinical trial",
-    "DOD contract",
-    "china approval",
-    "plans to acquire",
-    "partnership",
-    "emergency use authorization",
-    # Additional hot stock keywords (biotech/healthcare)
-    "CRL",
-    "NDA submission",
-    "NDA approval",
-    "BLA submission",
-    "BLA approval",
-    "PDUFA",
-    "clinical hold",
-    "data readout",
-    "positive topline data",
-    "statistically significant",
-    # Earnings & guidance
-    "beats estimates",
-    "misses estimates",
-    "EPS",
-    "profit warning",
-    # Market activity
-    "short squeeze",
-    "analyst upgrade",
-    "analyst downgrade",
-    "price target increased",
-    "price target lowered",
-    # Partnerships/corporate
-    "joint venture",
-    "spin-off",
-    "reverse split",
-    "IPO",
-    "uplisting",
-    "downlisting",
-    # Crypto/AI/tech
-    "NFT",
-    "web3",
-    "data breach",
-    "ransomware",
-    "AI chip",
-    "quantum computing",
-    # Regulatory
-    "SEC investigation",
-    "settlement",
-    "class action",
-    # Other momentum
-    "momentum",
-    "record volume",
-    "record high",
-    "ATH",
-    "halted",
-    "resumes trading"
+    "fda approval", "fast track", "phase 1", "phase 2", "phase 3", "orphan drug", "IND submission", "IND clearance",
+    "breakthrough therapy", "AI", "AI integration", "blockchain", "cloud contract", "cybersecurity", "machine learning",
+    "acquisition", "merger", "SPAC merger", "strategic partnership", "investment from", "contract", "expansion into",
+    "guidance raised", "record revenue", "divestiture", "signs deal", "launches platform", "awarded", "accepting crypto",
+    "bitcoin", "viral", "buyback", "oral treatment", "preclinical trial", "DOD contract", "china approval", "plans to acquire",
+    "partnership", "emergency use authorization", "CRL", "NDA submission", "NDA approval", "BLA submission", "BLA approval",
+    "PDUFA", "clinical hold", "data readout", "positive topline data", "statistically significant", "beats estimates",
+    "misses estimates", "EPS", "profit warning", "short squeeze", "analyst upgrade", "analyst downgrade",
+    "price target increased", "price target lowered", "joint venture", "spin-off", "reverse split", "IPO", "uplisting",
+    "downlisting", "NFT", "web3", "data breach", "ransomware", "AI chip", "quantum computing", "SEC investigation",
+    "settlement", "class action", "momentum", "record volume", "record high", "ATH", "halted", "resumes trading"
 ]
 
 last_news_ids = set()
-news_lock = threading.Lock()  # For thread-safe news id tracking
+news_lock = threading.Lock()
 
 def is_market_hours():
-    # Only scan between 4:00 AM and 8:00 PM Eastern Time, Monday–Friday
     now = datetime.now(EASTERN)
     return now.weekday() < 5 and SCAN_START_HOUR <= now.hour < SCAN_END_HOUR
 
-def get_float_from_polygon(symbol, retries=3):
-    url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.get(url)
-            data = r.json()
-            return data["results"].get("share_class_shares_outstanding", 5_000_000)
-        except Exception as e:
-            print(f"Float lookup failed for {symbol}, attempt {attempt}: {e}")
-            if hasattr(r, 'text'):
-                print("Polygon response:", r.text)
-            if attempt < retries:
-                time.sleep(2 ** attempt)
-    return 5_000_000
-
 def send_news_telegram_alert(symbol, headline, keyword):
-    confidence = 5  # default
+    confidence = 5
     high_conf_keywords = [
         "fda approval", "acquisition", "merger", "halted", "resumes trading",
         "record high", "guidance raised", "beats estimates"
@@ -194,95 +101,14 @@ def send_ema_stack_alert(symbol, price, timeframe, confidence):
     except Exception as e:
         print("Telegram EMA stack alert error:", e)
 
-def send_saturday_ebook_alert():
-    message = '📚 Need more guidance? Grab my ebook "Stock Guide For The Poors."'
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
-    except Exception as e:
-        print("Telegram Saturday ebook alert error:", e)
-
 def scheduler_saturday_ebook():
     last_sent_date = None
     while True:
         now = datetime.now(EASTERN)
         if now.weekday() == 5 and now.hour == 12 and last_sent_date != now.date():
-            send_saturday_ebook_alert()
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text='📚 Need more guidance? Grab my ebook "Stock Guide For The Poors."', parse_mode="HTML")
             last_sent_date = now.date()
-        time.sleep(60)  # Check once a minute
-
-def check_ema_stack(tickers, timeframe="minute", label_5min=False):
-    for symbol in tickers:
-        try:
-            candles = client.get_aggs(
-                symbol,
-                1 if timeframe=="minute" else 5,
-                "minute",
-                from_="now-60m" if timeframe=="minute" else "now-300m",
-                to="now",
-                limit=30
-            )
-            if not candles or len(candles) < 21:
-                continue
-
-            closes = [c.c for c in candles]
-            def ema(prices, period):
-                k = 2 / (period + 1)
-                ema_values = [prices[0]]
-                for price in prices[1:]:
-                    ema_values.append(price * k + ema_values[-1] * (1 - k))
-                return ema_values
-
-            ema_8 = ema(closes, 8)[-1]
-            ema_13 = ema(closes, 13)[-1]
-            ema_21 = ema(closes, 21)[-1]
-
-            if not (ema_8 > ema_13 > ema_21):
-                continue
-
-            last_candle = candles[-1]
-            avg_vol = sum(c.v for c in candles[-10:]) / 10
-            if last_candle.v < avg_vol or last_candle.v < 100000:
-                continue
-
-            price_change = (closes[-1] - closes[0]) / closes[0] * 100
-            if abs(price_change) < 2:
-                continue
-
-            confidence = 10 if price_change > 5 else 8 if price_change > 3 else 6
-            label = "5-min" if label_5min else ("1-min" if timeframe=="minute" else timeframe)
-            send_ema_stack_alert(symbol, closes[-1], label, confidence)
-        except Exception as e:
-            print(f"EMA stack error for {symbol}: {e}")
-
-def check_high_of_day(symbols):
-    global hod_tracker, alerted_tickers
-    for symbol in symbols:
-        if symbol not in alerted_tickers:
-            continue
-        try:
-            now = datetime.now(pytz.UTC)
-            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            start_ts = int(start.timestamp() * 1000)
-            end_ts = int(now.timestamp() * 1000)
-            candles = client.get_aggs(
-                symbol,
-                1,
-                "minute",
-                from_=start_ts,
-                to=end_ts,
-                limit=1000
-            )
-            if not candles:
-                continue
-            hod = max(c.h for c in candles)
-            prev_hod = hod_tracker.get(symbol, None)
-            open_price = candles[0].o if candles else 0
-            if prev_hod is None or hod > prev_hod:
-                if prev_hod is not None:
-                    send_hod_telegram_alert(symbol, hod, open_price)
-                hod_tracker[symbol] = hod
-        except Exception as e:
-            print(f"HOD check error for {symbol}: {e}")
+        time.sleep(60)
 
 def fetch_all_tickers():
     try:
@@ -296,71 +122,138 @@ def fetch_all_tickers():
         print("Error fetching tickers:", e)
         return []
 
-def check_volume_spikes(tickers):
-    global last_message_time
-    now_utc = datetime.utcnow()
-    start_time = int((now_utc - timedelta(minutes=5)).timestamp() * 1000)
-    end_time = int(now_utc.timestamp() * 1000)
-    cooldown = 300  # 5 minutes
-    now_ts = time.time()
-
-    scanned = 0
-    max_scans = 10  # Increased from 1 to 10
-
-    global last_alert_time
-    if not isinstance(last_alert_time, dict):
-        last_alert_time = {}
-
-    for symbol in tickers:
-        if scanned >= max_scans:
-            break
-
-        candles = []
-        for attempt in range(1, 4):
-            try:
-                time.sleep(15)
-                candles = client.get_aggs(
-                    symbol,
-                    1,
-                    "minute",
-                    from_=start_time,
-                    to=end_time,
-                    limit=5
-                )
-                break
-            except Exception as e:
-                err_msg = str(e)
-                if 'NOT_AUTHORIZED' in err_msg or 'Your plan doesn\'t include this data timeframe' in err_msg:
-                    print(f"Skipping {symbol}: {err_msg}")
-                    candles = []
-                    break
-                print(f"Error scanning {symbol}, attempt {attempt}: {err_msg}")
-                if attempt < 3:
-                    time.sleep(2 ** attempt)
-                else:
-                    candles = []
+def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
+    try:
+        start_time = int((now_utc - timedelta(minutes=5)).timestamp() * 1000)
+        end_time = int(now_utc.timestamp() * 1000)
+        candles = client.get_aggs(
+            symbol,
+            1,
+            "minute",
+            from_=start_time,
+            to=end_time,
+            limit=5
+        )
         if not candles or len(candles) < 5:
-            continue
-
+            return
         avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
         if avg_vol < 100000:
-            continue
-
+            return
         total_vol = sum(c.v for c in candles)
         if total_vol < 500000:
-            continue
-
+            return
         rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
-
         if (rel_vol >= 2.0 or total_vol >= 2 * avg_vol) and now_ts - last_alert_time.get(symbol, 0) > cooldown:
             send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol)
             last_alert_time[symbol] = now_ts
-            last_message_time = now_ts
+    except Exception as e:
+        print(f"Volume spike error for {symbol}: {e}")
 
-        scanned += 1
+def volume_spike_scanner():
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            now_utc = datetime.utcnow()
+            cooldown = 30
+            now_ts = time.time()
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+        time.sleep(1)
 
-async def async_scan_news_and_alert(tickers, keywords):
-    global last_news_ids
+def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
+    try:
+        candles = client.get_aggs(
+            symbol,
+            1 if timeframe=="minute" else 5,
+            "minute",
+            from_="now-60m" if timeframe=="minute" else "now-300m",
+            to="now",
+            limit=30
+        )
+        if not candles or len(candles) < 21:
+            return
+        closes = [c.c for c in candles]
+        def ema(prices, period):
+            k = 2 / (period + 1)
+            ema_values = [prices[0]]
+            for price in prices[1:]:
+                ema_values.append(price * k + ema_values[-1] * (1 - k))
+            return ema_values
+        ema_8 = ema(closes, 8)[-1]
+        ema_13 = ema(closes, 13)[-1]
+        ema_21 = ema(closes, 21)[-1]
+        if not (ema_8 > ema_13 > ema_21):
+            return
+        last_candle = candles[-1]
+        avg_vol = sum(c.v for c in candles[-10:]) / 10
+        if last_candle.v < avg_vol or last_candle.v < 100000:
+            return
+        price_change = (closes[-1] - closes[0]) / closes[0] * 100
+        if abs(price_change) < 2:
+            return
+        confidence = 10 if price_change > 5 else 8 if price_change > 3 else 6
+        label = "5-min" if label_5min else ("1-min" if timeframe=="minute" else timeframe)
+        send_ema_stack_alert(symbol, closes[-1], label, confidence)
+    except Exception as e:
+        print(f"EMA stack error for {symbol}: {e}")
+
+def ema_stack_scanner():
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                # 1-min EMA
+                futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+                # 5-min EMA
+                futures = [executor.submit(check_ema_stack_worker, symbol, "5minute", True) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+        time.sleep(2)
+
+def check_hod_worker(symbol):
+    try:
+        if symbol not in alerted_tickers:
+            return
+        now = datetime.now(pytz.UTC)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ts = int(start.timestamp() * 1000)
+        end_ts = int(now.timestamp() * 1000)
+        candles = client.get_aggs(
+            symbol,
+            1,
+            "minute",
+            from_=start_ts,
+            to=end_ts,
+            limit=1000
+        )
+        if not candles:
+            return
+        hod = max(c.h for c in candles)
+        prev_hod = hod_tracker.get(symbol, None)
+        open_price = candles[0].o if candles else 0
+        if prev_hod is None or hod > prev_hod:
+            if prev_hod is not None:
+                send_hod_telegram_alert(symbol, hod, open_price)
+            hod_tracker[symbol] = hod
+    except Exception as e:
+        print(f"HOD check error for {symbol}: {e}")
+
+def hod_scanner():
+    while True:
+        if is_market_hours():
+            tickers = list(alerted_tickers)
+            with ThreadPoolExecutor(max_workers=32) as executor:
+                futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+        time.sleep(2)
+
+async def async_scan_news_and_alert_parallel(tickers, keywords):
+    import aiohttp
     async def fetch_news(session, symbol):
         try:
             url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit=3&apiKey={POLYGON_API_KEY}"
@@ -370,14 +263,12 @@ async def async_scan_news_and_alert(tickers, keywords):
         except Exception as e:
             print(f"News error {symbol}: {e}")
             return symbol, []
-
-    import aiohttp
     tasks = []
     async with aiohttp.ClientSession() as session:
         for symbol in tickers:
             tasks.append(fetch_news(session, symbol))
-        results = await asyncio.gather(*tasks)
-        for symbol, news_items in results:
+        for future in asyncio.as_completed(tasks):
+            symbol, news_items = await future
             for news in news_items:
                 headline = news.get("title", "").lower()
                 news_id = news.get("id", "")
@@ -388,6 +279,76 @@ async def async_scan_news_and_alert(tickers, keywords):
                     if matched:
                         send_news_telegram_alert(symbol, news.get("title", ""), matched[0])
                         last_news_ids.add(news_id)
+
+def news_polling_scanner():
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
+        time.sleep(10)
+
+def check_gap_worker(symbol, seen_today):
+    try:
+        yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
+        today = client.get_aggs(symbol, 1, "day", from_="now-1d", to="now", limit=1)
+        if not yest or not today:
+            return
+        prev = yest[0]
+        curr = today[0]
+        gap = (curr.o - prev.c) / prev.c * 100
+        key = f"{symbol}|{curr.o}|{prev.c}"
+        if abs(gap) >= 5 and key not in seen_today:
+            direction = "Gap Up" if gap > 0 else "Gap Down"
+            message = f"🚀 {direction}: ${symbol} opened {gap:.1f}% {'higher' if gap > 0 else 'lower'}"
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+            seen_today.add(key)
+    except Exception as e:
+        print(f"Gap scanner error for {symbol}: {e}")
+
+def gap_scanner():
+    seen_today = set()
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+        time.sleep(30)
+
+def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
+    try:
+        yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
+        if not yest:
+            return
+        prev_close = yest[0].c
+        trades = client.get_aggs(symbol, 1, "minute", from_="now-60m", to="now", limit=60)
+        if not trades:
+            return
+        last = trades[-1].c
+        move = (last - prev_close) / prev_close * 100
+        key = f"{symbol}|{now_et.date()}|{last}"
+        if abs(move) >= 5 and key not in seen:
+            session = "Premarket" if in_premarket else "After-hours"
+            message = f"⚡ {session} Mover: ${symbol} is up {move:.1f}%"
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+            seen.add(key)
+    except Exception as e:
+        print(f"Premarket/AH scanner error for {symbol}: {e}")
+
+def premarket_ah_mover_scanner():
+    seen = set()
+    while True:
+        now_et = datetime.now(EASTERN)
+        in_premarket = 4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
+        in_ah = 16 <= now_et.hour < 20
+        if in_premarket or in_ah:
+            tickers = fetch_all_tickers()
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+        time.sleep(10)
 
 def run_polygon_news_websocket(keywords):
     url = f"wss://socket.polygon.io/stocks"
@@ -458,93 +419,6 @@ def run_polygon_news_websocket(keywords):
         asyncio.run(listen())
     thread = threading.Thread(target=ws_runner, daemon=True)
     thread.start()
-
-# === Gap Up/Gap Down Scanner ===
-def gap_scanner():
-    seen_today = set()
-    while True:
-        if is_market_hours():
-            tickers = fetch_all_tickers()
-            for symbol in tickers:
-                try:
-                    yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
-                    today = client.get_aggs(symbol, 1, "day", from_="now-1d", to="now", limit=1)
-                    if not yest or not today:
-                        continue
-                    prev = yest[0]
-                    curr = today[0]
-                    gap = (curr.o - prev.c) / prev.c * 100
-                    key = f"{symbol}|{curr.o}|{prev.c}"
-                    if abs(gap) >= 5 and key not in seen_today:
-                        direction = "Gap Up" if gap > 0 else "Gap Down"
-                        message = f"🚀 {direction}: ${symbol} opened {gap:.1f}% {'higher' if gap > 0 else 'lower'}"
-                        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                        seen_today.add(key)
-                except Exception as e:
-                    print(f"Gap scanner error for {symbol}: {e}")
-        time.sleep(600)
-
-# === Premarket/After-hours Movers Scanner ===
-def premarket_ah_mover_scanner():
-    seen = set()
-    while True:
-        now_et = datetime.now(EASTERN)
-        in_premarket = 4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
-        in_ah = 16 <= now_et.hour < 20
-        if in_premarket or in_ah:
-            tickers = fetch_all_tickers()
-            for symbol in tickers:
-                try:
-                    yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
-                    if not yest:
-                        continue
-                    prev_close = yest[0].c
-                    trades = client.get_aggs(symbol, 1, "minute", from_="now-60m", to="now", limit=60)
-                    if not trades:
-                        continue
-                    last = trades[-1].c
-                    move = (last - prev_close) / prev_close * 100
-                    key = f"{symbol}|{now_et.date()}|{last}"
-                    if abs(move) >= 5 and key not in seen:
-                        session = "Premarket" if in_premarket else "After-hours"
-                        message = f"⚡ {session} Mover: ${symbol} is up {move:.1f}%"
-                        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                        seen.add(key)
-                except Exception as e:
-                    print(f"Premarket/AH scanner error for {symbol}: {e}")
-        time.sleep(300)
-
-# --- Independent scanner threads ---
-
-def volume_spike_scanner():
-    while True:
-        if is_market_hours():
-            tickers = fetch_all_tickers()
-            check_volume_spikes(tickers)
-        time.sleep(15)
-
-def ema_stack_scanner():
-    while True:
-        if is_market_hours():
-            tickers = fetch_all_tickers()
-            # 1-min EMA stack
-            check_ema_stack(tickers, timeframe="minute")
-            # 5-min EMA stack with label
-            check_ema_stack(tickers, timeframe="5minute", label_5min=True)
-        time.sleep(15)
-
-def hod_scanner():
-    while True:
-        if is_market_hours():
-            check_high_of_day(list(alerted_tickers))
-        time.sleep(15)
-
-def news_polling_scanner():
-    while True:
-        if is_market_hours():
-            tickers = fetch_all_tickers()
-            asyncio.run(async_scan_news_and_alert(tickers, KEYWORDS))
-        time.sleep(60)
 
 if __name__ == "__main__":
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="lets find some bangers!")
