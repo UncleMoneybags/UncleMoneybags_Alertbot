@@ -1,5 +1,8 @@
 import time
 import requests
+import asyncio
+import pickle
+import os
 from datetime import datetime, timedelta
 import pytz
 from telegram import Bot
@@ -8,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from collections import defaultdict
 import warnings
-import asyncio  # <-- FIXED: Add this import
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
@@ -50,8 +52,29 @@ KEYWORDS = [
     "phase 3", "nda approval", "buyback", "uplisting", "contract", "strategic partnership",
     "emergency use authorization"
 ]
-last_news_ids = set()
 news_lock = threading.Lock()
+
+# === Persistent news dedupe ===
+NEWS_ALERTED_FILE = "news_alerted_ids.pkl"
+news_alerted_ids = set()
+
+def load_news_alerted_ids():
+    global news_alerted_ids
+    if os.path.exists(NEWS_ALERTED_FILE):
+        try:
+            with open(NEWS_ALERTED_FILE, "rb") as f:
+                news_alerted_ids = pickle.load(f)
+        except Exception:
+            news_alerted_ids = set()
+    else:
+        news_alerted_ids = set()
+
+def save_news_alerted_ids():
+    try:
+        with open(NEWS_ALERTED_FILE, "wb") as f:
+            pickle.dump(news_alerted_ids, f)
+    except Exception:
+        pass
 
 def log_error_summary():
     for err, count in error_counts.items():
@@ -308,17 +331,19 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
             tasks.append(fetch_news(session, symbol))
         for future in asyncio.as_completed(tasks):
             symbol, news_items = await future
-            # get_price call removed, just news headline scan
             for news in news_items:
-                headline = news.get("title", "").lower()
                 news_id = news.get("id", "")
+                if not news_id:
+                    continue
                 with news_lock:
-                    if news_id in last_news_ids:
+                    if news_id in news_alerted_ids:
                         continue
+                    headline = news.get("title", "").lower()
                     matched = [kw for kw in keywords if kw.lower() in headline]
                     if matched:
                         send_news_telegram_alert(symbol, news.get("title", ""), matched[0])
-                        last_news_ids.add(news_id)
+                        news_alerted_ids.add(news_id)
+                        save_news_alerted_ids()
 
 def news_polling_scanner():
     while True:
@@ -374,6 +399,7 @@ def error_summary_thread():
         log_error_summary()
 
 if __name__ == "__main__":
+    load_news_alerted_ids()
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 SCANNER RESTARTED. Breakout scanner removed. Only volume, EMA, HOD, news, and PM/AH remain.")
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
