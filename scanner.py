@@ -324,7 +324,7 @@ def check_volume_spikes(tickers):
     now_ts = time.time()
 
     scanned = 0
-    max_scans = 1  # Only scan 1 ticker per loop
+    max_scans = 10  # Increased from 1 to 10
 
     global last_alert_time
     if not isinstance(last_alert_time, dict):
@@ -485,7 +485,7 @@ def volume_spike_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             check_volume_spikes(tickers)
-        time.sleep(90)
+        time.sleep(15)  # Lowered from 90
 
 def ema_stack_scanner():
     while True:
@@ -495,20 +495,20 @@ def ema_stack_scanner():
             check_ema_stack(tickers, timeframe="minute")
             # 5-min EMA stack with label
             check_ema_stack(tickers, timeframe="5minute", label_5min=True)
-        time.sleep(90)
+        time.sleep(15)  # Lowered from 90
 
 def hod_scanner():
     while True:
         if is_market_hours():
             check_high_of_day(list(alerted_tickers))
-        time.sleep(90)
+        time.sleep(15)  # Lowered from 90
 
 def news_polling_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
             asyncio.run(async_scan_news_and_alert(tickers, KEYWORDS))
-        time.sleep(180)
+        time.sleep(60)  # Lowered from 180
 
 if __name__ == "__main__":
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="lets find some bangers!")
