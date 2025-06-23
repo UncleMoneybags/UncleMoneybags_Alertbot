@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from collections import defaultdict
 import warnings
+import asyncio  # <-- FIXED: Add this import
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
@@ -323,7 +324,6 @@ def news_polling_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            import asyncio
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
         time.sleep(15)
 
