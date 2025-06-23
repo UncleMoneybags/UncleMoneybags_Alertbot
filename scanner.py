@@ -172,8 +172,8 @@ def fetch_all_tickers():
 
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     try:
-        start_time = int((now_utc - timedelta(minutes=5)).timestamp() * 1000)
         end_time = int(now_utc.timestamp() * 1000)
+        start_time = int((now_utc - timedelta(minutes=5)).timestamp() * 1000)
         candles = client.get_aggs(
             symbol,
             1,
@@ -197,29 +197,17 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     except Exception as e:
         print(f"Volume spike error for {symbol}: {e}")
 
-def volume_spike_scanner():
-    while True:
-        if is_market_hours():
-            tickers = fetch_all_tickers()
-            now_utc = datetime.utcnow()
-            cooldown = 30
-            now_ts = time.time()
-            with ThreadPoolExecutor(max_workers=128) as executor:  # reduced to manage memory
-                futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
-                for _ in as_completed(futures):
-                    pass
-        time.sleep(0.05)
-
 def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     try:
-        candles = client.get_aggs(
-            symbol,
-            1 if timeframe=="minute" else 5,
-            "minute",
-            from_="now-60m" if timeframe=="minute" else "now-300m",
-            to="now",
-            limit=30
-        )
+        now = datetime.utcnow()
+        if timeframe == "minute":
+            end_time = int(now.timestamp() * 1000)
+            start_time = int((now - timedelta(minutes=60)).timestamp() * 1000)
+            candles = client.get_aggs(symbol, 1, "minute", from_=start_time, to=end_time, limit=30)
+        else:
+            end_time = int(now.timestamp() * 1000)
+            start_time = int((now - timedelta(minutes=300)).timestamp() * 1000)
+            candles = client.get_aggs(symbol, 5, "minute", from_=start_time, to=end_time, limit=30)
         if not candles or len(candles) < 21:
             return
         closes = [c.c for c in candles]
@@ -247,24 +235,11 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     except Exception as e:
         print(f"EMA stack error for {symbol}: {e}")
 
-def ema_stack_scanner():
-    while True:
-        if is_market_hours():
-            tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=128) as executor:
-                futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
-                for _ in as_completed(futures):
-                    pass
-                futures = [executor.submit(check_ema_stack_worker, symbol, "5minute", True) for symbol in tickers]
-                for _ in as_completed(futures):
-                    pass
-        time.sleep(0.05)
-
 def check_hod_worker(symbol):
     try:
         if symbol not in alerted_tickers:
             return
-        now = datetime.now(pytz.UTC)
+        now = datetime.utcnow()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         start_ts = int(start.timestamp() * 1000)
         end_ts = int(now.timestamp() * 1000)
@@ -335,12 +310,14 @@ def news_polling_scanner():
 
 def check_gap_worker(symbol, seen_today):
     try:
-        yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
-        today = client.get_aggs(symbol, 1, "day", from_="now-1d", to="now", limit=1)
-        if not yest or not today:
+        today = datetime.utcnow().date()
+        yesterday = today - timedelta(days=1)
+        yest = client.get_aggs(symbol, 1, "day", from_=str(yesterday), to=str(yesterday), limit=1)
+        today_agg = client.get_aggs(symbol, 1, "day", from_=str(today), to=str(today), limit=1)
+        if not yest or not today_agg:
             return
         prev = yest[0]
-        curr = today[0]
+        curr = today_agg[0]
         gap = (curr.o - prev.c) / prev.c * 100
         key = f"{symbol}|{curr.o}|{prev.c}"
         if abs(gap) >= 5 and key not in seen_today:
@@ -364,11 +341,16 @@ def gap_scanner():
 
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
     try:
-        yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
+        today = datetime.utcnow().date()
+        yesterday = today - timedelta(days=1)
+        yest = client.get_aggs(symbol, 1, "day", from_=str(yesterday), to=str(yesterday), limit=1)
         if not yest:
             return
         prev_close = yest[0].c
-        trades = client.get_aggs(symbol, 1, "minute", from_="now-60m", to="now", limit=60)
+        now = datetime.utcnow()
+        end_time = int(now.timestamp() * 1000)
+        start_time = int((now - timedelta(minutes=60)).timestamp() * 1000)
+        trades = client.get_aggs(symbol, 1, "minute", from_=start_time, to=end_time, limit=60)
         if not trades:
             return
         last = trades[-1].c
