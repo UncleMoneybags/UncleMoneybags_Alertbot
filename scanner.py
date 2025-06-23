@@ -204,11 +204,11 @@ def volume_spike_scanner():
             now_utc = datetime.utcnow()
             cooldown = 30
             now_ts = time.time()
-            with ThreadPoolExecutor(max_workers=512) as executor:  # maximize workers
+            with ThreadPoolExecutor(max_workers=128) as executor:  # reduced to manage memory
                 futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.05)  # scan as fast as feasible
+        time.sleep(0.05)
 
 def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     try:
@@ -251,7 +251,7 @@ def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=512) as executor:
+            with ThreadPoolExecutor(max_workers=128) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
@@ -292,7 +292,7 @@ def hod_scanner():
     while True:
         if is_market_hours():
             tickers = list(alerted_tickers)
-            with ThreadPoolExecutor(max_workers=256) as executor:
+            with ThreadPoolExecutor(max_workers=64) as executor:
                 futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
@@ -356,7 +356,7 @@ def gap_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=512) as executor:
+            with ThreadPoolExecutor(max_workers=128) as executor:
                 futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
@@ -390,7 +390,7 @@ def premarket_ah_mover_scanner():
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=512) as executor:
+            with ThreadPoolExecutor(max_workers=128) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
