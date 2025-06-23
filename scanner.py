@@ -182,7 +182,8 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
             to=end_time,
             limit=5
         )
-        if not candles or len(candles) < 5:
+        # Defensive: handle None, empty list, or any object without volume data
+        if not candles or not isinstance(candles, list) or len(candles) < 5:
             return
         avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
         if avg_vol < 100000:
