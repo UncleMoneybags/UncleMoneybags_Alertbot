@@ -125,25 +125,6 @@ def is_market_hours():
     now = datetime.now(EASTERN)
     return now.weekday() < 5 and SCAN_START_HOUR <= now.hour < SCAN_END_HOUR
 
-def sleep_until_market_open():
-    now = datetime.now(EASTERN)
-    if now.hour >= SCAN_END_HOUR or now.weekday() >= 5:
-        days_ahead = (7 - now.weekday()) % 7
-        if now.hour >= SCAN_END_HOUR or now.weekday() == 4:
-            days_ahead = (7 - now.weekday() + 0) % 7
-            if days_ahead == 0:
-                days_ahead = 7
-        else:
-            days_ahead = 1
-        next_open = (now + timedelta(days=days_ahead)).replace(hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0)
-    else:
-        next_open = now.replace(hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0)
-        if now > next_open:
-            next_open += timedelta(days=1)
-    sleep_seconds = (next_open - now).total_seconds()
-    print(f"Sleeping {int(sleep_seconds)} seconds until next market open at {next_open}")
-    time.sleep(sleep_seconds)
-
 def get_float_from_polygon(symbol, retries=3):
     url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
     for attempt in range(1, retries + 1):
@@ -478,6 +459,61 @@ def run_polygon_news_websocket(keywords):
     thread = threading.Thread(target=ws_runner, daemon=True)
     thread.start()
 
+# === Gap Up/Gap Down Scanner ===
+def gap_scanner():
+    seen_today = set()
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            for symbol in tickers:
+                try:
+                    yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
+                    today = client.get_aggs(symbol, 1, "day", from_="now-1d", to="now", limit=1)
+                    if not yest or not today:
+                        continue
+                    prev = yest[0]
+                    curr = today[0]
+                    gap = (curr.o - prev.c) / prev.c * 100
+                    key = f"{symbol}|{curr.o}|{prev.c}"
+                    if abs(gap) >= 5 and key not in seen_today:
+                        direction = "Gap Up" if gap > 0 else "Gap Down"
+                        message = f"🚀 {direction}: ${symbol} opened {gap:.1f}% {'higher' if gap > 0 else 'lower'}"
+                        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                        seen_today.add(key)
+                except Exception as e:
+                    print(f"Gap scanner error for {symbol}: {e}")
+        time.sleep(600)
+
+# === Premarket/After-hours Movers Scanner ===
+def premarket_ah_mover_scanner():
+    seen = set()
+    while True:
+        now_et = datetime.now(EASTERN)
+        in_premarket = 4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
+        in_ah = 16 <= now_et.hour < 20
+        if in_premarket or in_ah:
+            tickers = fetch_all_tickers()
+            for symbol in tickers:
+                try:
+                    yest = client.get_aggs(symbol, 1, "day", from_="now-2d", to="now-1d", limit=1)
+                    if not yest:
+                        continue
+                    prev_close = yest[0].c
+                    trades = client.get_aggs(symbol, 1, "minute", from_="now-60m", to="now", limit=60)
+                    if not trades:
+                        continue
+                    last = trades[-1].c
+                    move = (last - prev_close) / prev_close * 100
+                    key = f"{symbol}|{now_et.date()}|{last}"
+                    if abs(move) >= 5 and key not in seen:
+                        session = "Premarket" if in_premarket else "After-hours"
+                        message = f"⚡ {session} Mover: ${symbol} is up {move:.1f}%"
+                        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                        seen.add(key)
+                except Exception as e:
+                    print(f"Premarket/AH scanner error for {symbol}: {e}")
+        time.sleep(300)
+
 # --- Independent scanner threads ---
 
 def volume_spike_scanner():
@@ -485,7 +521,7 @@ def volume_spike_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             check_volume_spikes(tickers)
-        time.sleep(15)  # Lowered from 90
+        time.sleep(15)
 
 def ema_stack_scanner():
     while True:
@@ -495,20 +531,20 @@ def ema_stack_scanner():
             check_ema_stack(tickers, timeframe="minute")
             # 5-min EMA stack with label
             check_ema_stack(tickers, timeframe="5minute", label_5min=True)
-        time.sleep(15)  # Lowered from 90
+        time.sleep(15)
 
 def hod_scanner():
     while True:
         if is_market_hours():
             check_high_of_day(list(alerted_tickers))
-        time.sleep(15)  # Lowered from 90
+        time.sleep(15)
 
 def news_polling_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
             asyncio.run(async_scan_news_and_alert(tickers, KEYWORDS))
-        time.sleep(60)  # Lowered from 180
+        time.sleep(60)
 
 if __name__ == "__main__":
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="lets find some bangers!")
@@ -517,6 +553,8 @@ if __name__ == "__main__":
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
     threading.Thread(target=hod_scanner, daemon=True).start()
     threading.Thread(target=news_polling_scanner, daemon=True).start()
+    threading.Thread(target=gap_scanner, daemon=True).start()
+    threading.Thread(target=premarket_ah_mover_scanner, daemon=True).start()
     run_polygon_news_websocket(KEYWORDS)
     while True:
         time.sleep(60)
