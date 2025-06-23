@@ -6,9 +6,6 @@ from telegram import Bot
 from polygon import RESTClient
 import threading
 import asyncio
-import websockets
-import json
-import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIG ===
@@ -23,7 +20,6 @@ SCAN_START_HOUR = 4
 SCAN_END_HOUR = 20
 
 last_alert_time = {}
-last_message_time = time.time()
 alerted_tickers = set()
 hod_tracker = {}
 
@@ -39,16 +35,12 @@ KEYWORDS = [
     "price target increased", "price target lowered", "joint venture", "spin-off", "reverse split", "IPO", "uplisting",
     "downlisting", "NFT", "web3", "data breach", "ransomware", "AI chip", "quantum computing", "SEC investigation",
     "settlement", "class action", "momentum", "record volume", "record high", "ATH", "halted", "resumes trading",
-    # User-added keywords
     "top line", "significant", "demonstrates", "treatment", "cancer", "primary",
     "positive", "laucnhes", "completes", "beneficial", "breakout", "signs"
 ]
 
 last_news_ids = set()
 news_lock = threading.Lock()
-
-def scheduled_startup_and_close_messages():
-    return  # Disable for test
 
 def is_market_hours():
     now = datetime.now(EASTERN)
@@ -63,7 +55,6 @@ def send_news_telegram_alert(symbol, headline, keyword):
         print("Telegram News error:", e)
 
 def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol):
-    # Lowered threshold for testing!
     message = f"🚨 ${symbol} — Volume Spike\nRel: {rel_vol:.2f} Tot: {total_vol} Avg: {avg_vol}"
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
@@ -86,39 +77,54 @@ def send_ema_stack_alert(symbol, price, timeframe, confidence):
     except Exception as e:
         print("Telegram EMA stack alert error:", e)
 
-def scheduler_saturday_ebook():
-    return  # Disable for test
-
 def fetch_all_tickers():
-    # For test: only hot tickers so you get alerts
-    return ["AAPL", "TSLA", "SPY", "NVDA"]
+    # Scan all US listed stocks for price < $5
+    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
+    tickers = []
+    next_url = url
+    while next_url:
+        resp = requests.get(next_url)
+        data = resp.json()
+        results = data.get('results', [])
+        for item in results:
+            symbol = item.get('ticker')
+            if symbol:
+                # Get last price for the symbol
+                try:
+                    aggs = client.get_aggs(symbol, 1, "day", limit=1)
+                    if aggs and isinstance(aggs, list):
+                        last_price = aggs[-1].close
+                        if last_price is not None and last_price < 5:
+                            tickers.append(symbol)
+                except Exception:
+                    continue
+        next_url = data.get('next_url')
+        if next_url:
+            # Polygon returns a partial next_url, so add the domain if needed
+            if next_url.startswith("/"):
+                next_url = f"https://api.polygon.io{next_url}&apiKey={POLYGON_API_KEY}"
+            else:
+                next_url += f"&apiKey={POLYGON_API_KEY}"
+    return tickers
 
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     try:
         end_time = int(now_utc.timestamp() * 1000)
         start_time = int((now_utc - timedelta(minutes=5)).timestamp() * 1000)
         try:
-            candles = client.get_aggs(
-                symbol,
-                1,
-                "minute",
-                from_=start_time,
-                to=end_time,
-                limit=5
-            )
+            candles = client.get_aggs(symbol, 1, "minute", from_=start_time, to=end_time, limit=5)
         except Exception:
             candles = []
         if not candles or not isinstance(candles, list) or len(candles) < 5:
             return
-        # Use .close and .volume
         avg_vol = sum(candle.volume for candle in candles[:-1]) / len(candles[:-1])
-        if avg_vol < 50000:     # Lowered
+        if avg_vol < 20000:     # Lowered for pennies
             return
         total_vol = sum(candle.volume for candle in candles)
-        if total_vol < 100000:  # Lowered
+        if total_vol < 50000:  # Lowered for pennies
             return
         rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
-        if (rel_vol >= 1.2 or total_vol >= 1.2 * avg_vol) and now_ts - last_alert_time.get(symbol, 0) > cooldown:
+        if (rel_vol >= 1.5 or total_vol >= 1.5 * avg_vol) and now_ts - last_alert_time.get(symbol, 0) > cooldown:
             send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol)
             last_alert_time[symbol] = now_ts
     except Exception as e:
@@ -129,13 +135,13 @@ def volume_spike_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             now_utc = datetime.utcnow()
-            cooldown = 30
+            cooldown = 60
             now_ts = time.time()
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(1)
+        time.sleep(2)
 
 def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     try:
@@ -170,12 +176,12 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
             return
         last_candle = candles[-1]
         avg_vol = sum(candle.volume for candle in candles[-10:]) / 10
-        if last_candle.volume < avg_vol or last_candle.volume < 50000:  # Lowered
+        if last_candle.volume < avg_vol or last_candle.volume < 20000:  # Lowered
             return
         price_change = (closes[-1] - closes[0]) / closes[0] * 100
-        if abs(price_change) < 1:  # Lowered
+        if abs(price_change) < 2:  # Lowered for pennies
             return
-        confidence = 10 if price_change > 2 else 8 if price_change > 1.5 else 6
+        confidence = 10 if price_change > 5 else 8 if price_change > 3 else 6
         label = "5-min" if label_5min else ("1-min" if timeframe=="minute" else timeframe)
         send_ema_stack_alert(symbol, closes[-1], label, confidence)
     except Exception as e:
@@ -185,14 +191,14 @@ def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
                 futures = [executor.submit(check_ema_stack_worker, symbol, "5minute", True) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(1)
+        time.sleep(3)
 
 def check_hod_worker(symbol):
     try:
@@ -203,14 +209,7 @@ def check_hod_worker(symbol):
         start_ts = int(start.timestamp() * 1000)
         end_ts = int(now.timestamp() * 1000)
         try:
-            candles = client.get_aggs(
-                symbol,
-                1,
-                "minute",
-                from_=start_ts,
-                to=end_ts,
-                limit=1000
-            )
+            candles = client.get_aggs(symbol, 1, "minute", from_=start_ts, to=end_ts, limit=1000)
         except Exception:
             candles = []
         if not candles or not isinstance(candles, list) or not candles:
@@ -229,11 +228,11 @@ def hod_scanner():
     while True:
         if is_market_hours():
             tickers = list(alerted_tickers)
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(1)
+        time.sleep(2)
 
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
@@ -270,7 +269,7 @@ def news_polling_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
-        time.sleep(10)
+        time.sleep(15)
 
 def check_gap_worker(symbol, seen_today):
     try:
@@ -290,10 +289,9 @@ def check_gap_worker(symbol, seen_today):
             return
         prev = yest[0]
         curr = today_agg[0]
-        # .open, .close
         gap = (curr.open - prev.close) / prev.close * 100
         key = f"{symbol}|{curr.open}|{prev.close}"
-        if abs(gap) >= 2 and key not in seen_today:  # Lowered
+        if abs(gap) >= 5 and key not in seen_today:  # Penny stocks can gap big
             direction = "Gap Up" if gap > 0 else "Gap Down"
             message = f"🚀 {direction}: ${symbol} opened {gap:.1f}% {'higher' if gap > 0 else 'lower'}"
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -306,11 +304,11 @@ def gap_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(10)
+        time.sleep(15)
 
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
     try:
@@ -335,7 +333,7 @@ def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
         last = trades[-1].close
         move = (last - prev_close) / prev_close * 100
         key = f"{symbol}|{now_et.date()}|{last}"
-        if abs(move) >= 2 and key not in seen:  # Lowered
+        if abs(move) >= 5 and key not in seen:
             session = "Premarket" if in_premarket else "After-hours"
             message = f"⚡ {session} Mover: ${symbol} is up {move:.1f}%"
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -351,17 +349,13 @@ def premarket_ah_mover_scanner():
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(10)
-
-def run_polygon_news_websocket(keywords):
-    return  # Disable for test
+        time.sleep(15)
 
 if __name__ == "__main__":
-    # Force alert for test!
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 THIS IS A TEST ALERT. If you see this, Telegram is working.")
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
