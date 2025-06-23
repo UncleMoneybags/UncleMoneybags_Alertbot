@@ -12,9 +12,9 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIG ===
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
-POLYGON_API_KEY = "YOUR_POLYGON_API_KEY"
+TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
+TELEGRAM_CHAT_ID = "-1002266463234"
+POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 client = RESTClient(api_key=POLYGON_API_KEY)
 
@@ -47,62 +47,15 @@ KEYWORDS = [
 last_news_ids = set()
 news_lock = threading.Lock()
 
-startup_messages = [
-    "Lets find some price imbalamce liquidity before the poors even wake up",
-    "SECURE THE DAMN BAG",
-    "Get in. Get rich. Get out.",
-    "Remember, find the setup and ride the wave! Don't let your emotions make you the liquidity.",
-    "SCALE OUT OR BAIL OUT!",
-    "Make sure you're trading and not donating! NEVER chase, NEVER let FOMO get to you!"
-]
-
-market_closed_messages = [
-    "🚨 The market is officially closed. Rest up and get ready to secure the bag tomorrow!",
-    "🔒 The bell has rung and the casino is closed. See you bright and early!",
-    "🛑 Trading day is over! Review your plays, manage your risk, and come back stronger.",
-    "📉 Market closed. Don’t let FOMO get you after hours—patience pays!",
-    "💤 Closing time! Recharge, reflect, and prepare for tomorrow’s action."
-]
-
 def scheduled_startup_and_close_messages():
-    last_startup_sent = None
-    last_close_sent = None
-
-    closed_rotation = market_closed_messages.copy()
-    random.shuffle(closed_rotation)
-    closed_index = 0
-
-    while True:
-        now_et = datetime.now(EASTERN)
-        if (now_et.weekday() < 5 and now_et.hour == 3 and now_et.minute == 55 and
-                (last_startup_sent is None or last_startup_sent != now_et.date())):
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=random.choice(startup_messages))
-            last_startup_sent = now_et.date()
-        if (now_et.weekday() < 5 and now_et.hour == 20 and now_et.minute == 0 and
-                (last_close_sent is None or last_close_sent != now_et.date())):
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=closed_rotation[closed_index])
-            closed_index += 1
-            if closed_index >= len(closed_rotation):
-                random.shuffle(closed_rotation)
-                closed_index = 0
-            last_close_sent = now_et.date()
-        time.sleep(5)
+    return  # Disable for test
 
 def is_market_hours():
     now = datetime.now(EASTERN)
     return now.weekday() < 5 and SCAN_START_HOUR <= now.hour < SCAN_END_HOUR
 
 def send_news_telegram_alert(symbol, headline, keyword):
-    confidence = 5
-    high_conf_keywords = [
-        "fda approval", "acquisition", "merger", "halted", "resumes trading",
-        "record high", "guidance raised", "beats estimates"
-    ]
-    if any(hk in keyword.lower() for hk in high_conf_keywords):
-        confidence = 9
-    elif keyword.lower() in ["ai", "blockchain", "web3"]:
-        confidence = 7
-    message = f"📰 ${symbol} — {headline}\n(keyword: {keyword})\nConfidence: {confidence}/10"
+    message = f"📰 ${symbol} — {headline}\n(keyword: {keyword})"
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
         alerted_tickers.add(symbol)
@@ -110,15 +63,8 @@ def send_news_telegram_alert(symbol, headline, keyword):
         print("Telegram News error:", e)
 
 def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol):
-    if rel_vol > 4 or total_vol > 4*avg_vol:
-        confidence = 10
-    elif rel_vol > 3 or total_vol > 3*avg_vol:
-        confidence = 8
-    elif rel_vol > 2 or total_vol > 2*avg_vol:
-        confidence = 6
-    else:
-        confidence = 4
-    message = f"🚨 ${symbol} — Volume Spike\nConfidence: {confidence}/10"
+    # Lowered threshold for testing!
+    message = f"🚨 ${symbol} — Volume Spike\nRel: {rel_vol:.2f} Tot: {total_vol} Avg: {avg_vol}"
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
         alerted_tickers.add(symbol)
@@ -127,13 +73,7 @@ def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol):
 
 def send_hod_telegram_alert(symbol, price, open_price):
     percent = (price - open_price) / open_price * 100 if open_price else 0
-    if percent >= 10:
-        confidence = 10
-    elif percent >= 5:
-        confidence = 8
-    else:
-        confidence = 6
-    message = f"💰🚀 ${symbol} — NEW HIGH OF DAY: {price:.2f}\nConfidence: {confidence}/10"
+    message = f"💰🚀 ${symbol} — NEW HIGH OF DAY: {price:.2f} ({percent:.2f}%)"
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
     except Exception as e:
@@ -147,16 +87,10 @@ def send_ema_stack_alert(symbol, price, timeframe, confidence):
         print("Telegram EMA stack alert error:", e)
 
 def scheduler_saturday_ebook():
-    last_sent_date = None
-    while True:
-        now = datetime.now(EASTERN)
-        if now.weekday() == 5 and now.hour == 12 and last_sent_date != now.date():
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text='📚 Need more guidance? Grab my ebook "Stock Guide For The Poors."', parse_mode="HTML")
-            last_sent_date = now.date()
-        time.sleep(60)
+    return  # Disable for test
 
 def fetch_all_tickers():
-    # For reliable alerts, use only hot/active tickers!
+    # For test: only hot tickers so you get alerts
     return ["AAPL", "TSLA", "SPY", "NVDA"]
 
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
@@ -172,20 +106,19 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
                 to=end_time,
                 limit=5
             )
-        except Exception as e:
-            if "Expected key \"results\"" not in str(e):
-                print(f"Polygon API error (volume spike) for {symbol}: {e}")
+        except Exception:
             candles = []
         if not candles or not isinstance(candles, list) or len(candles) < 5:
             return
-        avg_vol = sum(c.v for c in candles[:-1]) / len(candles[:-1])
-        if avg_vol < 100000:
+        # Use .close and .volume
+        avg_vol = sum(candle.volume for candle in candles[:-1]) / len(candles[:-1])
+        if avg_vol < 50000:     # Lowered
             return
-        total_vol = sum(c.v for c in candles)
-        if total_vol < 500000:
+        total_vol = sum(candle.volume for candle in candles)
+        if total_vol < 100000:  # Lowered
             return
         rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
-        if (rel_vol >= 2.0 or total_vol >= 2 * avg_vol) and now_ts - last_alert_time.get(symbol, 0) > cooldown:
+        if (rel_vol >= 1.2 or total_vol >= 1.2 * avg_vol) and now_ts - last_alert_time.get(symbol, 0) > cooldown:
             send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol)
             last_alert_time[symbol] = now_ts
     except Exception as e:
@@ -198,11 +131,11 @@ def volume_spike_scanner():
             now_utc = datetime.utcnow()
             cooldown = 30
             now_ts = time.time()
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.5)
+        time.sleep(1)
 
 def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     try:
@@ -212,22 +145,18 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
             start_time = int((now - timedelta(minutes=60)).timestamp() * 1000)
             try:
                 candles = client.get_aggs(symbol, 1, "minute", from_=start_time, to=end_time, limit=30)
-            except Exception as e:
-                if "Expected key \"results\"" not in str(e):
-                    print(f"Polygon API error (ema minute) for {symbol}: {e}")
+            except Exception:
                 candles = []
         else:
             end_time = int(now.timestamp() * 1000)
             start_time = int((now - timedelta(minutes=300)).timestamp() * 1000)
             try:
                 candles = client.get_aggs(symbol, 5, "minute", from_=start_time, to=end_time, limit=30)
-            except Exception as e:
-                if "Expected key \"results\"" not in str(e):
-                    print(f"Polygon API error (ema 5min) for {symbol}: {e}")
+            except Exception:
                 candles = []
         if not candles or not isinstance(candles, list) or len(candles) < 21:
             return
-        closes = [c.c for c in candles]
+        closes = [candle.close for candle in candles]
         def ema(prices, period):
             k = 2 / (period + 1)
             ema_values = [prices[0]]
@@ -240,13 +169,13 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
         if not (ema_8 > ema_13 > ema_21):
             return
         last_candle = candles[-1]
-        avg_vol = sum(c.v for c in candles[-10:]) / 10
-        if last_candle.v < avg_vol or last_candle.v < 100000:
+        avg_vol = sum(candle.volume for candle in candles[-10:]) / 10
+        if last_candle.volume < avg_vol or last_candle.volume < 50000:  # Lowered
             return
         price_change = (closes[-1] - closes[0]) / closes[0] * 100
-        if abs(price_change) < 2:
+        if abs(price_change) < 1:  # Lowered
             return
-        confidence = 10 if price_change > 5 else 8 if price_change > 3 else 6
+        confidence = 10 if price_change > 2 else 8 if price_change > 1.5 else 6
         label = "5-min" if label_5min else ("1-min" if timeframe=="minute" else timeframe)
         send_ema_stack_alert(symbol, closes[-1], label, confidence)
     except Exception as e:
@@ -256,14 +185,14 @@ def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
                 futures = [executor.submit(check_ema_stack_worker, symbol, "5minute", True) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.5)
+        time.sleep(1)
 
 def check_hod_worker(symbol):
     try:
@@ -282,15 +211,13 @@ def check_hod_worker(symbol):
                 to=end_ts,
                 limit=1000
             )
-        except Exception as e:
-            if "Expected key \"results\"" not in str(e):
-                print(f"Polygon API error (hod) for {symbol}: {e}")
+        except Exception:
             candles = []
         if not candles or not isinstance(candles, list) or not candles:
             return
-        hod = max(c.h for c in candles)
+        hod = max(candle.high for candle in candles)
         prev_hod = hod_tracker.get(symbol, None)
-        open_price = candles[0].o if candles else 0
+        open_price = candles[0].open if candles else 0
         if prev_hod is None or hod > prev_hod:
             if prev_hod is not None:
                 send_hod_telegram_alert(symbol, hod, open_price)
@@ -302,11 +229,11 @@ def hod_scanner():
     while True:
         if is_market_hours():
             tickers = list(alerted_tickers)
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.5)
+        time.sleep(1)
 
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
@@ -343,7 +270,7 @@ def news_polling_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
-        time.sleep(0.5)
+        time.sleep(10)
 
 def check_gap_worker(symbol, seen_today):
     try:
@@ -351,15 +278,11 @@ def check_gap_worker(symbol, seen_today):
         yesterday = today - timedelta(days=1)
         try:
             yest = client.get_aggs(symbol, 1, "day", from_=str(yesterday), to=str(yesterday), limit=1)
-        except Exception as e:
-            if "Expected key \"results\"" not in str(e):
-                print(f"Polygon API error (gap yest) for {symbol}: {e}")
+        except Exception:
             yest = []
         try:
             today_agg = client.get_aggs(symbol, 1, "day", from_=str(today), to=str(today), limit=1)
-        except Exception as e:
-            if "Expected key \"results\"" not in str(e):
-                print(f"Polygon API error (gap today) for {symbol}: {e}")
+        except Exception:
             today_agg = []
         if not yest or not isinstance(yest, list) or not yest:
             return
@@ -367,9 +290,10 @@ def check_gap_worker(symbol, seen_today):
             return
         prev = yest[0]
         curr = today_agg[0]
-        gap = (curr.o - prev.c) / prev.c * 100
-        key = f"{symbol}|{curr.o}|{prev.c}"
-        if abs(gap) >= 5 and key not in seen_today:
+        # .open, .close
+        gap = (curr.open - prev.close) / prev.close * 100
+        key = f"{symbol}|{curr.open}|{prev.close}"
+        if abs(gap) >= 2 and key not in seen_today:  # Lowered
             direction = "Gap Up" if gap > 0 else "Gap Down"
             message = f"🚀 {direction}: ${symbol} opened {gap:.1f}% {'higher' if gap > 0 else 'lower'}"
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -382,11 +306,11 @@ def gap_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.5)
+        time.sleep(10)
 
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
     try:
@@ -394,28 +318,24 @@ def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
         yesterday = today - timedelta(days=1)
         try:
             yest = client.get_aggs(symbol, 1, "day", from_=str(yesterday), to=str(yesterday), limit=1)
-        except Exception as e:
-            if "Expected key \"results\"" not in str(e):
-                print(f"Polygon API error (pm/ah yest) for {symbol}: {e}")
+        except Exception:
             yest = []
         if not yest or not isinstance(yest, list) or not yest:
             return
-        prev_close = yest[0].c
+        prev_close = yest[0].close
         now = datetime.utcnow()
         end_time = int(now.timestamp() * 1000)
         start_time = int((now - timedelta(minutes=60)).timestamp() * 1000)
         try:
             trades = client.get_aggs(symbol, 1, "minute", from_=start_time, to=end_time, limit=60)
-        except Exception as e:
-            if "Expected key \"results\"" not in str(e):
-                print(f"Polygon API error (pm/ah trades) for {symbol}: {e}")
+        except Exception:
             trades = []
         if not trades or not isinstance(trades, list) or not trades:
             return
-        last = trades[-1].c
+        last = trades[-1].close
         move = (last - prev_close) / prev_close * 100
         key = f"{symbol}|{now_et.date()}|{last}"
-        if abs(move) >= 5 and key not in seen:
+        if abs(move) >= 2 and key not in seen:  # Lowered
             session = "Premarket" if in_premarket else "After-hours"
             message = f"⚡ {session} Mover: ${symbol} is up {move:.1f}%"
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -431,93 +351,23 @@ def premarket_ah_mover_scanner():
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.5)
+        time.sleep(10)
 
 def run_polygon_news_websocket(keywords):
-    url = f"wss://socket.polygon.io/stocks"
-    ALLOWED_HALT_CODES = ["T1", "T2", "T3", "H10", "LUDP", "MCB"]
-    EXCLUDE_WORDS = ["TEST", "DEMO", "AUCTION"]
-    def ws_runner():
-        async def listen():
-            global last_news_ids
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                await ws.send(json.dumps({"action":"auth","params":POLYGON_API_KEY}))
-                await ws.send(json.dumps({
-                    "action":"subscribe",
-                    "params":"A.NEWS,A.HALT,A.RESUME"
-                }))
-                print("Polygon WebSocket news & halts connected.")
-                while True:
-                    try:
-                        resp = await ws.recv()
-                        msgs = json.loads(resp)
-                        if not isinstance(msgs, list):
-                            msgs = [msgs]
-                        for msg in msgs:
-                            if msg.get("ev") == "A.NEWS":
-                                symbol = msg.get("sym", "")
-                                headline = msg.get("headline", "").lower()
-                                news_id = msg.get("id", "")
-                                with news_lock:
-                                    if news_id in last_news_ids:
-                                        continue
-                                    matched = [kw for kw in keywords if kw.lower() in headline]
-                                    if matched:
-                                        send_news_telegram_alert(
-                                            symbol, msg.get("headline", ""), matched[0]
-                                        )
-                                        last_news_ids.add(news_id)
-                                        alerted_tickers.add(symbol)
-                            if msg.get("ev") == "A.HALT":
-                                symbol = msg.get("sym", "")
-                                reason = msg.get("reason", "") or msg.get("tape", "")
-                                reason_upper = (reason or "").upper()
-                                halt_code = None
-                                for code in ALLOWED_HALT_CODES:
-                                    if code in reason_upper:
-                                        halt_code = code
-                                        break
-                                confidence = 6
-                                if halt_code == "H10":
-                                    confidence = 10
-                                elif halt_code in ("T1", "T2"):
-                                    confidence = 9
-                                elif halt_code in ("LUDP", "MCB"):
-                                    confidence = 8
-                                elif halt_code == "T3":
-                                    confidence = 7
-                                if halt_code and not any(ex in reason_upper for ex in EXCLUDE_WORDS):
-                                    message = f"⏸️ ${symbol} HALTED\nType: {halt_code}\nReason: {reason or 'Unknown'}\nConfidence: {confidence}/10"
-                                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
-                                    alerted_tickers.add(symbol)
-                            if msg.get("ev") == "A.RESUME":
-                                symbol = msg.get("sym", "")
-                                message = f"▶️ ${symbol} RESUMED TRADING\nConfidence: 7/10"
-                                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
-                                alerted_tickers.add(symbol)
-                    except Exception as e:
-                        print("WebSocket err:", e)
-                        time.sleep(1)
-                        break
-        asyncio.run(listen())
-    thread = threading.Thread(target=ws_runner, daemon=True)
-    thread.start()
+    return  # Disable for test
 
 if __name__ == "__main__":
     # Force alert for test!
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 THIS IS A TEST ALERT. If you see this, Telegram is working.")
-    threading.Thread(target=scheduled_startup_and_close_messages, daemon=True).start()
-    threading.Thread(target=scheduler_saturday_ebook, daemon=True).start()
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
     threading.Thread(target=hod_scanner, daemon=True).start()
     threading.Thread(target=news_polling_scanner, daemon=True).start()
     threading.Thread(target=gap_scanner, daemon=True).start()
     threading.Thread(target=premarket_ah_mover_scanner, daemon=True).start()
-    run_polygon_news_websocket(KEYWORDS)
     while True:
         time.sleep(60)
