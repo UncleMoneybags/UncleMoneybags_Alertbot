@@ -8,6 +8,7 @@ import threading
 import asyncio
 import websockets
 import json
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIG ===
@@ -42,6 +43,49 @@ KEYWORDS = [
 
 last_news_ids = set()
 news_lock = threading.Lock()
+
+startup_messages = [
+    "Lets find some price imbalamce liquidity before the poors even wake up",
+    "SECURE THE DAMN BAG",
+    "Get in. Get rich. Get out.",
+    "Remember, find the setup and ride the wave! Don't let your emotions make you the liquidity.",
+    "SCALE OUT OR BAIL OUT!",
+    "Make sure you're trading and not donating! NEVER chase, NEVER let FOMO get to you!"
+]
+
+market_closed_messages = [
+    "🚨 The market is officially closed. Rest up and get ready to secure the bag tomorrow!",
+    "🔒 The bell has rung and the casino is closed. See you bright and early!",
+    "🛑 Trading day is over! Review your plays, manage your risk, and come back stronger.",
+    "📉 Market closed. Don’t let FOMO get you after hours—patience pays!",
+    "💤 Closing time! Recharge, reflect, and prepare for tomorrow’s action."
+]
+
+def scheduled_startup_and_close_messages():
+    last_startup_sent = None
+    last_close_sent = None
+
+    closed_rotation = market_closed_messages.copy()
+    random.shuffle(closed_rotation)
+    closed_index = 0
+
+    while True:
+        now_et = datetime.now(EASTERN)
+        # Startup message at 3:55am Mon–Fri
+        if (now_et.weekday() < 5 and now_et.hour == 3 and now_et.minute == 55 and
+                (last_startup_sent is None or last_startup_sent != now_et.date())):
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=random.choice(startup_messages))
+            last_startup_sent = now_et.date()
+        # Market closed message at 8:00pm Mon–Fri, rotating through all messages
+        if (now_et.weekday() < 5 and now_et.hour == 20 and now_et.minute == 0 and
+                (last_close_sent is None or last_close_sent != now_et.date())):
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=closed_rotation[closed_index])
+            closed_index += 1
+            if closed_index >= len(closed_rotation):
+                random.shuffle(closed_rotation)
+                closed_index = 0
+            last_close_sent = now_et.date()
+        time.sleep(30)
 
 def is_market_hours():
     now = datetime.now(EASTERN)
@@ -421,7 +465,7 @@ def run_polygon_news_websocket(keywords):
     thread.start()
 
 if __name__ == "__main__":
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="lets find some bangers!")
+    threading.Thread(target=scheduled_startup_and_close_messages, daemon=True).start()
     threading.Thread(target=scheduler_saturday_ebook, daemon=True).start()
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
