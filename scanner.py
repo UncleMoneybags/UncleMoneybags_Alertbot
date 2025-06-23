@@ -38,7 +38,11 @@ KEYWORDS = [
     "misses estimates", "EPS", "profit warning", "short squeeze", "analyst upgrade", "analyst downgrade",
     "price target increased", "price target lowered", "joint venture", "spin-off", "reverse split", "IPO", "uplisting",
     "downlisting", "NFT", "web3", "data breach", "ransomware", "AI chip", "quantum computing", "SEC investigation",
-    "settlement", "class action", "momentum", "record volume", "record high", "ATH", "halted", "resumes trading"
+    "settlement", "class action", "momentum", "record volume", "record high", "ATH", "halted", "resumes trading",
+
+    # User-added keywords
+    "top line", "significant", "demonstrates", "treatment", "cancer", "primary",
+    "positive", "laucnhes", "completes", "beneficial", "breakout", "signs"
 ]
 
 last_news_ids = set()
