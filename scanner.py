@@ -79,9 +79,8 @@ def send_ema_stack_alert(symbol, price, timeframe, confidence):
 
 def fetch_all_tickers():
     """
-    Fetch all US common stocks (type=CS) with last close < $5,
-    excluding ETFs, funds, ADRs, preferreds, units, etc.
-    Prints raw results for debugging.
+    Fetch all US common stocks (type=CS), excluding ETFs, funds, ADRs, preferreds, units, etc.
+    Looser filtering: no price check!
     """
     url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&type=CS&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     tickers = []
@@ -102,22 +101,14 @@ def fetch_all_tickers():
                 # Exclude OTC
                 if item.get('primary_exchange') == 'OTC':
                     continue
-                # Exclude if name has etf, fund, trust, depositary, unit, warrant, preferred, adr, note, bond, income
                 name = item.get('name', '').lower()
                 if any(x in name for x in [
                     'etf', 'fund', 'trust', 'depositary', 'unit', 'warrant',
                     'preferred', 'adr', 'note', 'bond', 'income'
                 ]):
                     continue
-                # Get last close price
-                try:
-                    aggs = client.get_aggs(symbol, 1, "day", limit=1)
-                    if aggs and isinstance(aggs, list):
-                        last_price = aggs[-1].close
-                        if last_price is not None and last_price < 5:
-                            tickers.append(symbol)
-                except Exception:
-                    continue
+                # NO price check here!
+                tickers.append(symbol)
             url = data.get('next_url')
             if url:
                 if url.startswith("/"):
@@ -143,10 +134,10 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
         if not candles or not isinstance(candles, list) or len(candles) < 5:
             return
         avg_vol = sum(candle.volume for candle in candles[:-1]) / len(candles[:-1])
-        if avg_vol < 20000:     # Lowered for pennies
+        if avg_vol < 20000:
             return
         total_vol = sum(candle.volume for candle in candles)
-        if total_vol < 50000:  # Lowered for pennies
+        if total_vol < 50000:
             return
         rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
         if (rel_vol >= 1.5 or total_vol >= 1.5 * avg_vol) and now_ts - last_alert_time.get(symbol, 0) > cooldown:
@@ -203,10 +194,10 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
             return
         last_candle = candles[-1]
         avg_vol = sum(candle.volume for candle in candles[-10:]) / 10
-        if last_candle.volume < avg_vol or last_candle.volume < 20000:  # Lowered
+        if last_candle.volume < avg_vol or last_candle.volume < 20000:
             return
         price_change = (closes[-1] - closes[0]) / closes[0] * 100
-        if abs(price_change) < 2:  # Lowered for pennies
+        if abs(price_change) < 2:
             return
         confidence = 10 if price_change > 5 else 8 if price_change > 3 else 6
         label = "5-min" if label_5min else ("1-min" if timeframe=="minute" else timeframe)
@@ -324,7 +315,7 @@ def check_gap_worker(symbol, seen_today):
         curr = today_agg[0]
         gap = (curr.open - prev.close) / prev.close * 100
         key = f"{symbol}|{curr.open}|{prev.close}"
-        if abs(gap) >= 5 and key not in seen_today:  # Penny stocks can gap big
+        if abs(gap) >= 5 and key not in seen_today:
             direction = "Gap Up" if gap > 0 else "Gap Down"
             message = f"🚀 {direction}: ${symbol} opened {gap:.1f}% {'higher' if gap > 0 else 'lower'}"
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
