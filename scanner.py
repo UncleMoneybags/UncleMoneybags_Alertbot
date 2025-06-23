@@ -81,16 +81,19 @@ def fetch_all_tickers():
     """
     Fetch all US common stocks (type=CS) with last close < $5,
     excluding ETFs, funds, ADRs, preferreds, units, etc.
+    Prints raw results for debugging.
     """
     url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&type=CS&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     tickers = []
     seen = set()
+    page = 0
     while url:
         try:
             resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
             data = resp.json()
             results = data.get('results', [])
+            print(f"Polygon page {page} returned {len(results)} raw tickers")
+            print("Sample raw ticker result:", results[:2])
             for item in results:
                 symbol = item.get('ticker')
                 if not symbol or symbol in seen:
@@ -121,9 +124,12 @@ def fetch_all_tickers():
                     url = f"https://api.polygon.io{url}&apiKey={POLYGON_API_KEY}"
                 else:
                     url += f"&apiKey={POLYGON_API_KEY}"
+            page += 1
         except Exception as e:
             print(f"Polygon fetch error: {e}")
             break
+    print(f"Fetched {len(tickers)} filtered tickers")
+    print("Sample filtered tickers:", tickers[:10])
     return tickers
 
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
