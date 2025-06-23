@@ -11,16 +11,14 @@ from collections import defaultdict
 import warnings
 
 # === LOGGING SETUP ===
-logging.basicConfig(
-    filename='scanner.log',
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-console.setFormatter(formatter)
-logging.getLogger('').addHandler(console)
+from logging.handlers import RotatingFileHandler
+
+log_handler = RotatingFileHandler('scanner.log', maxBytes=10*1024*1024, backupCount=5)
+log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+logging.getLogger('').handlers = []  # Remove default handlers
+logging.getLogger('').addHandler(log_handler)
+logging.getLogger('').addHandler(logging.StreamHandler())  # Also log to console
+logging.getLogger('').setLevel(logging.INFO)
 
 error_counts = defaultdict(int)
 
@@ -38,7 +36,9 @@ TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+from telegram.utils.request import Request
+telegram_request = Request(con_pool_size=40)  # Increase Telegram pool!
+bot = Bot(token=TELEGRAM_BOT_TOKEN, request=telegram_request)
 
 EASTERN = pytz.timezone('US/Eastern')
 SCAN_START_HOUR = 4
@@ -48,20 +48,11 @@ last_alert_time = {}
 alerted_tickers = set()
 hod_tracker = {}
 
+# === IMPACTFUL NEWS ONLY ===
 KEYWORDS = [
-    "fda approval", "fast track", "phase 1", "phase 2", "phase 3", "orphan drug", "IND submission", "IND clearance",
-    "breakthrough therapy", "AI", "AI integration", "blockchain", "cloud contract", "cybersecurity", "machine learning",
-    "acquisition", "merger", "SPAC merger", "strategic partnership", "investment from", "contract", "expansion into",
-    "guidance raised", "record revenue", "divestiture", "signs deal", "launches platform", "awarded", "accepting crypto",
-    "bitcoin", "viral", "buyback", "oral treatment", "preclinical trial", "DOD contract", "china approval", "plans to acquire",
-    "partnership", "emergency use authorization", "CRL", "NDA submission", "NDA approval", "BLA submission", "BLA approval",
-    "PDUFA", "clinical hold", "data readout", "positive topline data", "statistically significant", "beats estimates",
-    "misses estimates", "EPS", "profit warning", "short squeeze", "analyst upgrade", "analyst downgrade",
-    "price target increased", "price target lowered", "joint venture", "spin-off", "reverse split", "IPO", "uplisting",
-    "downlisting", "NFT", "web3", "data breach", "ransomware", "AI chip", "quantum computing", "SEC investigation",
-    "settlement", "class action", "momentum", "record volume", "record high", "ATH", "halted", "resumes trading",
-    "top line", "significant", "demonstrates", "treatment", "cancer", "primary",
-    "positive", "laucnhes", "completes", "beneficial", "breakout", "signs"
+    "fda approval", "acquisition", "merger", "guidance raised", "record revenue", "breakthrough therapy",
+    "phase 3", "nda approval", "buyback", "uplisting", "contract", "strategic partnership",
+    "emergency use authorization"
 ]
 
 last_news_ids = set()
@@ -77,7 +68,10 @@ def is_market_hours():
     now = datetime.now(EASTERN)
     return now.weekday() < 5 and SCAN_START_HOUR <= now.hour < SCAN_END_HOUR
 
-def send_news_telegram_alert(symbol, headline, keyword):
+def send_news_telegram_alert(symbol, headline, keyword, price=None):
+    # Only alert for stocks with price > $2
+    if price is not None and price < 2.0:
+        return
     message = f"📰 ${symbol} — {headline}\n(keyword: {keyword})"
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
@@ -85,8 +79,11 @@ def send_news_telegram_alert(symbol, headline, keyword):
     except Exception as e:
         logging.error(f"Telegram News error: {e}")
 
-def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol):
-    message = f"🚨 ${symbol} — Volume Spike\nRel: {rel_vol:.2f} Tot: {total_vol} Avg: {avg_vol}"
+def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol, price, price_change):
+    # Only alert if rel_vol >= 4.0, total_vol > 100000, price > $2, and |price_change| > 2%
+    if rel_vol < 4.0 or total_vol < 100000 or price < 2.0 or abs(price_change) < 2.0:
+        return
+    message = f"🚨 ${symbol} — Volume Spike\nRel: {rel_vol:.2f} Tot: {total_vol} Avg: {avg_vol} Price: {price:.2f} ({price_change:.2f}%)"
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
         alerted_tickers.add(symbol)
@@ -160,6 +157,17 @@ def get_aggs(symbol, timespan, multiplier, from_ts, to_ts, limit=1000):
         error_counts[str(e)] += 1
         return []
 
+def get_last_price(symbol):
+    url = f"https://api.polygon.io/v2/last/trade/stock/{symbol}?apiKey={POLYGON_API_KEY}"
+    try:
+        resp = session.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("results", {}).get("p", 0)
+    except Exception as e:
+        error_counts[str(e)] += 1
+        return 0
+
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     try:
         end_time = int(now_utc.timestamp() * 1000)
@@ -168,14 +176,14 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
         if not candles or len(candles) < 5:
             return
         avg_vol = sum(candle["v"] for candle in candles[:-1]) / len(candles[:-1])
-        if avg_vol < 20000:
+        if avg_vol < 50000:
             return
         total_vol = sum(candle["v"] for candle in candles)
-        if total_vol < 50000:
-            return
+        price = candles[-1]["c"]
+        price_change = (candles[-1]["c"] - candles[0]["o"]) / candles[0]["o"] * 100 if candles[0]["o"] != 0 else 0
         rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
-        if (rel_vol >= 1.5 or total_vol >= 1.5 * avg_vol) and now_ts - last_alert_time.get(symbol, 0) > cooldown:
-            send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol)
+        if now_ts - last_alert_time.get(symbol, 0) > cooldown:
+            send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol, price, price_change)
             last_alert_time[symbol] = now_ts
     except Exception as e:
         error_counts[str(e)] += 1
@@ -222,10 +230,10 @@ def check_ema_stack_worker(symbol, timespan="minute", label_5min=False):
             return
         last_candle = candles[-1]
         avg_vol = sum(candle["v"] for candle in candles[-10:]) / 10
-        if last_candle["v"] < avg_vol or last_candle["v"] < 20000:
+        if last_candle["v"] < avg_vol or last_candle["v"] < 50000 or last_candle["c"] < 2.0:
             return
         price_change = (closes[-1] - closes[0]) / closes[0] * 100
-        if abs(price_change) < 2:
+        if abs(price_change) < 3:
             return
         confidence = 10 if price_change > 5 else 8 if price_change > 3 else 6
         label = "5-min" if label_5min else ("1-min" if timespan=="minute" else timespan)
@@ -304,6 +312,8 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
             tasks.append(fetch_news(session, symbol))
         for future in asyncio.as_completed(tasks):
             symbol, news_items = await future
+            # Get price for news filter
+            price = get_last_price(symbol)
             for news in news_items:
                 headline = news.get("title", "").lower()
                 news_id = news.get("id", "")
@@ -311,8 +321,8 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
                     if news_id in last_news_ids:
                         continue
                     matched = [kw for kw in keywords if kw.lower() in headline]
-                    if matched:
-                        send_news_telegram_alert(symbol, news.get("title", ""), matched[0])
+                    if matched and price > 2.0:
+                        send_news_telegram_alert(symbol, news.get("title", ""), matched[0], price=price)
                         last_news_ids.add(news_id)
 
 def news_polling_scanner():
@@ -334,6 +344,8 @@ def check_gap_worker(symbol, seen_today):
             return
         prev = yest[0]
         curr = today_agg[0]
+        if curr["o"] < 2.0:
+            return
         gap = (curr["o"] - prev["c"]) / prev["c"] * 100
         key = f"{symbol}|{curr['o']}|{prev['c']}"
         if abs(gap) >= 5 and key not in seen_today:
@@ -372,6 +384,8 @@ def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
         if not trades:
             return
         last = trades[-1]["c"]
+        if last < 2.0:
+            return
         move = (last - prev_close) / prev_close * 100
         key = f"{symbol}|{now_et.date()}|{last}"
         if abs(move) >= 5 and key not in seen:
