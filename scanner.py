@@ -85,7 +85,7 @@ def scheduled_startup_and_close_messages():
                 random.shuffle(closed_rotation)
                 closed_index = 0
             last_close_sent = now_et.date()
-        time.sleep(30)
+        time.sleep(5)  # keep this a little higher to avoid 2 messages by accident
 
 def is_market_hours():
     now = datetime.now(EASTERN)
@@ -200,11 +200,11 @@ def volume_spike_scanner():
             now_utc = datetime.utcnow()
             cooldown = 30
             now_ts = time.time()
-            with ThreadPoolExecutor(max_workers=64) as executor:
+            with ThreadPoolExecutor(max_workers=512) as executor:  # maximize workers
                 futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(1)
+        time.sleep(0.05)  # scan as fast as feasible
 
 def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     try:
@@ -247,16 +247,14 @@ def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=64) as executor:
-                # 1-min EMA
+            with ThreadPoolExecutor(max_workers=512) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-                # 5-min EMA
                 futures = [executor.submit(check_ema_stack_worker, symbol, "5minute", True) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(2)
+        time.sleep(0.05)
 
 def check_hod_worker(symbol):
     try:
@@ -290,11 +288,11 @@ def hod_scanner():
     while True:
         if is_market_hours():
             tickers = list(alerted_tickers)
-            with ThreadPoolExecutor(max_workers=32) as executor:
+            with ThreadPoolExecutor(max_workers=256) as executor:
                 futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(2)
+        time.sleep(0.05)
 
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
@@ -329,7 +327,7 @@ def news_polling_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
-        time.sleep(10)
+        time.sleep(0.05)
 
 def check_gap_worker(symbol, seen_today):
     try:
@@ -354,11 +352,11 @@ def gap_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=64) as executor:
+            with ThreadPoolExecutor(max_workers=512) as executor:
                 futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(30)
+        time.sleep(0.05)
 
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
     try:
@@ -388,11 +386,11 @@ def premarket_ah_mover_scanner():
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=64) as executor:
+            with ThreadPoolExecutor(max_workers=512) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(10)
+        time.sleep(0.05)
 
 def run_polygon_news_websocket(keywords):
     url = f"wss://socket.polygon.io/stocks"
@@ -458,7 +456,7 @@ def run_polygon_news_websocket(keywords):
                                 alerted_tickers.add(symbol)
                     except Exception as e:
                         print("WebSocket err:", e)
-                        time.sleep(5)
+                        time.sleep(1)
                         break
         asyncio.run(listen())
     thread = threading.Thread(target=ws_runner, daemon=True)
