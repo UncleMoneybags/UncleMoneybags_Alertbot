@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 import pytz
 from telegram import Bot
 import threading
-import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from collections import defaultdict
@@ -44,10 +43,6 @@ last_alert_time = {}
 alerted_tickers = set()
 hod_tracker = {}
 
-# Deduped breakout: (symbol, hod, date)
-breakout_alerted_hod = set()
-last_breakout_reset_date = None
-
 # For news scanner
 KEYWORDS = [
     "fda approval", "acquisition", "merger", "guidance raised", "record revenue", "breakthrough therapy",
@@ -56,13 +51,6 @@ KEYWORDS = [
 ]
 last_news_ids = set()
 news_lock = threading.Lock()
-
-def daily_breakout_reset():
-    global breakout_alerted_hod, last_breakout_reset_date
-    today_str = datetime.now(EASTERN).strftime('%Y-%m-%d')
-    if last_breakout_reset_date != today_str:
-        breakout_alerted_hod.clear()
-        last_breakout_reset_date = today_str
 
 def log_error_summary():
     for err, count in error_counts.items():
@@ -114,17 +102,6 @@ def send_ema_stack_alert(symbol, price, timeframe, confidence, ema8, ema13, ema2
     except Exception as e:
         logging.error(f"Telegram EMA stack alert error: {e}")
 
-def send_breakout_alert(symbol, price, high, volume, price_change, avg_vol):
-    message = (
-        f"💥 BREAKOUT: ${symbol} New HOD {high:.2f} "
-        f"Vol {volume:.0f} ({price_change:.1f}% from open, avg vol: {avg_vol:.0f})"
-    )
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
-        alerted_tickers.add(symbol)
-    except Exception as e:
-        logging.error(f"Telegram Breakout alert error: {e}")
-
 def send_pm_ah_alert(symbol, pct, session_desc):
     message = f"⚡ {session_desc} Mover: ${symbol} is up {pct:.1f}%"
     try:
@@ -137,7 +114,6 @@ def fetch_all_tickers():
     url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&type=CS&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     tickers = []
     seen = set()
-    page = 0
     while url:
         try:
             resp = session.get(url, timeout=15)
@@ -163,7 +139,6 @@ def fetch_all_tickers():
                     url = f"https://api.polygon.io{url}&apiKey={POLYGON_API_KEY}"
                 else:
                     url += f"&apiKey={POLYGON_API_KEY}"
-            page += 1
         except Exception as e:
             error_counts[str(e)] += 1
             break
@@ -179,17 +154,6 @@ def get_aggs(symbol, timespan, multiplier, from_ts, to_ts, limit=1000):
     except Exception as e:
         error_counts[str(e)] += 1
         return []
-
-def get_last_price(symbol):
-    url = f"https://api.polygon.io/v2/last/trade/stock/{symbol}?apiKey={POLYGON_API_KEY}"
-    try:
-        resp = session.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("results", {}).get("p", 0)
-    except Exception as e:
-        error_counts[str(e)] += 1
-        return 0
 
 def ema(values, period):
     if len(values) < period:
@@ -320,45 +284,6 @@ def hod_scanner():
                     pass
         time.sleep(2)
 
-# BREAKOUT SCANNER (STRICT DEDUPED)
-def check_breakout_worker(symbol, now):
-    global breakout_alerted_hod
-    try:
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_ts = int(start.timestamp() * 1000)
-        end_ts = int(now.timestamp() * 1000)
-        candles = get_aggs(symbol, "minute", 1, start_ts, end_ts, limit=1000)
-        if not candles or len(candles) < 15:
-            return
-        prev_high = max(c["h"] for c in candles[:-1])
-        last_candle = candles[-1]
-        this_hod = round(float(last_candle["h"]), 4)
-        today_str = now.strftime('%Y-%m-%d')
-        key = (symbol, this_hod, today_str)
-        if key in breakout_alerted_hod:
-            return  # Already alerted for this HOD today
-        if this_hod > prev_high and last_candle["c"] > 2.0:
-            avg_vol = sum(c["v"] for c in candles[-11:-1]) / 10
-            if last_candle["v"] > 2 * avg_vol:
-                open_price = candles[0]["o"]
-                price_change = (last_candle["c"] - open_price) / open_price * 100
-                if price_change > 3:
-                    send_breakout_alert(symbol, last_candle["c"], this_hod, last_candle["v"], price_change, avg_vol)
-                    breakout_alerted_hod.add(key)
-    except Exception as e:
-        error_counts[str(e)] += 1
-
-def breakout_scanner():
-    while True:
-        daily_breakout_reset()
-        if is_market_hours():
-            tickers = fetch_all_tickers()
-            now = datetime.utcnow()
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                for symbol in tickers:
-                    executor.submit(check_breakout_worker, symbol, now)
-        time.sleep(2)
-
 # NEWS SCANNER
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
@@ -382,7 +307,7 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
             tasks.append(fetch_news(session, symbol))
         for future in asyncio.as_completed(tasks):
             symbol, news_items = await future
-            price = get_last_price(symbol)
+            # get_price call removed, just news headline scan
             for news in news_items:
                 headline = news.get("title", "").lower()
                 news_id = news.get("id", "")
@@ -390,14 +315,15 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
                     if news_id in last_news_ids:
                         continue
                     matched = [kw for kw in keywords if kw.lower() in headline]
-                    if matched and price > 2.0:
-                        send_news_telegram_alert(symbol, news.get("title", ""), matched[0], price=price)
+                    if matched:
+                        send_news_telegram_alert(symbol, news.get("title", ""), matched[0])
                         last_news_ids.add(news_id)
 
 def news_polling_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
+            import asyncio
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
         time.sleep(15)
 
@@ -448,12 +374,11 @@ def error_summary_thread():
         log_error_summary()
 
 if __name__ == "__main__":
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 FULL SCANNER RESTARTED. If you see this, Telegram is working.")
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 SCANNER RESTARTED. Breakout scanner removed. Only volume, EMA, HOD, news, and PM/AH remain.")
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
     threading.Thread(target=hod_scanner, daemon=True).start()
     threading.Thread(target=news_polling_scanner, daemon=True).start()
-    threading.Thread(target=breakout_scanner, daemon=True).start()
     threading.Thread(target=premarket_ah_mover_scanner, daemon=True).start()
     threading.Thread(target=error_summary_thread, daemon=True).start()
     while True:
