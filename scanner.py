@@ -78,8 +78,8 @@ def send_ema_stack_alert(symbol, price, timeframe, confidence):
         print("Telegram EMA stack alert error:", e)
 
 def fetch_all_tickers():
-    # Scan all US listed stocks for price < $5
-    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
+    # Only fetch US common stocks (type=CS), price < $5, exclude everything else
+    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&type=CS&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     tickers = []
     next_url = url
     while next_url:
@@ -88,19 +88,25 @@ def fetch_all_tickers():
         results = data.get('results', [])
         for item in results:
             symbol = item.get('ticker')
-            if symbol:
-                # Get last price for the symbol
-                try:
-                    aggs = client.get_aggs(symbol, 1, "day", limit=1)
-                    if aggs and isinstance(aggs, list):
-                        last_price = aggs[-1].close
-                        if last_price is not None and last_price < 5:
-                            tickers.append(symbol)
-                except Exception:
-                    continue
+            if not symbol:
+                continue
+            # Extra sanity checks: exclude OTC, warrants, preferreds, units, etc.
+            if item.get('primary_exchange') == 'OTC':
+                continue
+            name = item.get('name', '').lower()
+            if any(x in name for x in ['etf', 'fund', 'trust', 'depositary', 'unit', 'warrant', 'preferred', 'adr', 'note', 'bond', 'income']):
+                continue
+            # Now get last price from Polygon
+            try:
+                aggs = client.get_aggs(symbol, 1, "day", limit=1)
+                if aggs and isinstance(aggs, list):
+                    last_price = aggs[-1].close
+                    if last_price is not None and last_price < 5:
+                        tickers.append(symbol)
+            except Exception:
+                continue
         next_url = data.get('next_url')
         if next_url:
-            # Polygon returns a partial next_url, so add the domain if needed
             if next_url.startswith("/"):
                 next_url = f"https://api.polygon.io{next_url}&apiKey={POLYGON_API_KEY}"
             else:
