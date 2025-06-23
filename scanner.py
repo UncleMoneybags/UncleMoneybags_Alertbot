@@ -78,39 +78,52 @@ def send_ema_stack_alert(symbol, price, timeframe, confidence):
         print("Telegram EMA stack alert error:", e)
 
 def fetch_all_tickers():
-    # Only fetch US common stocks (type=CS), price < $5, exclude everything else
+    """
+    Fetch all US common stocks (type=CS) with last close < $5,
+    excluding ETFs, funds, ADRs, preferreds, units, etc.
+    """
     url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&type=CS&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     tickers = []
-    next_url = url
-    while next_url:
-        resp = requests.get(next_url)
-        data = resp.json()
-        results = data.get('results', [])
-        for item in results:
-            symbol = item.get('ticker')
-            if not symbol:
-                continue
-            # Extra sanity checks: exclude OTC, warrants, preferreds, units, etc.
-            if item.get('primary_exchange') == 'OTC':
-                continue
-            name = item.get('name', '').lower()
-            if any(x in name for x in ['etf', 'fund', 'trust', 'depositary', 'unit', 'warrant', 'preferred', 'adr', 'note', 'bond', 'income']):
-                continue
-            # Now get last price from Polygon
-            try:
-                aggs = client.get_aggs(symbol, 1, "day", limit=1)
-                if aggs and isinstance(aggs, list):
-                    last_price = aggs[-1].close
-                    if last_price is not None and last_price < 5:
-                        tickers.append(symbol)
-            except Exception:
-                continue
-        next_url = data.get('next_url')
-        if next_url:
-            if next_url.startswith("/"):
-                next_url = f"https://api.polygon.io{next_url}&apiKey={POLYGON_API_KEY}"
-            else:
-                next_url += f"&apiKey={POLYGON_API_KEY}"
+    seen = set()
+    while url:
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get('results', [])
+            for item in results:
+                symbol = item.get('ticker')
+                if not symbol or symbol in seen:
+                    continue
+                seen.add(symbol)
+                # Exclude OTC
+                if item.get('primary_exchange') == 'OTC':
+                    continue
+                # Exclude if name has etf, fund, trust, depositary, unit, warrant, preferred, adr, note, bond, income
+                name = item.get('name', '').lower()
+                if any(x in name for x in [
+                    'etf', 'fund', 'trust', 'depositary', 'unit', 'warrant',
+                    'preferred', 'adr', 'note', 'bond', 'income'
+                ]):
+                    continue
+                # Get last close price
+                try:
+                    aggs = client.get_aggs(symbol, 1, "day", limit=1)
+                    if aggs and isinstance(aggs, list):
+                        last_price = aggs[-1].close
+                        if last_price is not None and last_price < 5:
+                            tickers.append(symbol)
+                except Exception:
+                    continue
+            url = data.get('next_url')
+            if url:
+                if url.startswith("/"):
+                    url = f"https://api.polygon.io{url}&apiKey={POLYGON_API_KEY}"
+                else:
+                    url += f"&apiKey={POLYGON_API_KEY}"
+        except Exception as e:
+            print(f"Polygon fetch error: {e}")
+            break
     return tickers
 
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
@@ -140,6 +153,8 @@ def volume_spike_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
+            print(f"Fetched {len(tickers)} tickers [Volume Scanner]")
+            print("Sample tickers:", tickers[:10])
             now_utc = datetime.utcnow()
             cooldown = 60
             now_ts = time.time()
@@ -197,6 +212,8 @@ def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
+            print(f"Fetched {len(tickers)} tickers [EMA Scanner]")
+            print("Sample tickers:", tickers[:10])
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -234,6 +251,8 @@ def hod_scanner():
     while True:
         if is_market_hours():
             tickers = list(alerted_tickers)
+            print(f"Fetched {len(tickers)} tickers [HOD Scanner]")
+            print("Sample tickers:", tickers[:10])
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -274,6 +293,8 @@ def news_polling_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
+            print(f"Fetched {len(tickers)} tickers [News Scanner]")
+            print("Sample tickers:", tickers[:10])
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
         time.sleep(15)
 
@@ -310,6 +331,8 @@ def gap_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
+            print(f"Fetched {len(tickers)} tickers [Gap Scanner]")
+            print("Sample tickers:", tickers[:10])
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -355,6 +378,8 @@ def premarket_ah_mover_scanner():
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
             tickers = fetch_all_tickers()
+            print(f"Fetched {len(tickers)} tickers [Premarket/AH Scanner]")
+            print("Sample tickers:", tickers[:10])
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
