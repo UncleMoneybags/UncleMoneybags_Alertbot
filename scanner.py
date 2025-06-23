@@ -12,9 +12,9 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIG ===
-TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
-TELEGRAM_CHAT_ID = "-1002266463234"
-POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+POLYGON_API_KEY = "YOUR_POLYGON_API_KEY"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 client = RESTClient(api_key=POLYGON_API_KEY)
 
@@ -156,17 +156,8 @@ def scheduler_saturday_ebook():
         time.sleep(60)
 
 def fetch_all_tickers():
-    try:
-        url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
-        r = requests.get(url)
-        data = r.json()
-        if "results" not in data:
-            print("Polygon API error (tickers):", data)
-            return []
-        return [item["ticker"] for item in data["results"] if item.get("primary_exchange") in ["XNYS", "XNAS"]]
-    except Exception as e:
-        print("Error fetching tickers:", e)
-        return []
+    # For reliable alerts, use only hot/active tickers!
+    return ["AAPL", "TSLA", "SPY", "NVDA"]
 
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     try:
@@ -182,7 +173,8 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
                 limit=5
             )
         except Exception as e:
-            print(f"Polygon API error (volume spike) for {symbol}: {e}")
+            if "Expected key \"results\"" not in str(e):
+                print(f"Polygon API error (volume spike) for {symbol}: {e}")
             candles = []
         if not candles or not isinstance(candles, list) or len(candles) < 5:
             return
@@ -206,11 +198,11 @@ def volume_spike_scanner():
             now_utc = datetime.utcnow()
             cooldown = 30
             now_ts = time.time()
-            with ThreadPoolExecutor(max_workers=128) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.05)
+        time.sleep(0.5)
 
 def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     try:
@@ -221,7 +213,8 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
             try:
                 candles = client.get_aggs(symbol, 1, "minute", from_=start_time, to=end_time, limit=30)
             except Exception as e:
-                print(f"Polygon API error (ema minute) for {symbol}: {e}")
+                if "Expected key \"results\"" not in str(e):
+                    print(f"Polygon API error (ema minute) for {symbol}: {e}")
                 candles = []
         else:
             end_time = int(now.timestamp() * 1000)
@@ -229,7 +222,8 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
             try:
                 candles = client.get_aggs(symbol, 5, "minute", from_=start_time, to=end_time, limit=30)
             except Exception as e:
-                print(f"Polygon API error (ema 5min) for {symbol}: {e}")
+                if "Expected key \"results\"" not in str(e):
+                    print(f"Polygon API error (ema 5min) for {symbol}: {e}")
                 candles = []
         if not candles or not isinstance(candles, list) or len(candles) < 21:
             return
@@ -262,14 +256,14 @@ def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=128) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
                 futures = [executor.submit(check_ema_stack_worker, symbol, "5minute", True) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.05)
+        time.sleep(0.5)
 
 def check_hod_worker(symbol):
     try:
@@ -289,7 +283,8 @@ def check_hod_worker(symbol):
                 limit=1000
             )
         except Exception as e:
-            print(f"Polygon API error (hod) for {symbol}: {e}")
+            if "Expected key \"results\"" not in str(e):
+                print(f"Polygon API error (hod) for {symbol}: {e}")
             candles = []
         if not candles or not isinstance(candles, list) or not candles:
             return
@@ -307,11 +302,11 @@ def hod_scanner():
     while True:
         if is_market_hours():
             tickers = list(alerted_tickers)
-            with ThreadPoolExecutor(max_workers=64) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_hod_worker, symbol) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.05)
+        time.sleep(0.5)
 
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
@@ -320,12 +315,11 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
             url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit=3&apiKey={POLYGON_API_KEY}"
             async with session.get(url, timeout=8) as r:
                 data = await r.json()
-            if "error" in data or "status" in data and data["status"] != "OK":
-                print(f"Polygon API error (news) for {symbol}: {data}")
-                return symbol, []
+            if "error" in data or (data.get("status") == "ERROR"):
+                print(f"News API error for {symbol}: {data}")
             return symbol, data.get("results", [])
         except Exception as e:
-            print(f"News error {symbol}: {e}")
+            print(f"News error {symbol}: {repr(e)}")
             return symbol, []
     tasks = []
     async with aiohttp.ClientSession() as session:
@@ -349,7 +343,7 @@ def news_polling_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
-        time.sleep(0.05)
+        time.sleep(0.5)
 
 def check_gap_worker(symbol, seen_today):
     try:
@@ -358,12 +352,14 @@ def check_gap_worker(symbol, seen_today):
         try:
             yest = client.get_aggs(symbol, 1, "day", from_=str(yesterday), to=str(yesterday), limit=1)
         except Exception as e:
-            print(f"Polygon API error (gap yest) for {symbol}: {e}")
+            if "Expected key \"results\"" not in str(e):
+                print(f"Polygon API error (gap yest) for {symbol}: {e}")
             yest = []
         try:
             today_agg = client.get_aggs(symbol, 1, "day", from_=str(today), to=str(today), limit=1)
         except Exception as e:
-            print(f"Polygon API error (gap today) for {symbol}: {e}")
+            if "Expected key \"results\"" not in str(e):
+                print(f"Polygon API error (gap today) for {symbol}: {e}")
             today_agg = []
         if not yest or not isinstance(yest, list) or not yest:
             return
@@ -386,11 +382,11 @@ def gap_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=128) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_gap_worker, symbol, seen_today) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.05)
+        time.sleep(0.5)
 
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
     try:
@@ -399,7 +395,8 @@ def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
         try:
             yest = client.get_aggs(symbol, 1, "day", from_=str(yesterday), to=str(yesterday), limit=1)
         except Exception as e:
-            print(f"Polygon API error (pm/ah yest) for {symbol}: {e}")
+            if "Expected key \"results\"" not in str(e):
+                print(f"Polygon API error (pm/ah yest) for {symbol}: {e}")
             yest = []
         if not yest or not isinstance(yest, list) or not yest:
             return
@@ -410,7 +407,8 @@ def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
         try:
             trades = client.get_aggs(symbol, 1, "minute", from_=start_time, to=end_time, limit=60)
         except Exception as e:
-            print(f"Polygon API error (pm/ah trades) for {symbol}: {e}")
+            if "Expected key \"results\"" not in str(e):
+                print(f"Polygon API error (pm/ah trades) for {symbol}: {e}")
             trades = []
         if not trades or not isinstance(trades, list) or not trades:
             return
@@ -433,11 +431,11 @@ def premarket_ah_mover_scanner():
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
             tickers = fetch_all_tickers()
-            with ThreadPoolExecutor(max_workers=128) as executor:
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
-        time.sleep(0.05)
+        time.sleep(0.5)
 
 def run_polygon_news_websocket(keywords):
     url = f"wss://socket.polygon.io/stocks"
@@ -510,6 +508,8 @@ def run_polygon_news_websocket(keywords):
     thread.start()
 
 if __name__ == "__main__":
+    # Force alert for test!
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 THIS IS A TEST ALERT. If you see this, Telegram is working.")
     threading.Thread(target=scheduled_startup_and_close_messages, daemon=True).start()
     threading.Thread(target=scheduler_saturday_ebook, daemon=True).start()
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
