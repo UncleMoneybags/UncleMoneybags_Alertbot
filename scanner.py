@@ -9,6 +9,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from collections import defaultdict
+import warnings
 
 # === LOGGING SETUP ===
 logging.basicConfig(
@@ -24,12 +25,26 @@ logging.getLogger('').addHandler(console)
 
 error_counts = defaultdict(int)
 
+# === SUPPRESS CONNECTION POOL WARNINGS ===
+warnings.filterwarnings("ignore", message="Connection pool is full, discarding connection")
+
+# === CUSTOM REQUESTS SESSION WITH BIGGER POOL ===
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
+session.mount('https://', adapter)
+session.mount('http://', adapter)
+
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 client = RESTClient(api_key=POLYGON_API_KEY)
+try:
+    # If RESTClient exposes session, use our pooled session
+    client._session = session
+except Exception:
+    pass
 
 EASTERN = pytz.timezone('US/Eastern')
 SCAN_START_HOUR = 4
@@ -110,7 +125,7 @@ def fetch_all_tickers():
     page = 0
     while url:
         try:
-            resp = requests.get(url, timeout=15)
+            resp = session.get(url, timeout=15)
             data = resp.json()
             results = data.get('results', [])
             logging.info(f"Polygon page {page} returned {len(results)} raw tickers")
@@ -295,7 +310,7 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
                 return symbol, []
 
     tasks = []
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=10)) as session:
         for symbol in tickers[:200]:  # Limit to first 200 tickers for news
             tasks.append(fetch_news(session, symbol))
         for future in asyncio.as_completed(tasks):
