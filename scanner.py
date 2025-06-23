@@ -197,6 +197,19 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     except Exception as e:
         print(f"Volume spike error for {symbol}: {e}")
 
+def volume_spike_scanner():
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            now_utc = datetime.utcnow()
+            cooldown = 30
+            now_ts = time.time()
+            with ThreadPoolExecutor(max_workers=128) as executor:
+                futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+        time.sleep(0.05)
+
 def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
     try:
         now = datetime.utcnow()
@@ -234,6 +247,19 @@ def check_ema_stack_worker(symbol, timeframe="minute", label_5min=False):
         send_ema_stack_alert(symbol, closes[-1], label, confidence)
     except Exception as e:
         print(f"EMA stack error for {symbol}: {e}")
+
+def ema_stack_scanner():
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            with ThreadPoolExecutor(max_workers=128) as executor:
+                futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+                futures = [executor.submit(check_ema_stack_worker, symbol, "5minute", True) for symbol in tickers]
+                for _ in as_completed(futures):
+                    pass
+        time.sleep(0.05)
 
 def check_hod_worker(symbol):
     try:
