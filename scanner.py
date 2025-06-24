@@ -134,6 +134,13 @@ def send_pm_ah_alert(symbol, pct, session_desc):
     except Exception as e:
         logging.error(f"Telegram PM/AH alert error: {e}")
 
+def send_breakout_alert(symbol, price, resistance, volume):
+    message = f"💥 BREAKOUT: ${symbol} broke resistance {resistance:.2f} now {price:.2f} with vol {volume}"
+    try:
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Telegram breakout alert error: {e}")
+
 def fetch_all_tickers():
     url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&type=CS&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     tickers = []
@@ -308,6 +315,54 @@ def hod_scanner():
                     pass
         time.sleep(2)
 
+# RESISTANCE/ BREAKOUT SCANNER
+def find_resistance_level(candles, lookback=100, tolerance=0.002, min_touches=2):
+    """
+    Find a resistance level in the last `lookback` candles.
+    - tolerance: how close (relative) highs must be to count as the same resistance level (e.g. 0.2%).
+    - min_touches: minimum times price must touch the level.
+    Returns: price level or None
+    """
+    highs = [c['h'] for c in candles[-lookback:]]
+    levels = []
+    for i, high in enumerate(highs):
+        touches = sum(1 for h in highs if abs(h - high)/high < tolerance)
+        if touches >= min_touches:
+            levels.append((high, touches))
+    if not levels:
+        return None
+    # Choose the level with most touches and highest price
+    levels.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    return levels[0][0]
+
+def breakout_scanner():
+    already_alerted = set()
+    while True:
+        if is_market_hours():
+            tickers = fetch_all_tickers()
+            for symbol in tickers:
+                now = datetime.utcnow()
+                # Look back e.g. 100 candles (minutes)
+                end_time = int(now.timestamp() * 1000)
+                start_time = int((now - timedelta(minutes=120)).timestamp() * 1000)
+                candles = get_aggs(symbol, "minute", 1, start_time, end_time, limit=120)
+                if not candles or len(candles) < 30:
+                    continue
+                resistance = find_resistance_level(candles[:-5], lookback=100)
+                if not resistance:
+                    continue
+                price = candles[-1]["c"]
+                prev_close = candles[-2]["c"]
+                key = f"{symbol}:{resistance:.2f}"
+                # Breakout condition: price crosses above resistance level
+                if prev_close < resistance and price > resistance and key not in already_alerted:
+                    # Optional: require volume spike
+                    avg_vol = sum(c["v"] for c in candles[-11:-1]) / 10
+                    if candles[-1]["v"] > 1.5 * avg_vol and price > 2:
+                        send_breakout_alert(symbol, price, resistance, candles[-1]["v"])
+                        already_alerted.add(key)
+        time.sleep(10)
+
 # NEWS SCANNER
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
@@ -350,7 +405,7 @@ def news_polling_scanner():
         if is_market_hours():
             tickers = fetch_all_tickers()
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
-        time.sleep(15)
+        time.sleep(5)  # lower interval for more real-time news
 
 # PREMARKET/AFTERHOURS SCANNER
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
@@ -398,14 +453,65 @@ def error_summary_thread():
         time.sleep(300)
         log_error_summary()
 
+# === SCHEDULED TIME ALERTS ===
+def scheduled_time_alerts():
+    last_alerts = {"premarket": None, "open": None, "close": None}
+    while True:
+        now_et = datetime.now(EASTERN)
+        weekday = now_et.weekday()  # 0=Monday, ..., 4=Friday
+        today = now_et.date()
+
+        # Premarket alert at 3:55am ET
+        if weekday < 5 and now_et.hour == 3 and now_et.minute == 55:
+            if last_alerts["premarket"] != today:
+                try:
+                    bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text="⏰ Premarket in 5 mins...be there!",
+                        parse_mode="HTML"
+                    )
+                    last_alerts["premarket"] = today
+                except Exception as e:
+                    logging.error(f"Premarket alert error: {e}")
+
+        # Market open alert at 9:25am ET
+        if weekday < 5 and now_et.hour == 9 and now_et.minute == 25:
+            if last_alerts["open"] != today:
+                try:
+                    bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text="🚀 Market opens in 5 mins....secure the damn bag!",
+                        parse_mode="HTML"
+                    )
+                    last_alerts["open"] = today
+                except Exception as e:
+                    logging.error(f"Open alert error: {e}")
+
+        # Market close alert at 8:00pm ET
+        if weekday < 5 and now_et.hour == 20 and now_et.minute == 0:
+            if last_alerts["close"] != today:
+                try:
+                    bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text="🔔 Market Closed....recovene in pre market.",
+                        parse_mode="HTML"
+                    )
+                    last_alerts["close"] = today
+                except Exception as e:
+                    logging.error(f"Close alert error: {e}")
+
+        time.sleep(20)
+
 if __name__ == "__main__":
     load_news_alerted_ids()
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 SCANNER RESTARTED. Breakout scanner removed. Only volume, EMA, HOD, news, and PM/AH remain.")
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 SCANNER RESTARTED. Breakout scanner now only triggers when price breaks a resistance level with volume. Volume, EMA, HOD, news, and PM/AH remain. Scheduled time alerts active.")
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
     threading.Thread(target=hod_scanner, daemon=True).start()
     threading.Thread(target=news_polling_scanner, daemon=True).start()
     threading.Thread(target=premarket_ah_mover_scanner, daemon=True).start()
+    threading.Thread(target=breakout_scanner, daemon=True).start()
+    threading.Thread(target=scheduled_time_alerts, daemon=True).start()
     threading.Thread(target=error_summary_thread, daemon=True).start()
     while True:
         time.sleep(60)
