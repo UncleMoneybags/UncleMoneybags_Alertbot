@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import pytz
 from telegram import Bot
 import threading
+from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from collections import defaultdict
@@ -20,9 +21,9 @@ EASTERN = pytz.timezone('US/Eastern')
 SCAN_START_HOUR = 4
 SCAN_END_HOUR = 20
 MAX_FLOAT = 10_000_000  # 10 million
+MAX_CANDLE_REQS_PER_SEC = 5  # Polygon Advanced plan per-endpoint limit
 
 from logging.handlers import RotatingFileHandler
-
 log_handler = RotatingFileHandler('scanner.log', maxBytes=10*1024*1024, backupCount=5)
 log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 logging.getLogger('').handlers = []
@@ -46,7 +47,6 @@ last_alert_time = {}
 alerted_tickers = set()
 hod_tracker = {}
 
-# For news scanner
 KEYWORDS = [
     "fda approval", "acquisition", "merger", "guidance raised", "record revenue", "breakthrough therapy",
     "phase 3", "nda approval", "buyback", "uplisting", "contract", "strategic partnership",
@@ -54,7 +54,6 @@ KEYWORDS = [
 ]
 news_lock = threading.Lock()
 
-# === Persistent news dedupe ===
 NEWS_ALERTED_FILE = "news_alerted_ids.pkl"
 news_alerted_ids = set()
 
@@ -211,10 +210,9 @@ def ema(values, period):
         emas.append((price - prev_ema) * k + prev_ema)
     return emas
 
-# VOLUME SPIKE SCANNER -- 3 minute window, 5% move, 0.05 ≤ price ≤ 10, float ≤ 10M
+# --- Volume Spike Scanner with Polygon Rate Limiting ---
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     try:
-        # Get 4 most recent 1-min candles (covers 3 minutes)
         end_time = int(now_utc.timestamp() * 1000)
         start_time = int((now_utc - timedelta(minutes=3)).timestamp() * 1000)
         candles = get_aggs(symbol, "minute", 1, start_time, end_time, limit=4)
@@ -225,12 +223,9 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
         if avg_vol <= 0:
             return
         rel_vol = last_vol / avg_vol
-        # Only alert if 2x <= last_vol/avg_vol < 3x
         if 2 <= rel_vol < 3:
             price = candles[-1]["c"]
-            # Price change from first open to last close (3 minutes)
             price_change = (candles[-1]["c"] - candles[0]["o"]) / candles[0]["o"] * 100 if candles[0]["o"] != 0 else 0
-            # Only price between $0.05 and $10, and 5% or more move
             if 0.05 <= price <= 10 and abs(price_change) >= 5:
                 if now_ts - last_alert_time.get(symbol, 0) > cooldown:
                     send_volume_telegram_alert(symbol, rel_vol, price, price_change)
@@ -238,20 +233,40 @@ def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     except Exception as e:
         error_counts[str(e)] += 1
 
+def rate_limited_worker(ticker_queue, *scanner_args):
+    while True:
+        ticker = ticker_queue.get()
+        if ticker is None:
+            break
+        check_volume_spike_worker(ticker, *scanner_args)
+        ticker_queue.task_done()
+
 def volume_spike_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers_with_float(MAX_FLOAT)
+            ticker_queue = Queue()
+            for symbol in tickers:
+                ticker_queue.put(symbol)
+            workers = []
             now_utc = datetime.utcnow()
             cooldown = 60
             now_ts = time.time()
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [executor.submit(check_volume_spike_worker, symbol, now_utc, cooldown, now_ts) for symbol in tickers]
-                for _ in as_completed(futures):
-                    pass
-        time.sleep(2)
+            for _ in range(MAX_CANDLE_REQS_PER_SEC):
+                t = threading.Thread(target=rate_limited_worker, args=(ticker_queue, now_utc, cooldown, now_ts))
+                t.daemon = True
+                t.start()
+                workers.append(t)
+            for _ in range(len(tickers)):
+                time.sleep(1.0 / MAX_CANDLE_REQS_PER_SEC)
+            ticker_queue.join()
+            for _ in range(MAX_CANDLE_REQS_PER_SEC):
+                ticker_queue.put(None)
+            for t in workers:
+                t.join()
+        time.sleep(1)
 
-# EMA STACK SCANNER (still only float ≤ 10M)
+# --- EMA STACK SCANNER ---
 def check_ema_stack_worker(symbol, timespan="minute", label_5min=False):
     try:
         now = datetime.utcnow()
@@ -293,7 +308,7 @@ def ema_stack_scanner():
     while True:
         if is_market_hours():
             tickers = fetch_all_tickers_with_float(MAX_FLOAT)
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=MAX_CANDLE_REQS_PER_SEC) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
                     pass
@@ -302,7 +317,7 @@ def ema_stack_scanner():
                     pass
         time.sleep(3)
 
-# HOD SCANNER
+# --- HOD SCANNER ---
 def check_hod_worker(symbol):
     try:
         if symbol not in alerted_tickers:
@@ -334,7 +349,7 @@ def hod_scanner():
                     pass
         time.sleep(2)
 
-# RESISTANCE/ BREAKOUT SCANNER
+# --- BREAKOUT SCANNER ---
 def find_resistance_level(candles, lookback=100, tolerance=0.002, min_touches=2):
     highs = [c['h'] for c in candles[-lookback:]]
     levels = []
@@ -374,7 +389,7 @@ def breakout_scanner():
                         already_alerted.add(key)
         time.sleep(10)
 
-# NEWS SCANNER
+# --- NEWS SCANNER ---
 async def async_scan_news_and_alert_parallel(tickers, keywords):
     import aiohttp
     semaphore = asyncio.Semaphore(5)
@@ -418,7 +433,7 @@ def news_polling_scanner():
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
         time.sleep(5)
 
-# PREMARKET/AFTERHOURS SCANNER
+# --- PREMARKET/AFTERHOURS SCANNER ---
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
     try:
         today = datetime.utcnow().date()
@@ -464,7 +479,6 @@ def error_summary_thread():
         time.sleep(300)
         log_error_summary()
 
-# === SCHEDULED TIME ALERTS ===
 def scheduled_time_alerts():
     last_alerts = {"premarket": None, "open": None, "close": None}
     while True:
@@ -508,7 +522,10 @@ def scheduled_time_alerts():
 
 if __name__ == "__main__":
     load_news_alerted_ids()
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 SCANNER RESTARTED. Volume, EMA, HOD, news, breakout, PM/AH, and scheduled time alerts active. Volume spike = 2–3x (3min), ≥5% move, $0.05–$10, float ≤10M.")
+    bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text="🚨 SCANNER RESTARTED. Volume, EMA, HOD, news, breakout, PM/AH, and scheduled time alerts active. Volume spike = 2–3x (3min), ≥5% move, $0.05–$10, float ≤10M. Max speed without exceeding Polygon Advanced plan limits."
+    )
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
     threading.Thread(target=hod_scanner, daemon=True).start()
