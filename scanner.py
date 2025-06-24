@@ -19,8 +19,8 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 EASTERN = pytz.timezone('US/Eastern')
 SCAN_START_HOUR = 4
 SCAN_END_HOUR = 20
+MAX_FLOAT = 10_000_000  # 10 million
 
-# === LOGGING SETUP ===
 from logging.handlers import RotatingFileHandler
 
 log_handler = RotatingFileHandler('scanner.log', maxBytes=10*1024*1024, backupCount=5)
@@ -87,7 +87,7 @@ def is_market_hours():
     return now.weekday() < 5 and SCAN_START_HOUR <= now.hour < SCAN_END_HOUR
 
 def send_news_telegram_alert(symbol, headline, keyword, price=None):
-    if price is not None and price < 2.0:
+    if price is not None and price < 0.05:
         return
     message = f"📰 ${symbol} — {headline}\n(keyword: {keyword})"
     try:
@@ -96,10 +96,12 @@ def send_news_telegram_alert(symbol, headline, keyword, price=None):
     except Exception as e:
         logging.error(f"Telegram News error: {e}")
 
-def send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol, price, price_change):
-    if rel_vol < 4.0 or total_vol < 100000 or price < 2.0 or abs(price_change) < 2.0:
-        return
-    message = f"🚨 ${symbol} — Volume Spike\nRel: {rel_vol:.2f} Tot: {total_vol} Avg: {avg_vol} Price: {price:.2f} ({price_change:.2f}%)"
+def send_volume_telegram_alert(symbol, rel_vol, price, price_change):
+    message = (
+        f"🚨 ${symbol} — Volume Spike\n"
+        f"Spike: {rel_vol:.2f}x\n"
+        f"Price: {price:.2f} ({price_change:.2f}%)"
+    )
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message.strip(), parse_mode="HTML")
         alerted_tickers.add(symbol)
@@ -141,7 +143,7 @@ def send_breakout_alert(symbol, price, resistance, volume):
     except Exception as e:
         logging.error(f"Telegram breakout alert error: {e}")
 
-def fetch_all_tickers():
+def fetch_all_tickers_with_float(max_float=MAX_FLOAT):
     url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&type=CS&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     tickers = []
     seen = set()
@@ -163,7 +165,18 @@ def fetch_all_tickers():
                     'preferred', 'adr', 'note', 'bond', 'income'
                 ]):
                     continue
-                tickers.append(symbol)
+                float_shares = item.get("share_class_shares_outstanding", None)
+                if float_shares is None:
+                    try:
+                        f_url = f"https://api.polygon.io/v3/reference/financials?ticker={symbol}&limit=1&apiKey={POLYGON_API_KEY}"
+                        f_resp = session.get(f_url, timeout=10)
+                        f_data = f_resp.json()
+                        fin = f_data.get("results", [{}])[0]
+                        float_shares = fin.get("float_shares_outstanding", None)
+                    except Exception:
+                        float_shares = None
+                if float_shares is not None and float_shares <= max_float:
+                    tickers.append(symbol)
             url = data.get('next_url')
             if url:
                 if url.startswith("/"):
@@ -198,31 +211,37 @@ def ema(values, period):
         emas.append((price - prev_ema) * k + prev_ema)
     return emas
 
-# VOLUME SPIKE SCANNER
+# VOLUME SPIKE SCANNER -- 3 minute window, 5% move, 0.05 ≤ price ≤ 10, float ≤ 10M
 def check_volume_spike_worker(symbol, now_utc, cooldown, now_ts):
     try:
+        # Get 4 most recent 1-min candles (covers 3 minutes)
         end_time = int(now_utc.timestamp() * 1000)
-        start_time = int((now_utc - timedelta(minutes=5)).timestamp() * 1000)
-        candles = get_aggs(symbol, "minute", 1, start_time, end_time, limit=5)
-        if not candles or len(candles) < 5:
+        start_time = int((now_utc - timedelta(minutes=3)).timestamp() * 1000)
+        candles = get_aggs(symbol, "minute", 1, start_time, end_time, limit=4)
+        if not candles or len(candles) < 4:
             return
-        avg_vol = sum(candle["v"] for candle in candles[:-1]) / len(candles[:-1])
-        if avg_vol < 50000:
+        avg_vol = sum(candle["v"] for candle in candles[:-1]) / 3
+        last_vol = candles[-1]["v"]
+        if avg_vol <= 0:
             return
-        total_vol = sum(candle["v"] for candle in candles)
-        price = candles[-1]["c"]
-        price_change = (candles[-1]["c"] - candles[0]["o"]) / candles[0]["o"] * 100 if candles[0]["o"] != 0 else 0
-        rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
-        if now_ts - last_alert_time.get(symbol, 0) > cooldown:
-            send_volume_telegram_alert(symbol, rel_vol, total_vol, avg_vol, price, price_change)
-            last_alert_time[symbol] = now_ts
+        rel_vol = last_vol / avg_vol
+        # Only alert if 2x <= last_vol/avg_vol < 3x
+        if 2 <= rel_vol < 3:
+            price = candles[-1]["c"]
+            # Price change from first open to last close (3 minutes)
+            price_change = (candles[-1]["c"] - candles[0]["o"]) / candles[0]["o"] * 100 if candles[0]["o"] != 0 else 0
+            # Only price between $0.05 and $10, and 5% or more move
+            if 0.05 <= price <= 10 and abs(price_change) >= 5:
+                if now_ts - last_alert_time.get(symbol, 0) > cooldown:
+                    send_volume_telegram_alert(symbol, rel_vol, price, price_change)
+                    last_alert_time[symbol] = now_ts
     except Exception as e:
         error_counts[str(e)] += 1
 
 def volume_spike_scanner():
     while True:
         if is_market_hours():
-            tickers = fetch_all_tickers()
+            tickers = fetch_all_tickers_with_float(MAX_FLOAT)
             now_utc = datetime.utcnow()
             cooldown = 60
             now_ts = time.time()
@@ -232,7 +251,7 @@ def volume_spike_scanner():
                     pass
         time.sleep(2)
 
-# EMA STACK SCANNER
+# EMA STACK SCANNER (still only float ≤ 10M)
 def check_ema_stack_worker(symbol, timespan="minute", label_5min=False):
     try:
         now = datetime.utcnow()
@@ -259,7 +278,7 @@ def check_ema_stack_worker(symbol, timespan="minute", label_5min=False):
             return
         last_candle = candles[-1]
         avg_vol = sum(candle["v"] for candle in candles[-10:]) / 10
-        if last_candle["v"] < avg_vol or last_candle["v"] < 50000 or last_candle["c"] < 2.0:
+        if last_candle["v"] < avg_vol or last_candle["v"] < 50000 or last_candle["c"] < 0.05 or last_candle["c"] > 10:
             return
         price_change = (closes[-1] - closes[0]) / closes[0] * 100
         if abs(price_change) < 3:
@@ -273,7 +292,7 @@ def check_ema_stack_worker(symbol, timespan="minute", label_5min=False):
 def ema_stack_scanner():
     while True:
         if is_market_hours():
-            tickers = fetch_all_tickers()
+            tickers = fetch_all_tickers_with_float(MAX_FLOAT)
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_ema_stack_worker, symbol, "minute", False) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -317,12 +336,6 @@ def hod_scanner():
 
 # RESISTANCE/ BREAKOUT SCANNER
 def find_resistance_level(candles, lookback=100, tolerance=0.002, min_touches=2):
-    """
-    Find a resistance level in the last `lookback` candles.
-    - tolerance: how close (relative) highs must be to count as the same resistance level (e.g. 0.2%).
-    - min_touches: minimum times price must touch the level.
-    Returns: price level or None
-    """
     highs = [c['h'] for c in candles[-lookback:]]
     levels = []
     for i, high in enumerate(highs):
@@ -331,7 +344,6 @@ def find_resistance_level(candles, lookback=100, tolerance=0.002, min_touches=2)
             levels.append((high, touches))
     if not levels:
         return None
-    # Choose the level with most touches and highest price
     levels.sort(key=lambda x: (x[1], x[0]), reverse=True)
     return levels[0][0]
 
@@ -339,10 +351,9 @@ def breakout_scanner():
     already_alerted = set()
     while True:
         if is_market_hours():
-            tickers = fetch_all_tickers()
+            tickers = fetch_all_tickers_with_float(MAX_FLOAT)
             for symbol in tickers:
                 now = datetime.utcnow()
-                # Look back e.g. 100 candles (minutes)
                 end_time = int(now.timestamp() * 1000)
                 start_time = int((now - timedelta(minutes=120)).timestamp() * 1000)
                 candles = get_aggs(symbol, "minute", 1, start_time, end_time, limit=120)
@@ -352,13 +363,13 @@ def breakout_scanner():
                 if not resistance:
                     continue
                 price = candles[-1]["c"]
+                if price < 0.05 or price > 10:
+                    continue
                 prev_close = candles[-2]["c"]
                 key = f"{symbol}:{resistance:.2f}"
-                # Breakout condition: price crosses above resistance level
                 if prev_close < resistance and price > resistance and key not in already_alerted:
-                    # Optional: require volume spike
                     avg_vol = sum(c["v"] for c in candles[-11:-1]) / 10
-                    if candles[-1]["v"] > 1.5 * avg_vol and price > 2:
+                    if candles[-1]["v"] > 1.5 * avg_vol:
                         send_breakout_alert(symbol, price, resistance, candles[-1]["v"])
                         already_alerted.add(key)
         time.sleep(10)
@@ -403,9 +414,9 @@ async def async_scan_news_and_alert_parallel(tickers, keywords):
 def news_polling_scanner():
     while True:
         if is_market_hours():
-            tickers = fetch_all_tickers()
+            tickers = fetch_all_tickers_with_float(MAX_FLOAT)
             asyncio.run(async_scan_news_and_alert_parallel(tickers, KEYWORDS))
-        time.sleep(5)  # lower interval for more real-time news
+        time.sleep(5)
 
 # PREMARKET/AFTERHOURS SCANNER
 def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
@@ -423,11 +434,11 @@ def check_pm_ah_worker(symbol, seen, now_et, in_premarket, in_ah):
         if not trades:
             return
         last = trades[-1]["c"]
-        if last < 2.0:
+        if last < 0.05 or last > 10:
             return
         move = (last - prev_close) / prev_close * 100
         key = f"{symbol}|{now_et.date()}|{last}"
-        if abs(move) >= 5 and key not in seen:
+        if abs(move) >= 30 and key not in seen:
             session_desc = "Premarket" if in_premarket else "After-hours"
             send_pm_ah_alert(symbol, move, session_desc)
             seen.add(key)
@@ -441,7 +452,7 @@ def premarket_ah_mover_scanner():
         in_premarket = 4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
         in_ah = 16 <= now_et.hour < 20
         if in_premarket or in_ah:
-            tickers = fetch_all_tickers()
+            tickers = fetch_all_tickers_with_float(MAX_FLOAT)
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(check_pm_ah_worker, symbol, seen, now_et, in_premarket, in_ah) for symbol in tickers]
                 for _ in as_completed(futures):
@@ -458,10 +469,8 @@ def scheduled_time_alerts():
     last_alerts = {"premarket": None, "open": None, "close": None}
     while True:
         now_et = datetime.now(EASTERN)
-        weekday = now_et.weekday()  # 0=Monday, ..., 4=Friday
+        weekday = now_et.weekday()
         today = now_et.date()
-
-        # Premarket alert at 3:55am ET
         if weekday < 5 and now_et.hour == 3 and now_et.minute == 55:
             if last_alerts["premarket"] != today:
                 try:
@@ -473,8 +482,6 @@ def scheduled_time_alerts():
                     last_alerts["premarket"] = today
                 except Exception as e:
                     logging.error(f"Premarket alert error: {e}")
-
-        # Market open alert at 9:25am ET
         if weekday < 5 and now_et.hour == 9 and now_et.minute == 25:
             if last_alerts["open"] != today:
                 try:
@@ -486,8 +493,6 @@ def scheduled_time_alerts():
                     last_alerts["open"] = today
                 except Exception as e:
                     logging.error(f"Open alert error: {e}")
-
-        # Market close alert at 8:00pm ET
         if weekday < 5 and now_et.hour == 20 and now_et.minute == 0:
             if last_alerts["close"] != today:
                 try:
@@ -499,12 +504,11 @@ def scheduled_time_alerts():
                     last_alerts["close"] = today
                 except Exception as e:
                     logging.error(f"Close alert error: {e}")
-
         time.sleep(20)
 
 if __name__ == "__main__":
     load_news_alerted_ids()
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 SCANNER RESTARTED. Breakout scanner now only triggers when price breaks a resistance level with volume. Volume, EMA, HOD, news, and PM/AH remain. Scheduled time alerts active.")
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚨 SCANNER RESTARTED. Volume, EMA, HOD, news, breakout, PM/AH, and scheduled time alerts active. Volume spike = 2–3x (3min), ≥5% move, $0.05–$10, float ≤10M.")
     threading.Thread(target=volume_spike_scanner, daemon=True).start()
     threading.Thread(target=ema_stack_scanner, daemon=True).start()
     threading.Thread(target=hod_scanner, daemon=True).start()
