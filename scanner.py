@@ -4,6 +4,17 @@ from datetime import datetime, timedelta
 import os
 import json
 import threading
+
+# For Eastern timezone support:
+try:
+    from zoneinfo import ZoneInfo
+    TZ_NY = ZoneInfo("America/New_York")
+    print("[DEBUG] Using zoneinfo for America/New_York", flush=True)
+except ImportError:
+    import pytz
+    TZ_NY = pytz.timezone("US/Eastern")
+    print("[DEBUG] Using pytz for US/Eastern", flush=True)
+
 from websocket import WebSocketApp
 
 print("[DEBUG] SCANNER.PY IS RUNNING", flush=True)
@@ -79,8 +90,10 @@ def save_seen_news_id(news_id, filename=SEEN_NEWS_FILE):
     print(f"[DEBUG] Saved news ID: {news_id}", flush=True)
 
 def scan_for_news(tickers, seen_news_ids):
-    print(f"[DEBUG] Scanning news for tickers: {tickers}", flush=True)
-    since = (datetime.utcnow() - timedelta(minutes=NEWS_LOOKBACK_MINUTES)).isoformat()[:16]
+    # Use Eastern time for the since cutoff
+    now_ny = datetime.now(TZ_NY)
+    print(f"[DEBUG] Scanning news for tickers: {tickers} at Eastern time {now_ny}", flush=True)
+    since = (now_ny - timedelta(minutes=NEWS_LOOKBACK_MINUTES)).astimezone().isoformat()[:16]
     for ticker in tickers:
         url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&published_utc.gte={since}&limit=5&apiKey={POLYGON_API_KEY}"
         try:
@@ -111,7 +124,7 @@ class RealTimeScanner:
         self.active = True
 
     def on_message(self, ws, message):
-        print(f"[WS] Message received at {datetime.now()}: {message[:100]}", flush=True)
+        print(f"[WS] Message received at {datetime.now(TZ_NY)} (Eastern): {message[:100]}", flush=True)
         try:
             data = json.loads(message)
             for event in data:
@@ -154,7 +167,7 @@ class RealTimeScanner:
         print(f"[WS] Connection closed: {close_status_code} {close_msg}", flush=True)
 
     def on_open(self, ws):
-        print(f"[WS] Connected to Polygon WebSocket at {datetime.now()}", flush=True)
+        print(f"[WS] Connected to Polygon WebSocket at {datetime.now(TZ_NY)} (Eastern)", flush=True)
         try:
             auth_data = {
                 "action": "auth",
@@ -183,8 +196,9 @@ class RealTimeScanner:
             print(f"[ERROR][WS][run] {e}", flush=True)
 
 def within_scan_window():
-    now = datetime.now()
-    print(f"[DEBUG] Checking scan window: weekday={now.weekday()}, hour={now.hour}", flush=True)
+    # Use Eastern time for window check
+    now = datetime.now(TZ_NY)
+    print(f"[DEBUG] Server datetime now (Eastern): {now}", flush=True)
     # Monday is 0, Sunday is 6
     if now.weekday() >= 5:
         print("[DEBUG] Today is weekend. Not scanning.", flush=True)
@@ -192,7 +206,7 @@ def within_scan_window():
     scan_start = now.replace(hour=4, minute=0, second=0, microsecond=0)
     scan_end = now.replace(hour=20, minute=0, second=0, microsecond=0)
     in_window = scan_start <= now <= scan_end
-    print(f"[DEBUG] Scan window check: {in_window}", flush=True)
+    print(f"[DEBUG] Scan window check (Eastern): {in_window}", flush=True)
     return in_window
 
 if __name__ == "__main__":
