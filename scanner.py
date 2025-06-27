@@ -1,114 +1,174 @@
 import requests
 import time
-from datetime import datetime, timedelta
-import os
+from datetime import datetime, timezone
+import pytz
 
-# === CONFIGURATION ===
+# --- CONFIG ---
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
+WATCHLIST = [
+    'SVRE', 'INMB', 'RCT', 'CTOR', 'UGRO', 'AMIX', 'OGEN', 'PMNT'
+]
+CHECK_INTERVAL = 60  # seconds
 
-FLOAT_MAX = 20_000_000
-PRICE_MAX = 10.0
-VOLUME_SPIKE_MULT = 1.1         # Lowered for easy testing!
-MIN_AVG_VOLUME = 1              # Lowered for easy testing!
-NEWS_LOOKBACK_MINUTES = 60      # Back 1 hour for testing
+POPULAR_NEWS_KEYWORDS = [
+    "offering", "merger", "acquisition", "FDA", "earnings", "guidance", "spike", "halt",
+    "lawsuit", "contract", "partnership", "approval", "phase", "buyout", "appoints",
+    "delist", "split", "dividend", "bankruptcy", "IPO", "agreement", "collaboration",
+    "settlement", "investigation", "grant", "license", "expansion", "recall", "patent",
+    "sec", "upgrade", "downgrade", "initiates", "target", "price target", "surge", "plunge"
+]
 
-SEEN_NEWS_FILE = "seen_news.txt"
+PRICE_FILTER = 10.00  # Only alert stocks under this price
 
-def fetch_low_float_tickers():
-    # For debugging, use a static list!
-    tickers = ["SNTG", "GNS", "TBLT", "TOP", "HUBC", "HUDI", "CYN", "PEGY", "RAYA", "COMS"]
-    print(f"{datetime.now()} | [DEBUG] Using static tickers: {tickers}")
-    return tickers
-
-def fetch_minute_candles(ticker):
-    today = datetime.now().strftime("%Y-%m-%d")
-    url = f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{today}/{today}?apiKey={POLYGON_API_KEY}&limit=6'
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     try:
-        resp = requests.get(url, timeout=8)
-        resp.raise_for_status()
-        data = resp.json().get('results', [])
-        print(f"[DEBUG] {ticker} minute candles fetched: {data}")
-        return data
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print(f"[ERROR] Error fetching {ticker} candles: {e}")
-        return []
+        print(f"Telegram send error: {e}")
 
-def send_telegram_alert(message):
-    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    try:
-        resp = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': message})
-        print(f"[DEBUG] Telegram sent: {message} | Response: {resp.status_code}")
-    except Exception as e:
-        print(f"[ERROR] Error sending Telegram message: {e}")
+def fetch_polygon_minute_candles(symbol):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/2025-06-27/2025-06-27?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_API_KEY}"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code == 200:
+        data = resp.json()
+        if data.get("results"):
+            return data["results"]
+    return []
 
-def scan_for_volume(tickers, last_alerts):
-    for ticker in tickers:
-        candles = fetch_minute_candles(ticker)
-        if len(candles) < 4:
-            print(f"[DEBUG] {ticker} has less than 4 candles, skipping.")
-            continue
-        last = candles[-1]
-        prev = candles[-4:-1]
-        price = last['c']
-        curr_vol = last['v']
-        avg_prev_vol = sum(x['v'] for x in prev) / 3
-        print(f"[DEBUG] {ticker}: price={price}, curr_vol={curr_vol}, avg_prev_vol={avg_prev_vol}")
-        if price > PRICE_MAX:
-            print(f"[DEBUG] {ticker}: price {price} > {PRICE_MAX}, skipping.")
-            continue
-        if curr_vol > avg_prev_vol * VOLUME_SPIKE_MULT and avg_prev_vol > MIN_AVG_VOLUME:
-            # Only alert if price or volume changed since last alert for this ticker
-            last_key = (price, curr_vol)
-            if last_alerts.get(ticker) != last_key:
-                msg = (f"🚨 {ticker}: Price ${price:.2f} | Float <20M | {curr_vol:,} 1min vol (>1.1x avg {int(avg_prev_vol):,})\n"
-                       f"https://finance.yahoo.com/quote/{ticker}")
-                print(f"[ALERT] {msg}")
-                send_telegram_alert(msg)
-                last_alerts[ticker] = last_key
+def fetch_polygon_news(symbol, limit=5):
+    url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit={limit}&apiKey={POLYGON_API_KEY}"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code == 200:
+        news = resp.json().get("results", [])
+        return news
+    return []
+
+def format_time(ts_ms):
+    dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
+    return dt.strftime('%H:%M')
+
+def contains_popular_keyword(title):
+    title_l = title.lower()
+    return any(kw in title_l for kw in POPULAR_NEWS_KEYWORDS)
+
+def is_market_hours():
+    eastern = pytz.timezone("US/Eastern")
+    now_eastern = datetime.now(eastern)
+    weekday = now_eastern.weekday()  # Monday=0, Sunday=6
+    hour = now_eastern.hour
+    minute = now_eastern.minute
+    # Only Monday-Friday, 4:00am-8:00pm
+    if 0 <= weekday <= 4:
+        if 4 <= hour < 20:
+            return True
+        if hour == 20 and minute == 0:
+            return True
+    return False
+
+class StockAlertBot:
+    def __init__(self, watchlist):
+        self.watchlist = watchlist
+        self.highs = {}  # symbol -> today's high
+        self.lows = {}   # symbol -> today's low
+        self.last_alerted = {}  # (symbol, type) -> (price, ts)
+        self.sent_news_ids = set()  # news id set to prevent duplicate alerts
+
+    def check_volume_spike(self, candles):
+        if len(candles) < 5:
+            return False, None, None, None
+        curr = candles[-1]
+        curr_vol = curr['v']
+        curr_price = curr['c']
+        avg_vol = sum(c['v'] for c in candles[-5:-1]) / 4
+        if avg_vol == 0:
+            return False, None, None, None
+        if curr_vol > avg_vol * 1.2 and curr_vol > 500:
+            return True, curr_price, curr_vol, curr['t']
+        return False, None, None, None
+
+    def check_new_high(self, symbol, price):
+        prev_high = self.highs.get(symbol, float('-inf'))
+        if price > prev_high:
+            self.highs[symbol] = price
+            return True
+        return False
+
+    def check_new_low(self, symbol, price):
+        prev_low = self.lows.get(symbol, float('inf'))
+        if price < prev_low:
+            self.lows[symbol] = price
+            return True
+        return False
+
+    def should_alert(self, symbol, price, alert_type):
+        now = time.time()
+        last = self.last_alerted.get((symbol, alert_type))
+        if last and last[0] == price and now - last[1] < 300:
+            return False
+        self.last_alerted[(symbol, alert_type)] = (price, now)
+        return True
+
+    def scan(self):
+        for symbol in self.watchlist:
+            try:
+                candles = fetch_polygon_minute_candles(symbol)
+                if not candles or len(candles) < 2:
+                    continue
+                last = candles[-1]
+                price = last['c']
+                ts = last['t']
+
+                # Only scan/alert for stocks under PRICE_FILTER
+                if price >= PRICE_FILTER:
+                    continue
+
+                # Volume spike
+                spike, spike_price, spike_vol, spike_ts = self.check_volume_spike(candles)
+                if spike and self.should_alert(symbol, spike_price, "volume"):
+                    msg = (f"<b>{symbol}</b> volume spike at <b>${spike_price:.2f}</b> (vol={spike_vol}) "
+                           f"@ {format_time(spike_ts)} UTC")
+                    send_telegram(msg)
+                # New high
+                if self.check_new_high(symbol, price) and self.should_alert(symbol, price, "high"):
+                    msg = (f"<b>{symbol}</b> new high of the day <b>${price:.2f}</b> 🤑 "
+                           f"@ {format_time(ts)} UTC")
+                    send_telegram(msg)
+                # New low
+                if self.check_new_low(symbol, price) and self.should_alert(symbol, price, "low"):
+                    msg = (f"<b>{symbol}</b> new low of the day <b>${price:.2f}</b> 😬 "
+                           f"@ {format_time(ts)} UTC")
+                    send_telegram(msg)
+                # News headlines (no duplicates, only if keyword)
+                news = fetch_polygon_news(symbol, limit=5)
+                for item in news:
+                    nid = item.get("id")
+                    title = item.get("title", "")
+                    url = item.get("article_url", "")
+                    if nid and nid not in self.sent_news_ids and contains_popular_keyword(title):
+                        self.sent_news_ids.add(nid)
+                        newsmsg = f"📰 <b>{symbol} News:</b> <b>{title}</b>\n{url}"
+                        send_telegram(newsmsg)
+            except Exception as e:
+                print(f"Error scanning {symbol}: {e}")
+
+    def run(self):
+        while True:
+            if is_market_hours():
+                self.scan()
             else:
-                print(f"[DEBUG] {ticker}: Alert already sent for price {price} and vol {curr_vol}.")
-        else:
-            print(f"[DEBUG] {ticker}: No spike detected.")
-
-def load_seen_news_ids(filename=SEEN_NEWS_FILE):
-    if not os.path.exists(filename):
-        return set()
-    with open(filename, "r") as f:
-        return set(line.strip() for line in f)
-
-def save_seen_news_id(news_id, filename=SEEN_NEWS_FILE):
-    with open(filename, "a") as f:
-        f.write(f"{news_id}\n")
-
-def scan_for_news(tickers, seen_news_ids):
-    since = (datetime.utcnow() - timedelta(minutes=NEWS_LOOKBACK_MINUTES)).isoformat()[:16]
-    for ticker in tickers:
-        url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&published_utc.gte={since}&limit=5&apiKey={POLYGON_API_KEY}"
-        try:
-            resp = requests.get(url, timeout=8)
-            news_items = resp.json().get("results", [])
-            print(f"[DEBUG] News for {ticker}: {news_items}")
-            for news in news_items:
-                if news["id"] not in seen_news_ids:
-                    seen_news_ids.add(news["id"])
-                    save_seen_news_id(news["id"])  # Save to file!
-                    headline = news["title"]
-                    url_link = news.get("article_url", "")
-                    alert = f"📰 NEWS: {ticker} - {headline}\n{url_link}"
-                    print(f"[ALERT] {alert}")
-                    send_telegram_alert(alert)
-        except Exception as e:
-            print(f"[ERROR] News error {ticker}: {e}")
+                print("Outside scan window, waiting...")
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    lowfloat_tickers = fetch_low_float_tickers()
-    seen_news_ids = load_seen_news_ids()
-    last_alerts = {}  # ticker -> (price, vol)
-    while True:
-        print(f"{datetime.now()} | [DEBUG] Scanning {len(lowfloat_tickers)} tickers for volume/news...")
-        scan_for_volume(lowfloat_tickers, last_alerts)
-        scan_for_news(lowfloat_tickers, seen_news_ids)
-        print(f"{datetime.now()} | [DEBUG] Scan loop complete. Sleeping 60s.")
-        time.sleep(60)
+    print("Starting Stock Alert Telegram Bot with news keyword filter and market hours restriction (stocks under $10 only)...")
+    bot = StockAlertBot(WATCHLIST)
+    bot.run()
