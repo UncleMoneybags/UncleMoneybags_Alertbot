@@ -94,6 +94,8 @@ class RealTimeScanner:
         self.tickers = tickers
         self.last_alerts = {}
         self.recent_minute_vols = {ticker: [] for ticker in tickers}
+        self.ws = None
+        self.active = True
 
     def on_message(self, ws, message):
         try:
@@ -147,20 +149,37 @@ class RealTimeScanner:
 
     def run(self):
         ws_url = "wss://socket.polygon.io/stocks"
-        ws = WebSocketApp(ws_url,
+        self.ws = WebSocketApp(ws_url,
                           on_open=self.on_open,
                           on_message=self.on_message,
                           on_error=self.on_error,
                           on_close=self.on_close)
-        ws.run_forever(ping_interval=30, ping_timeout=10)
+        self.ws.run_forever(ping_interval=30, ping_timeout=10)
+
+def within_scan_window():
+    now = datetime.now()
+    # Monday is 0, Sunday is 6
+    if now.weekday() >= 5:
+        return False
+    scan_start = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    scan_end = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    return scan_start <= now <= scan_end
 
 if __name__ == "__main__":
     tickers = fetch_volatile_tickers()
     print(f"[INFO] Will monitor: {tickers}")
     seen_news_ids = load_seen_news_ids()
     scanner = RealTimeScanner(tickers)
-    ws_thread = threading.Thread(target=scanner.run, daemon=True)
-    ws_thread.start()
+    ws_thread = None
+
     while True:
-        scan_for_news(tickers, seen_news_ids)
+        if within_scan_window():
+            if ws_thread is None or not ws_thread.is_alive():
+                ws_thread = threading.Thread(target=scanner.run, daemon=True)
+                ws_thread.start()
+            scan_for_news(tickers, seen_news_ids)
+        else:
+            print("[INFO] Outside scan window. Bot sleeping...")
+            # No direct way to kill the websocket thread gracefully, so just let it run out or restart the process
+            time.sleep(60)
         time.sleep(60)
