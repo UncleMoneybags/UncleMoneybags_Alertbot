@@ -89,17 +89,26 @@ def save_seen_news_id(news_id, filename=SEEN_NEWS_FILE):
         f.write(f"{news_id}\n")
     print(f"[DEBUG] Saved news ID: {news_id}", flush=True)
 
-def scan_for_news(tickers, seen_news_ids):
-    # Use Eastern time for the since cutoff
+def scan_for_news(tickers, seen_news_ids, bad_tickers=None):
+    if bad_tickers is None:
+        bad_tickers = set()
     now_ny = datetime.now(TZ_NY)
     print(f"[DEBUG] Scanning news for tickers: {tickers} at Eastern time {now_ny}", flush=True)
     since = (now_ny - timedelta(minutes=NEWS_LOOKBACK_MINUTES)).astimezone().isoformat()[:16]
+
     for ticker in tickers:
+        if ticker in bad_tickers:
+            continue  # Skip tickers that already failed
+
         url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&published_utc.gte={since}&limit=5&apiKey={POLYGON_API_KEY}"
         try:
             resp = requests.get(url, timeout=8)
+            if resp.status_code == 400:
+                print(f"[ERROR] News API failed for {ticker}: 400 (Bad request) - removing from future lookups.", flush=True)
+                bad_tickers.add(ticker)
+                continue
             if resp.status_code != 200:
-                print(f"[ERROR] News API failed for {ticker}: {resp.status_code}", flush=True)
+                print(f"[ERROR] News API failed for {ticker}: {resp.status_code} {resp.text}", flush=True)
                 continue
             news_items = resp.json().get("results", [])
             print(f"[DEBUG] {ticker}: {len(news_items)} news items", flush=True)
@@ -221,6 +230,7 @@ if __name__ == "__main__":
         seen_news_ids = load_seen_news_ids()
         scanner = RealTimeScanner(tickers)
         ws_thread = None
+        bad_tickers = set()
 
         while True:
             print(f"[DEBUG] Top of main loop | Heartbeat {datetime.now(TZ_NY)}", flush=True)
@@ -229,7 +239,7 @@ if __name__ == "__main__":
                     ws_thread = threading.Thread(target=scanner.run, daemon=True)
                     ws_thread.start()
                     print("[INFO] WebSocket thread started.", flush=True)
-                scan_for_news(tickers, seen_news_ids)
+                scan_for_news(tickers, seen_news_ids, bad_tickers)
             else:
                 print("[INFO] Outside scan window. Bot sleeping...", flush=True)
                 time.sleep(60)
