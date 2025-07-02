@@ -30,6 +30,7 @@ MIN_AVG_VOLUME = 1
 NEWS_LOOKBACK_MINUTES = 60
 SEEN_NEWS_FILE = "seen_news.txt"
 SCREENER_LIMIT = 50  # How many top stocks to monitor
+REFRESH_TICKERS_SECONDS = 300  # 5 minutes
 
 def fetch_volatile_tickers():
     print("[DEBUG] Entered fetch_volatile_tickers", flush=True)
@@ -150,6 +151,7 @@ class RealTimeScanner:
                     vols.append(curr_vol)
                     self.recent_minute_vols[ticker] = vols
                     avg_prev_vol = sum(vols[:-1]) / (len(vols)-1) if len(vols) > 1 else 0
+                    print(f"[DEBUG] {ticker}: curr_vol={curr_vol}, avg_prev_vol={avg_prev_vol}, vols={vols}", flush=True)
                     if len(vols) >= 2 and curr_vol > avg_prev_vol * VOLUME_SPIKE_MULT and avg_prev_vol > MIN_AVG_VOLUME:
                         last_key = (price, curr_vol)
                         if self.last_alerts.get(ticker) != last_key:
@@ -225,6 +227,7 @@ def within_scan_window():
 if __name__ == "__main__":
     print("[DEBUG] In __main__ block", flush=True)
     try:
+        last_tickers_update = 0
         tickers = fetch_volatile_tickers()
         print(f"[INFO] Will monitor: {tickers}", flush=True)
         seen_news_ids = load_seen_news_ids()
@@ -233,6 +236,14 @@ if __name__ == "__main__":
         bad_tickers = set()
 
         while True:
+            now = time.time()
+            # Refresh tickers every REFRESH_TICKERS_SECONDS
+            if now - last_tickers_update > REFRESH_TICKERS_SECONDS:
+                tickers = fetch_volatile_tickers()
+                print(f"[INFO] Updated tickers: {tickers}", flush=True)
+                scanner.tickers = tickers  # update in RealTimeScanner too!
+                last_tickers_update = now
+
             print(f"[DEBUG] Top of main loop | Heartbeat {datetime.now(TZ_NY)}", flush=True)
             if within_scan_window():
                 if ws_thread is None or not ws_thread.is_alive():
