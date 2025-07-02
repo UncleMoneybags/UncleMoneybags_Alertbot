@@ -181,19 +181,23 @@ class RealTimeScanner:
         except Exception as e:
             print(f"[ERROR][WS][on_open] {e}", flush=True)
 
+    # Bulletproof run() with reconnect logic
     def run(self):
         print("[DEBUG] RealTimeScanner run() called", flush=True)
         ws_url = "wss://socket.polygon.io/stocks"
-        try:
-            self.ws = WebSocketApp(ws_url,
-                              on_open=self.on_open,
-                              on_message=self.on_message,
-                              on_error=self.on_error,
-                              on_close=self.on_close)
-            print("[DEBUG] WebSocketApp initialized, starting run_forever...", flush=True)
-            self.ws.run_forever(ping_interval=30, ping_timeout=10)
-        except Exception as e:
-            print(f"[ERROR][WS][run] {e}", flush=True)
+        while self.active:
+            try:
+                self.ws = WebSocketApp(ws_url,
+                                  on_open=self.on_open,
+                                  on_message=self.on_message,
+                                  on_error=self.on_error,
+                                  on_close=self.on_close)
+                print("[DEBUG] WebSocketApp initialized, starting run_forever...", flush=True)
+                self.ws.run_forever(ping_interval=30, ping_timeout=10)
+                print("[WS] run_forever exited, will attempt reconnect in 10 seconds", flush=True)
+            except Exception as e:
+                print(f"[ERROR][WS][run] {e}", flush=True)
+            time.sleep(10)  # Wait before reconnecting
 
 def within_scan_window():
     # Use Eastern time for window check
@@ -219,7 +223,7 @@ if __name__ == "__main__":
         ws_thread = None
 
         while True:
-            print("[DEBUG] Top of main loop", flush=True)
+            print(f"[DEBUG] Top of main loop | Heartbeat {datetime.now(TZ_NY)}", flush=True)
             if within_scan_window():
                 if ws_thread is None or not ws_thread.is_alive():
                     ws_thread = threading.Thread(target=scanner.run, daemon=True)
