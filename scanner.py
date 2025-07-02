@@ -1,259 +1,212 @@
 import requests
 import time
-from datetime import datetime, timedelta
-import os
-import json
+from collections import deque
+import datetime
 import threading
 
-# For Eastern timezone support:
-try:
-    from zoneinfo import ZoneInfo
-    TZ_NY = ZoneInfo("America/New_York")
-    print("[DEBUG] Using zoneinfo for America/New_York", flush=True)
-except ImportError:
-    import pytz
-    TZ_NY = pytz.timezone("US/Eastern")
-    print("[DEBUG] Using pytz for US/Eastern", flush=True)
-
-from websocket import WebSocketApp
-
-print("[DEBUG] SCANNER.PY IS RUNNING", flush=True)
-
-# === CONFIGURATION ===
+# === USER CONFIGURATION ===
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
-TELEGRAM_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
-TELEGRAM_CHAT_ID = "-1002266463234"
+TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
+TELEGRAM_CHAT_ID = "-1002266463234"  # Can be user or group
+DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL"
 
-PRICE_MAX = 10.0
-VOLUME_SPIKE_MULT = 1.1
-MIN_AVG_VOLUME = 1
-NEWS_LOOKBACK_MINUTES = 60
-SEEN_NEWS_FILE = "seen_news.txt"
-SCREENER_LIMIT = 50  # How many top stocks to monitor
-REFRESH_TICKERS_SECONDS = 300  # 5 minutes
+PRICE_MAX = 10.00
+MIN_VOLUME = 100_000
+VOLUME_SPIKE_MULT = 3.0
+PRICE_SPIKE_PCT = 3.0  # % change vs rolling average to be considered a spike
+NEWS_LOOKBACK_MINUTES = 5
+TICKERS_LIMIT = 100
 
-def fetch_volatile_tickers():
-    print("[DEBUG] Entered fetch_volatile_tickers", flush=True)
-    url = (
-        f"https://api.polygon.io/v3/reference/tickers"
-        f"?market=stocks&active=true&order=desc&limit=1000&apiKey={POLYGON_API_KEY}"
-    )
-    try:
-        resp = requests.get(url)
-        tickers = []
-        if resp.status_code == 200:
-            data = resp.json().get("results", [])
-            print(f"[DEBUG] Polygon returned {len(data)} tickers", flush=True)
-            symbols = [t["ticker"] for t in data if t.get("type") == "CS"]
-            for symbol in symbols:
-                detail_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
-                det_resp = requests.get(detail_url)
-                if det_resp.status_code == 200:
-                    results = det_resp.json().get("results", [])
-                    if results:
-                        close = results[0].get("c", 0)
-                        volume = results[0].get("v", 0)
-                        if close and close <= PRICE_MAX and volume:
-                            tickers.append((symbol, volume))
-                if len(tickers) >= SCREENER_LIMIT * 2:
-                    break
-            tickers = sorted(tickers, key=lambda x: x[1], reverse=True)[:SCREENER_LIMIT]
-            final = [t[0] for t in tickers]
-            print(f"[DEBUG] Screener selected: {final}", flush=True)
-            return final
-        else:
-            print(f"[ERROR] Polygon screener failed, status {resp.status_code}", flush=True)
-            return ["SNTG", "GNS", "TBLT", "TOP", "HUBC", "HUDI", "CYN", "PEGY", "RAYA", "COMS", "PMNT"]
-    except Exception as e:
-        print(f"[ERROR] Exception in fetch_volatile_tickers: {e}", flush=True)
-        return ["SNTG", "GNS", "TBLT", "TOP", "HUBC", "HUDI", "CYN", "PEGY", "RAYA", "COMS", "PMNT"]
+volume_history = {}
+price_history = {}
+alerted_news_ids = set()
+alerted_halts = set()
+alerted_ipos = set()
+
+TRADING_START_HOUR = 4  # 4:00 AM ET
+TRADING_END_HOUR = 20   # 8:00 PM ET
+
+def is_market_time():
+    """Return True if now is Monday-Friday and between 4am and 8pm Eastern Time."""
+    now_utc = datetime.datetime.utcnow()
+    # New York is UTC-4 during daylight saving (EDT, Mar-Nov), UTC-5 in standard (EST, Nov-Mar)
+    # We'll use UTC-4 (EDT) for typical US trading months. If you want to be exact, use pytz.
+    NY_OFFSET = -4
+    now_ny = now_utc + datetime.timedelta(hours=NY_OFFSET)
+    weekday = now_ny.weekday()  # 0 = Monday, 6 = Sunday
+    hour = now_ny.hour
+    return (weekday < 5) and (TRADING_START_HOUR <= hour < TRADING_END_HOUR)
+
+# === ALERT SENDING ===
 
 def send_telegram_alert(message):
-    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+    url = (
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
     try:
-        resp = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': message})
-        print(f"[DEBUG] Telegram alert sent: {message} | Status: {resp.status_code}", flush=True)
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"[ERROR] Error sending Telegram message: {e}", flush=True)
+        print(f"[WARN] Telegram alert failed: {e}")
 
-def load_seen_news_ids(filename=SEEN_NEWS_FILE):
-    print("[DEBUG] Loading seen news IDs", flush=True)
-    if not os.path.exists(filename):
-        return set()
-    with open(filename, "r") as f:
-        lines = set(line.strip() for line in f)
-        print(f"[DEBUG] Loaded {len(lines)} seen news IDs", flush=True)
-        return lines
+def send_discord_alert(message):
+    payload = {"content": message}
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
+    except Exception as e:
+        print(f"[WARN] Discord alert failed: {e}")
 
-def save_seen_news_id(news_id, filename=SEEN_NEWS_FILE):
-    with open(filename, "a") as f:
-        f.write(f"{news_id}\n")
-    print(f"[DEBUG] Saved news ID: {news_id}", flush=True)
+def alert(message):
+    print(message)
+    threading.Thread(target=send_telegram_alert, args=(message,)).start()
+    threading.Thread(target=send_discord_alert, args=(message,)).start()
 
-def scan_for_news(tickers, seen_news_ids, bad_tickers=None):
-    if bad_tickers is None:
-        bad_tickers = set()
-    now_ny = datetime.now(TZ_NY)
-    print(f"[DEBUG] Scanning news for tickers: {tickers} at Eastern time {now_ny}", flush=True)
-    since = (now_ny - timedelta(minutes=NEWS_LOOKBACK_MINUTES)).astimezone().isoformat()[:16]
+# === DATA FUNCTIONS ===
 
-    for ticker in tickers:
-        if ticker in bad_tickers:
-            continue  # Skip tickers that already failed
+def get_active_tickers():
+    """Pulls most active tickers under price cap from Polygon snapshot."""
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/active?apiKey={POLYGON_API_KEY}"
+    r = requests.get(url)
+    data = r.json().get("tickers", [])
+    tickers = [
+        t["ticker"]
+        for t in data
+        if t.get("lastTrade", {}).get("p", 0) <= PRICE_MAX and t.get("day", {}).get("v", 0) >= MIN_VOLUME
+    ]
+    return tickers[:TICKERS_LIMIT]
 
-        url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&published_utc.gte={since}&limit=5&apiKey={POLYGON_API_KEY}"
+def get_minute_bar(ticker):
+    """Get the last 1-min bar for this ticker."""
+    now = datetime.datetime.utcnow()
+    start = now - datetime.timedelta(minutes=2)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = now.strftime("%Y-%m-%d")
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{start_str}/{end_str}?sort=desc&limit=1&apiKey={POLYGON_API_KEY}"
+    r = requests.get(url)
+    results = r.json().get("results", [])
+    if not results:
+        return None
+    return results[0]  # Most recent bar
+
+def detect_volume_spike(ticker, bar):
+    """Detects if this minute's volume is a spike vs prior avg."""
+    vol = bar.get("v", 0)
+    hist = volume_history.setdefault(ticker, deque(maxlen=10))
+    if len(hist) >= 3:
+        avg = sum(hist) / len(hist)
+        if avg > 0 and vol > avg * VOLUME_SPIKE_MULT:
+            alert(f"🚨 *{ticker}* volume spike {vol/1000:.2f}K vs avg {avg/1000:.2f}K\nhttps://finance.yahoo.com/quote/{ticker}")
+    hist.append(vol)
+
+def detect_price_spike(ticker, bar):
+    """Detects if this minute's price is a spike vs prior avg."""
+    this_close = bar.get("c", 0)
+    hist = price_history.setdefault(ticker, deque(maxlen=10))
+    if len(hist) >= 3:
+        avg = sum(hist) / len(hist)
+        if avg > 0:
+            pct_change = (this_close - avg) / avg * 100
+            if abs(pct_change) >= PRICE_SPIKE_PCT:
+                alert(f"⚡️ *{ticker}* price spike {pct_change:.2f}% to ${this_close:.2f}\nhttps://finance.yahoo.com/quote/{ticker}")
+    hist.append(this_close)
+
+def get_recent_news(ticker):
+    """Returns news headlines for ticker in last N minutes."""
+    now = datetime.datetime.utcnow()
+    start = now - datetime.timedelta(minutes=NEWS_LOOKBACK_MINUTES)
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        f"https://api.polygon.io/v2/reference/news?"
+        f"ticker={ticker}&published_utc.gte={start_str}&apiKey={POLYGON_API_KEY}"
+    )
+    r = requests.get(url)
+    articles = r.json().get("results", [])
+    new_alerts = []
+    for a in articles:
+        news_id = a.get("id")
+        if news_id not in alerted_news_ids:
+            alerted_news_ids.add(news_id)
+            headline = a.get("title","")
+            url_link = a.get("article_url","")
+            new_alerts.append(f"📰 *{ticker}* - {headline}\n{url_link}")
+    return new_alerts
+
+def get_halts():
+    """Checks for new halts using Polygon's market status endpoint."""
+    url = f"https://api.polygon.io/v3/reference/market-status/halts?apiKey={POLYGON_API_KEY}"
+    try:
+        r = requests.get(url)
+        data = r.json().get("results", [])
+        new_halts = []
+        for h in data:
+            key = (h.get("ticker"), h.get("halt_time"))
+            if key not in alerted_halts:
+                alerted_halts.add(key)
+                reason = h.get("reason_code")
+                new_halts.append(f"⏸️ HALT: *{h['ticker']}* - Reason: {reason} @ {h.get('halt_time')}")
+        return new_halts
+    except Exception as e:
+        print(f"[WARN] Halt check failed: {e}")
+        return []
+
+def get_ipos():
+    """Checks for new IPOs in last 3 days using Polygon's IPO calendar."""
+    now = datetime.datetime.utcnow()
+    start = now - datetime.timedelta(days=3)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = now.strftime("%Y-%m-%d")
+    url = (
+        f"https://api.polygon.io/v3/reference/market-activity/ipos?from={start_str}&to={end_str}&apiKey={POLYGON_API_KEY}"
+    )
+    try:
+        r = requests.get(url)
+        ipos = r.json().get("results", [])
+        new_ipos = []
+        for ipo in ipos:
+            symbol = ipo.get("ticker")
+            if symbol and symbol not in alerted_ipos:
+                alerted_ipos.add(symbol)
+                name = ipo.get("name", "")
+                date = ipo.get("expected_date", "")
+                new_ipos.append(f"🆕 IPO: *{symbol}* ({name}) - Expected: {date}")
+        return new_ipos
+    except Exception as e:
+        print(f"[WARN] IPO check failed: {e}")
+        return []
+
+# === MAIN LOOP ===
+
+def main_loop():
+    print("Starting Stock Alert Service...")
+    while True:
+        if not is_market_time():
+            print("Not market hours (4am-8pm ET, Mon-Fri). Sleeping 60s...")
+            time.sleep(60)
+            continue
         try:
-            resp = requests.get(url, timeout=8)
-            if resp.status_code == 400:
-                print(f"[ERROR] News API failed for {ticker}: 400 (Bad request) - removing from future lookups.", flush=True)
-                bad_tickers.add(ticker)
-                continue
-            if resp.status_code != 200:
-                print(f"[ERROR] News API failed for {ticker}: {resp.status_code} {resp.text}", flush=True)
-                continue
-            news_items = resp.json().get("results", [])
-            print(f"[DEBUG] {ticker}: {len(news_items)} news items", flush=True)
-            for news in news_items:
-                if news["id"] not in seen_news_ids:
-                    seen_news_ids.add(news["id"])
-                    save_seen_news_id(news["id"])
-                    headline = news["title"]
-                    url_link = news.get("article_url", "")
-                    alert = f"📰 NEWS: {ticker} - {headline}\n{url_link}"
-                    send_telegram_alert(alert)
+            tickers = get_active_tickers()
+            for ticker in tickers:
+                bar = get_minute_bar(ticker)
+                if bar:
+                    detect_volume_spike(ticker, bar)
+                    detect_price_spike(ticker, bar)
+                news_alerts = get_recent_news(ticker)
+                for alert_msg in news_alerts:
+                    alert(alert_msg)
+            # Halt and IPO checks (less frequent, every 2 min)
+            if int(time.time()) % 120 < 60:
+                for halt_msg in get_halts():
+                    alert(halt_msg)
+                for ipo_msg in get_ipos():
+                    alert(ipo_msg)
         except Exception as e:
-            print(f"[ERROR] News error {ticker}: {e}", flush=True)
-
-class RealTimeScanner:
-    def __init__(self, tickers):
-        print("[DEBUG] RealTimeScanner init", flush=True)
-        self.tickers = tickers
-        self.last_alerts = {}
-        self.recent_minute_vols = {ticker: [] for ticker in tickers}
-        self.ws = None
-        self.active = True
-
-    def on_message(self, ws, message):
-        print(f"[WS] Message received at {datetime.now(TZ_NY)} (Eastern): {message[:100]}", flush=True)
-        try:
-            data = json.loads(message)
-            for event in data:
-                # Volume spike detection (AM = Aggregate per Minute)
-                if event.get("ev") == "AM":
-                    ticker = event["sym"]
-                    price = event["c"]
-                    curr_vol = event["v"]
-                    if price > PRICE_MAX:
-                        continue
-                    vols = self.recent_minute_vols.get(ticker, [])
-                    if len(vols) >= 3:
-                        vols.pop(0)
-                    vols.append(curr_vol)
-                    self.recent_minute_vols[ticker] = vols
-                    avg_prev_vol = sum(vols[:-1]) / (len(vols)-1) if len(vols) > 1 else 0
-                    print(f"[DEBUG] {ticker}: curr_vol={curr_vol}, avg_prev_vol={avg_prev_vol}, vols={vols}", flush=True)
-                    if len(vols) >= 2 and curr_vol > avg_prev_vol * VOLUME_SPIKE_MULT and avg_prev_vol > MIN_AVG_VOLUME:
-                        last_key = (price, curr_vol)
-                        if self.last_alerts.get(ticker) != last_key:
-                            msg = (f"🚨 {ticker}: Price ${price:.2f} | {curr_vol:,} 1min vol (>1.1x avg {int(avg_prev_vol):,})\n"
-                                   f"https://finance.yahoo.com/quote/{ticker}")
-                            send_telegram_alert(msg)
-                            self.last_alerts[ticker] = last_key
-                            print(f"[DEBUG] Volume spike alert sent for {ticker}", flush=True)
-                # Halt detection (code "H" or "U" events in Polygon)
-                elif event.get("ev") == "status":
-                    ticker = event.get("sym")
-                    status = event.get("status")
-                    if status in ("halt", "halted", "T12", "H10", "H11", "H4", "H9", "U3", "U4"):
-                        msg = f"⛔️ HALT: {ticker} - status: {status}"
-                        send_telegram_alert(msg)
-                        print(f"[DEBUG] Halt alert sent for {ticker} ({status})", flush=True)
-        except Exception as e:
-            print(f"[ERROR][WS] {e}", flush=True)
-
-    def on_error(self, ws, error):
-        print(f"[ERROR][WS] {error}", flush=True)
-
-    def on_close(self, ws, close_status_code, close_msg):
-        print(f"[WS] Connection closed: {close_status_code} {close_msg}", flush=True)
-
-    def on_open(self, ws):
-        print(f"[WS] Connected to Polygon WebSocket at {datetime.now(TZ_NY)} (Eastern)", flush=True)
-        try:
-            auth_data = {
-                "action": "auth",
-                "params": POLYGON_API_KEY
-            }
-            ws.send(json.dumps(auth_data))
-            sub_str = ",".join([f"A.{ticker}" for ticker in self.tickers])
-            ws.send(json.dumps({"action": "subscribe", "params": sub_str}))
-            ws.send(json.dumps({"action": "subscribe", "params": "status"}))
-            print(f"[DEBUG] Subscribed to tickers: {self.tickers}", flush=True)
-        except Exception as e:
-            print(f"[ERROR][WS][on_open] {e}", flush=True)
-
-    # Bulletproof run() with reconnect logic
-    def run(self):
-        print("[DEBUG] RealTimeScanner run() called", flush=True)
-        ws_url = "wss://socket.polygon.io/stocks"
-        while self.active:
-            try:
-                self.ws = WebSocketApp(ws_url,
-                                  on_open=self.on_open,
-                                  on_message=self.on_message,
-                                  on_error=self.on_error,
-                                  on_close=self.on_close)
-                print("[DEBUG] WebSocketApp initialized, starting run_forever...", flush=True)
-                self.ws.run_forever(ping_interval=30, ping_timeout=10)
-                print("[WS] run_forever exited, will attempt reconnect in 10 seconds", flush=True)
-            except Exception as e:
-                print(f"[ERROR][WS][run] {e}", flush=True)
-            time.sleep(10)  # Wait before reconnecting
-
-def within_scan_window():
-    # Use Eastern time for window check
-    now = datetime.now(TZ_NY)
-    print(f"[DEBUG] Server datetime now (Eastern): {now}", flush=True)
-    # Monday is 0, Sunday is 6
-    if now.weekday() >= 5:
-        print("[DEBUG] Today is weekend. Not scanning.", flush=True)
-        return False
-    scan_start = now.replace(hour=4, minute=0, second=0, microsecond=0)
-    scan_end = now.replace(hour=20, minute=0, second=0, microsecond=0)
-    in_window = scan_start <= now <= scan_end
-    print(f"[DEBUG] Scan window check (Eastern): {in_window}", flush=True)
-    return in_window
+            print(f"[ERROR] Loop error: {e}")
+        time.sleep(60)
 
 if __name__ == "__main__":
-    print("[DEBUG] In __main__ block", flush=True)
-    try:
-        last_tickers_update = 0
-        tickers = fetch_volatile_tickers()
-        print(f"[INFO] Will monitor: {tickers}", flush=True)
-        seen_news_ids = load_seen_news_ids()
-        scanner = RealTimeScanner(tickers)
-        ws_thread = None
-        bad_tickers = set()
-
-        while True:
-            now = time.time()
-            # Refresh tickers every REFRESH_TICKERS_SECONDS
-            if now - last_tickers_update > REFRESH_TICKERS_SECONDS:
-                tickers = fetch_volatile_tickers()
-                print(f"[INFO] Updated tickers: {tickers}", flush=True)
-                scanner.tickers = tickers  # update in RealTimeScanner too!
-                last_tickers_update = now
-
-            print(f"[DEBUG] Top of main loop | Heartbeat {datetime.now(TZ_NY)}", flush=True)
-            if within_scan_window():
-                if ws_thread is None or not ws_thread.is_alive():
-                    ws_thread = threading.Thread(target=scanner.run, daemon=True)
-                    ws_thread.start()
-                    print("[INFO] WebSocket thread started.", flush=True)
-                scan_for_news(tickers, seen_news_ids, bad_tickers)
-            else:
-                print("[INFO] Outside scan window. Bot sleeping...", flush=True)
-                time.sleep(60)
-            time.sleep(60)
-    except Exception as e:
-        print(f"[ERROR] Exception in main: {e}", flush=True)
+    main_loop()
