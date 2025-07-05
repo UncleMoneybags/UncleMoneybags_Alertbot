@@ -1,17 +1,19 @@
-import requests
-import time
+import websocket
+import json
 import pytz
 from datetime import datetime
+import requests
+from collections import deque, defaultdict
 
 # --- CONFIG ---
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 
-VOLUME_SPIKE_THRESHOLD = 2.0  # 2x last 10min avg
 PRICE_CUTOFF = 5.00
-CHECK_INTERVAL = 60  # seconds
-PRICE_SPIKE_AMOUNT = 0.10
+REL_VOL_LOOKBACK = 10
+REL_VOL_THRESHOLD = 2.0
+FAST_JUMP_AMOUNT = 0.10
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -27,15 +29,13 @@ def send_telegram(message):
         print(f"Telegram send error: {e}")
 
 def is_scan_window():
+    # Only scan Mon-Fri, 4am-8pm EST
     eastern = pytz.timezone("US/Eastern")
     now_est = datetime.now(eastern)
     weekday = now_est.weekday()  # Monday=0, Sunday=6
     hour = now_est.hour
     minute = now_est.minute
-
-    # Only Monday-Friday (0-4)
     if 0 <= weekday <= 4:
-        # 4:00am to 8:00pm inclusive
         if (hour > 4 and hour < 20):
             return True
         if hour == 4 and minute >= 0:
@@ -44,79 +44,98 @@ def is_scan_window():
             return True
     return False
 
-def get_all_us_tickers():
-    tickers = []
-    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
-    while url:
-        resp = requests.get(url, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            page = data.get("results", [])
-            tickers += [item["ticker"] for item in page if not item["ticker"].endswith("W")]  # skip warrants
-            url = data.get("next_url")
-            if url and "apiKey" not in url:
-                url += f"&apiKey={POLYGON_API_KEY}"
-        else:
-            print(f"Ticker list fetch error: {resp.status_code}")
-            break
-    return tickers
-
-def fetch_minute_candles(symbol, lookback=11):
-    today = datetime.now().strftime("%Y-%m-%d")
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&sort=desc&limit={lookback}&apiKey={POLYGON_API_KEY}"
-    resp = requests.get(url, timeout=10)
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("results"):
-            return data["results"]
-    return []
-
-class PennySpikeBot:
+class SymbolState:
     def __init__(self):
-        self.tickers = get_all_us_tickers()
-        self.last_vol_alert = {}
+        self.last_3closes = deque(maxlen=4)  # [oldest, ..., newest] for price spike
+        self.last_3_closes_ts = deque(maxlen=4)
+        self.vol_history = deque(maxlen=REL_VOL_LOOKBACK + 1)  # for relative volume
+        self.last_price_spike_ts = 0
+        self.last_relvol_spike_ts = 0
+        self.last_fastjump_ts = 0
 
-    def scan_volume_spikes(self):
-        for symbol in self.tickers:
-            try:
-                candles = fetch_minute_candles(symbol, lookback=11)
-                if len(candles) < 11:
-                    continue
-                curr = candles[0]
-                prev = candles[1]
-                curr_price = curr['c']
-                prev_price = prev['c']
-                if curr_price is None or prev_price is None or curr_price > PRICE_CUTOFF or curr_price == 0:
-                    continue
-                # Require a price spike up (not down) AND at least $0.10 higher than previous
-                price_diff = curr_price - prev_price
-                if price_diff < PRICE_SPIKE_AMOUNT:
-                    continue
-                curr_vol = curr['v']
-                avg_vol = sum(c['v'] for c in candles[1:]) / 10
-                if avg_vol == 0:
-                    continue
-                rel_vol = curr_vol / avg_vol
-                last_ts = self.last_vol_alert.get(symbol, 0)
-                if rel_vol > VOLUME_SPIKE_THRESHOLD and curr['t'] != last_ts and curr_vol > 500:
-                    msg = (
-                        f"💥 <b>{symbol}</b> penny stock spike!\n"
-                        f"Price ${curr_price:.2f} (+${price_diff:.2f}) Vol {curr_vol} ({rel_vol:.1f}x rel vol)"
-                    )
-                    send_telegram(msg)
-                    self.last_vol_alert[symbol] = curr['t']
-            except Exception as e:
-                print(f"vol+price spike err {symbol}: {e}")
+def on_open(ws):
+    print("WebSocket opened and subscribing...")
+    ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+    ws.send(json.dumps({"action": "subscribe", "params": "AM.*"})) # AM.* = all minute aggregates
 
-    def run(self):
-        while True:
-            if is_scan_window():
-                self.scan_volume_spikes()
-            else:
-                print("Outside scan window, waiting...")
-            time.sleep(CHECK_INTERVAL)
+symbol_states = defaultdict(SymbolState)
+
+def on_message(ws, message):
+    if not is_scan_window():
+        return
+    bars = json.loads(message)
+    if not isinstance(bars, list):
+        bars = [bars]
+    for bar in bars:
+        if bar.get("ev") != "AM":
+            continue
+        symbol = bar["sym"]
+        close = bar.get("c")
+        openp = bar.get("o")
+        ts = bar.get("s", bar.get("t"))  # s is epoch for the candle; fallback to t if missing
+        if close is None or openp is None or close > PRICE_CUTOFF or close == 0:
+            continue
+
+        state = symbol_states[symbol]
+
+        # --- 1. PRICE SPIKE: 3 consecutive higher closes ---
+        state.last_3closes.append(close)
+        state.last_3_closes_ts.append(ts)
+        if len(state.last_3closes) == 4:
+            # [c[0], c[1], c[2], c[3]] oldest to newest
+            if (state.last_3closes[1] > state.last_3closes[0] and
+                state.last_3closes[2] > state.last_3closes[1] and
+                state.last_3closes[3] > state.last_3closes[2] and
+                state.last_3_closes_ts[3] != state.last_price_spike_ts):
+                msg = (
+                    f"🚀 <b>{symbol}</b> PRICE SPIKE!\n"
+                    f"3 green closes: {state.last_3closes[0]:.2f} → {state.last_3closes[1]:.2f} → {state.last_3closes[2]:.2f} → {state.last_3closes[3]:.2f}\n"
+                    f"Latest price: ${state.last_3closes[3]:.2f}"
+                )
+                send_telegram(msg)
+                state.last_price_spike_ts = state.last_3_closes_ts[3]
+
+        # --- 2. RELATIVE VOLUME SPIKE ---
+        curr_vol = bar.get("v", 0)
+        state.vol_history.append(curr_vol)
+        if len(state.vol_history) > REL_VOL_LOOKBACK:
+            avg_vol = sum(list(state.vol_history)[-REL_VOL_LOOKBACK-1:-1]) / REL_VOL_LOOKBACK
+            rel_vol = curr_vol / avg_vol if avg_vol else 0
+            if rel_vol >= REL_VOL_THRESHOLD and ts != state.last_relvol_spike_ts:
+                msg = (
+                    f"🔥 <b>{symbol}</b> RELATIVE VOLUME SPIKE!\n"
+                    f"Volume {curr_vol} ({rel_vol:.1f}x last {REL_VOL_LOOKBACK}min avg)\n"
+                    f"Price: ${close:.2f}"
+                )
+                send_telegram(msg)
+                state.last_relvol_spike_ts = ts
+
+        # --- 3. FAST PRICE JUMP ---
+        price_jump = close - openp
+        if (close > openp and price_jump >= FAST_JUMP_AMOUNT and ts != state.last_fastjump_ts):
+            msg = (
+                f"⚡ <b>{symbol}</b> FAST PRICE JUMP!\n"
+                f"1min candle: Open ${openp:.2f} → Close ${close:.2f} (+${price_jump:.2f})"
+            )
+            send_telegram(msg)
+            state.last_fastjump_ts = ts
+
+def on_error(ws, error):
+    print("WebSocket error:", error)
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket closed:", close_status_code, close_msg)
+
+def run_ws():
+    ws = websocket.WebSocketApp(
+        "wss://socket.polygon.io/stocks",
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
 
 if __name__ == "__main__":
-    print("Starting Real-Time Penny Stock Spike Bot!")
-    bot = PennySpikeBot()
-    bot.run()
+    print("Starting real-time WebSocket penny stock bot with separate alerts!")
+    run_ws()
