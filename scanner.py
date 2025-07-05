@@ -1,212 +1,122 @@
 import requests
 import time
-from collections import deque
-import datetime
-import threading
+import pytz
+from datetime import datetime
 
-# === USER CONFIGURATION ===
+# --- CONFIG ---
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
-TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
-TELEGRAM_CHAT_ID = "-1002266463234"  # Can be user or group
-DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL"
+TELEGRAM_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
+TELEGRAM_CHAT_ID = "-1002266463234"
 
-PRICE_MAX = 10.00
-MIN_VOLUME = 100_000
-VOLUME_SPIKE_MULT = 3.0
-PRICE_SPIKE_PCT = 3.0  # % change vs rolling average to be considered a spike
-NEWS_LOOKBACK_MINUTES = 5
-TICKERS_LIMIT = 100
+VOLUME_SPIKE_THRESHOLD = 2.0  # 2x last 10min avg
+PRICE_CUTOFF = 5.00
+CHECK_INTERVAL = 60  # seconds
+PRICE_SPIKE_AMOUNT = 0.10
 
-volume_history = {}
-price_history = {}
-alerted_news_ids = set()
-alerted_halts = set()
-alerted_ipos = set()
-
-TRADING_START_HOUR = 4  # 4:00 AM ET
-TRADING_END_HOUR = 20   # 8:00 PM ET
-
-def is_market_time():
-    """Return True if now is Monday-Friday and between 4am and 8pm Eastern Time."""
-    now_utc = datetime.datetime.utcnow()
-    # New York is UTC-4 during daylight saving (EDT, Mar-Nov), UTC-5 in standard (EST, Nov-Mar)
-    # We'll use UTC-4 (EDT) for typical US trading months. If you want to be exact, use pytz.
-    NY_OFFSET = -4
-    now_ny = now_utc + datetime.timedelta(hours=NY_OFFSET)
-    weekday = now_ny.weekday()  # 0 = Monday, 6 = Sunday
-    hour = now_ny.hour
-    return (weekday < 5) and (TRADING_START_HOUR <= hour < TRADING_END_HOUR)
-
-# === ALERT SENDING ===
-
-def send_telegram_alert(message):
-    url = (
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print(f"[WARN] Telegram alert failed: {e}")
+        print(f"Telegram send error: {e}")
 
-def send_discord_alert(message):
-    payload = {"content": message}
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-    except Exception as e:
-        print(f"[WARN] Discord alert failed: {e}")
+def is_scan_window():
+    eastern = pytz.timezone("US/Eastern")
+    now_est = datetime.now(eastern)
+    weekday = now_est.weekday()  # Monday=0, Sunday=6
+    hour = now_est.hour
+    minute = now_est.minute
 
-def alert(message):
-    print(message)
-    threading.Thread(target=send_telegram_alert, args=(message,)).start()
-    threading.Thread(target=send_discord_alert, args=(message,)).start()
+    # Only Monday-Friday (0-4)
+    if 0 <= weekday <= 4:
+        # 4:00am to 8:00pm inclusive
+        if (hour > 4 and hour < 20):
+            return True
+        if hour == 4 and minute >= 0:
+            return True
+        if hour == 20 and minute == 0:
+            return True
+    return False
 
-# === DATA FUNCTIONS ===
+def get_all_us_tickers():
+    tickers = []
+    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
+    while url:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            page = data.get("results", [])
+            tickers += [item["ticker"] for item in page if not item["ticker"].endswith("W")]  # skip warrants
+            url = data.get("next_url")
+            if url and "apiKey" not in url:
+                url += f"&apiKey={POLYGON_API_KEY}"
+        else:
+            print(f"Ticker list fetch error: {resp.status_code}")
+            break
+    return tickers
 
-def get_active_tickers():
-    """Pulls most active tickers under price cap from Polygon snapshot."""
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/active?apiKey={POLYGON_API_KEY}"
-    r = requests.get(url)
-    data = r.json().get("tickers", [])
-    tickers = [
-        t["ticker"]
-        for t in data
-        if t.get("lastTrade", {}).get("p", 0) <= PRICE_MAX and t.get("day", {}).get("v", 0) >= MIN_VOLUME
-    ]
-    return tickers[:TICKERS_LIMIT]
+def fetch_minute_candles(symbol, lookback=11):
+    today = datetime.now().strftime("%Y-%m-%d")
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&sort=desc&limit={lookback}&apiKey={POLYGON_API_KEY}"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code == 200:
+        data = resp.json()
+        if data.get("results"):
+            return data["results"]
+    return []
 
-def get_minute_bar(ticker):
-    """Get the last 1-min bar for this ticker."""
-    now = datetime.datetime.utcnow()
-    start = now - datetime.timedelta(minutes=2)
-    start_str = start.strftime("%Y-%m-%d")
-    end_str = now.strftime("%Y-%m-%d")
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{start_str}/{end_str}?sort=desc&limit=1&apiKey={POLYGON_API_KEY}"
-    r = requests.get(url)
-    results = r.json().get("results", [])
-    if not results:
-        return None
-    return results[0]  # Most recent bar
+class PennySpikeBot:
+    def __init__(self):
+        self.tickers = get_all_us_tickers()
+        self.last_vol_alert = {}
 
-def detect_volume_spike(ticker, bar):
-    """Detects if this minute's volume is a spike vs prior avg."""
-    vol = bar.get("v", 0)
-    hist = volume_history.setdefault(ticker, deque(maxlen=10))
-    if len(hist) >= 3:
-        avg = sum(hist) / len(hist)
-        if avg > 0 and vol > avg * VOLUME_SPIKE_MULT:
-            alert(f"🚨 *{ticker}* volume spike {vol/1000:.2f}K vs avg {avg/1000:.2f}K\nhttps://finance.yahoo.com/quote/{ticker}")
-    hist.append(vol)
+    def scan_volume_spikes(self):
+        for symbol in self.tickers:
+            try:
+                candles = fetch_minute_candles(symbol, lookback=11)
+                if len(candles) < 11:
+                    continue
+                curr = candles[0]
+                prev = candles[1]
+                curr_price = curr['c']
+                prev_price = prev['c']
+                if curr_price is None or prev_price is None or curr_price > PRICE_CUTOFF or curr_price == 0:
+                    continue
+                # Require a price spike up (not down) AND at least $0.10 higher than previous
+                price_diff = curr_price - prev_price
+                if price_diff < PRICE_SPIKE_AMOUNT:
+                    continue
+                curr_vol = curr['v']
+                avg_vol = sum(c['v'] for c in candles[1:]) / 10
+                if avg_vol == 0:
+                    continue
+                rel_vol = curr_vol / avg_vol
+                last_ts = self.last_vol_alert.get(symbol, 0)
+                if rel_vol > VOLUME_SPIKE_THRESHOLD and curr['t'] != last_ts and curr_vol > 500:
+                    msg = (
+                        f"💥 <b>{symbol}</b> penny stock spike!\n"
+                        f"Price ${curr_price:.2f} (+${price_diff:.2f}) Vol {curr_vol} ({rel_vol:.1f}x rel vol)"
+                    )
+                    send_telegram(msg)
+                    self.last_vol_alert[symbol] = curr['t']
+            except Exception as e:
+                print(f"vol+price spike err {symbol}: {e}")
 
-def detect_price_spike(ticker, bar):
-    """Detects if this minute's price is a spike vs prior avg."""
-    this_close = bar.get("c", 0)
-    hist = price_history.setdefault(ticker, deque(maxlen=10))
-    if len(hist) >= 3:
-        avg = sum(hist) / len(hist)
-        if avg > 0:
-            pct_change = (this_close - avg) / avg * 100
-            if abs(pct_change) >= PRICE_SPIKE_PCT:
-                alert(f"⚡️ *{ticker}* price spike {pct_change:.2f}% to ${this_close:.2f}\nhttps://finance.yahoo.com/quote/{ticker}")
-    hist.append(this_close)
-
-def get_recent_news(ticker):
-    """Returns news headlines for ticker in last N minutes."""
-    now = datetime.datetime.utcnow()
-    start = now - datetime.timedelta(minutes=NEWS_LOOKBACK_MINUTES)
-    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = (
-        f"https://api.polygon.io/v2/reference/news?"
-        f"ticker={ticker}&published_utc.gte={start_str}&apiKey={POLYGON_API_KEY}"
-    )
-    r = requests.get(url)
-    articles = r.json().get("results", [])
-    new_alerts = []
-    for a in articles:
-        news_id = a.get("id")
-        if news_id not in alerted_news_ids:
-            alerted_news_ids.add(news_id)
-            headline = a.get("title","")
-            url_link = a.get("article_url","")
-            new_alerts.append(f"📰 *{ticker}* - {headline}\n{url_link}")
-    return new_alerts
-
-def get_halts():
-    """Checks for new halts using Polygon's market status endpoint."""
-    url = f"https://api.polygon.io/v3/reference/market-status/halts?apiKey={POLYGON_API_KEY}"
-    try:
-        r = requests.get(url)
-        data = r.json().get("results", [])
-        new_halts = []
-        for h in data:
-            key = (h.get("ticker"), h.get("halt_time"))
-            if key not in alerted_halts:
-                alerted_halts.add(key)
-                reason = h.get("reason_code")
-                new_halts.append(f"⏸️ HALT: *{h['ticker']}* - Reason: {reason} @ {h.get('halt_time')}")
-        return new_halts
-    except Exception as e:
-        print(f"[WARN] Halt check failed: {e}")
-        return []
-
-def get_ipos():
-    """Checks for new IPOs in last 3 days using Polygon's IPO calendar."""
-    now = datetime.datetime.utcnow()
-    start = now - datetime.timedelta(days=3)
-    start_str = start.strftime("%Y-%m-%d")
-    end_str = now.strftime("%Y-%m-%d")
-    url = (
-        f"https://api.polygon.io/v3/reference/market-activity/ipos?from={start_str}&to={end_str}&apiKey={POLYGON_API_KEY}"
-    )
-    try:
-        r = requests.get(url)
-        ipos = r.json().get("results", [])
-        new_ipos = []
-        for ipo in ipos:
-            symbol = ipo.get("ticker")
-            if symbol and symbol not in alerted_ipos:
-                alerted_ipos.add(symbol)
-                name = ipo.get("name", "")
-                date = ipo.get("expected_date", "")
-                new_ipos.append(f"🆕 IPO: *{symbol}* ({name}) - Expected: {date}")
-        return new_ipos
-    except Exception as e:
-        print(f"[WARN] IPO check failed: {e}")
-        return []
-
-# === MAIN LOOP ===
-
-def main_loop():
-    print("Starting Stock Alert Service...")
-    while True:
-        if not is_market_time():
-            print("Not market hours (4am-8pm ET, Mon-Fri). Sleeping 60s...")
-            time.sleep(60)
-            continue
-        try:
-            tickers = get_active_tickers()
-            for ticker in tickers:
-                bar = get_minute_bar(ticker)
-                if bar:
-                    detect_volume_spike(ticker, bar)
-                    detect_price_spike(ticker, bar)
-                news_alerts = get_recent_news(ticker)
-                for alert_msg in news_alerts:
-                    alert(alert_msg)
-            # Halt and IPO checks (less frequent, every 2 min)
-            if int(time.time()) % 120 < 60:
-                for halt_msg in get_halts():
-                    alert(halt_msg)
-                for ipo_msg in get_ipos():
-                    alert(ipo_msg)
-        except Exception as e:
-            print(f"[ERROR] Loop error: {e}")
-        time.sleep(60)
+    def run(self):
+        while True:
+            if is_scan_window():
+                self.scan_volume_spikes()
+            else:
+                print("Outside scan window, waiting...")
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    main_loop()
+    print("Starting Real-Time Penny Stock Spike Bot!")
+    bot = PennySpikeBot()
+    bot.run()
