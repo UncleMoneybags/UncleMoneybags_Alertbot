@@ -1,32 +1,38 @@
 import websocket
 import json
-import pytz
-from datetime import datetime
-import requests
-from collections import deque, defaultdict
 import threading
-import time
+import requests
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+import pytz
 
 # --- CONFIG ---
-POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"  # Your API Key
-TELEGRAM_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"  # Your Bot Token
-TELEGRAM_CHAT_ID = "-1002266463234"  # Your Group or Channel ID
+POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
+TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
+TELEGRAM_CHAT_ID = "-1002266463234"
 
-PRICE_CUTOFF = 5.00
-REL_VOL_LOOKBACK = 10
-REL_VOL_THRESHOLD = 2.0
-FAST_JUMP_AMOUNT = 0.10
-MIN_VOL_THRESHOLD = 10000  # Don't alert on illiquid stuff
-ALERT_COOLDOWN_SEC = 180  # 3 minutes per ticker per alert type
+NEWS_KEYWORDS = [
+    "AI", "artificial intelligence", "Federal Reserve", "interest rate", "Big Tech", "earnings",
+    "Apple", "Microsoft", "Google", "Amazon", "Nvidia", "Meta", "EV", "electric vehicle", "Tesla",
+    "semiconductor", "chip", "biotech", "FDA", "approval", "IPO", "merger", "acquisition", "China",
+    "trade", "oil", "energy", "renewable", "meme stock", "retail investor", "cybersecurity", "hack",
+    "breach", "REIT", "real estate", "crypto", "Bitcoin", "ETF", "bank", "financial", "airline",
+    "travel", "healthcare", "innovation", "stimulus", "infrastructure", "ESG", "green energy",
+    "consumer spending", "retail", "inflation", "cost of living", "strike", "union", "antitrust",
+    "regulation", "streaming", "Netflix", "Disney", "election"
+]
+
+recent_news = defaultdict(lambda: deque(maxlen=20))
+NEWS_WINDOW = timedelta(minutes=10)
 
 def send_telegram_async(message):
     def _send():
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True
+            "disable_web_page_preview": False
         }
         try:
             requests.post(url, data=payload, timeout=10)
@@ -34,147 +40,216 @@ def send_telegram_async(message):
             print(f"Telegram send error: {e}")
     threading.Thread(target=_send).start()
 
-def pretty_alert(symbol, price, percent, relvol, volume, openp, alert_type):
-    eastern = pytz.timezone("US/Eastern")
-    now_et = datetime.now(eastern).strftime("%I:%M:%S %p ET")
-    chart_link = f"https://www.tradingview.com/chart/?symbol=NASDAQ:{symbol}"
+def news_pretty_alert(symbol, headline, summary, url):
     msg = (
-        f"🔥 <b>${symbol}</b> | {percent:+.1f}% | <code>{price:.2f}</code>\n"
-        f"🟢 {alert_type}\n"
-        f"🔊 RelVol: <b>{relvol:.1f}x</b> | Vol: <code>{volume:,}</code>\n"
-        f"🕛 {now_et} | <a href='{chart_link}'>Chart</a>"
+        f"📰 <b>${symbol}</b> News Alert\n"
+        f"<b>{headline}</b>\n"
+        f"{summary}\n"
+        f"<a href='{url}'>Read more</a>"
     )
     return msg
 
-def is_scan_window():
-    # Only scan Mon-Fri, 4am-8pm EST
-    eastern = pytz.timezone("US/Eastern")
-    now_est = datetime.now(eastern)
-    weekday = now_est.weekday()  # Monday=0, Sunday=6
-    hour = now_est.hour
-    minute = now_est.minute
-    if 0 <= weekday <= 4:
-        if (hour > 4 and hour < 20):
-            return True
-        if hour == 4 and minute >= 0:
-            return True
-        if hour == 20 and minute == 0:
+def price_pretty_alert(symbol, event_type, price, event_time):
+    msg = (
+        f"🚨 <b>{event_type}</b>\n"
+        f"Symbol: <b>${symbol}</b>\n"
+        f"Price: <b>{price}</b>\n"
+        f"Time: {event_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    return msg
+
+def news_contains_keywords(headline, summary):
+    text = (headline or "") + " " + (summary or "")
+    text = text.lower()
+    for kw in NEWS_KEYWORDS:
+        if kw.lower() in text:
             return True
     return False
 
-class SymbolState:
-    def __init__(self):
-        self.last_3closes = deque(maxlen=4)  # [oldest, ..., newest] for price spike
-        self.last_3_closes_ts = deque(maxlen=4)
-        self.vol_history = deque(maxlen=REL_VOL_LOOKBACK + 1)  # for relative volume
-        self.last_price_spike_ts = 0
-        self.last_relvol_spike_ts = 0
-        self.last_fastjump_ts = 0
-        self.last_alert_time = {}  # {alert_type: unix_time}
+def on_news_event(symbol, headline, summary, url, news_time):
+    recent_news[symbol].append((news_time, headline, summary, url))
 
-symbol_states = defaultdict(SymbolState)
+def scan_recent_news(symbol, event_time):
+    alerts = []
+    for news_time, headline, summary, url in recent_news[symbol]:
+        if abs((event_time - news_time).total_seconds()) <= NEWS_WINDOW.total_seconds():
+            if news_contains_keywords(headline, summary):
+                alerts.append((headline, summary, url))
+    return alerts
 
-def should_cooldown(symbol, alert_type):
-    now = int(time.time())
-    state = symbol_states[symbol]
-    if state.last_alert_time.get(alert_type, 0) > now - ALERT_COOLDOWN_SEC:
-        return True
-    state.last_alert_time[alert_type] = now
-    return False
+def on_price_alert(symbol, event_type, price, event_time):
+    send_telegram_async(price_pretty_alert(symbol, event_type, price, event_time))
+    news_found = scan_recent_news(symbol, event_time)
+    for headline, summary, url in news_found:
+        msg = news_pretty_alert(symbol, headline, summary, url)
+        send_telegram_async(msg)
 
-def on_open(ws):
-    print("WebSocket opened and subscribing...")
-    ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-    ws.send(json.dumps({"action": "subscribe", "params": "AM.*"})) # AM.* = all minute aggregates
+# --- Candle structure and logic for price/volume alerts ---
+class Candle:
+    def __init__(self, open_, high, low, close, volume, start_time):
+        self.open = open_
+        self.high = high
+        self.low = low
+        self.close = close
+        self.volume = volume
+        self.start_time = start_time
 
-def on_message(ws, message):
-    if not is_scan_window():
+# Store last 4 candles for each symbol (to check last 3 completed candles)
+candles = defaultdict(lambda: deque(maxlen=4))
+
+def on_new_candle(symbol, open_, high, low, close, volume, start_time):
+    # Only consider penny stocks
+    if max(open_, close, high, low) > 5.00:
         return
-    bars = json.loads(message)
-    if not isinstance(bars, list):
-        bars = [bars]
-    for bar in bars:
-        if bar.get("ev") != "AM":
-            continue
-        symbol = bar["sym"]
-        close = bar.get("c")
-        openp = bar.get("o")
-        ts = bar.get("s", bar.get("t"))  # s is epoch for the candle; fallback to t if missing
-        curr_vol = bar.get("v", 0)
-        if close is None or openp is None or close > PRICE_CUTOFF or close == 0 or curr_vol < MIN_VOL_THRESHOLD:
-            continue
 
-        state = symbol_states[symbol]
+    # Add new candle
+    candles[symbol].append(Candle(open_, high, low, close, volume, start_time))
 
-        # --- 1. PRICE SPIKE: 3 consecutive higher closes ---
-        state.last_3closes.append(close)
-        state.last_3_closes_ts.append(ts)
-        if len(state.last_3closes) == 4:
-            # [c[0], c[1], c[2], c[3]] oldest to newest
-            if (state.last_3closes[1] > state.last_3closes[0] and
-                state.last_3closes[2] > state.last_3closes[1] and
-                state.last_3closes[3] > state.last_3closes[2] and
-                state.last_3_closes_ts[3] != state.last_price_spike_ts):
-                if should_cooldown(symbol, "price_spike"):
-                    continue
-                percent = ((close - openp) / openp) * 100 if openp else 0
-                avg_vol = sum(list(state.vol_history)[-REL_VOL_LOOKBACK-1:-1]) / REL_VOL_LOOKBACK if len(state.vol_history) > REL_VOL_LOOKBACK else 0
-                relvol = curr_vol / avg_vol if avg_vol else 1
-                msg = pretty_alert(
-                    symbol, close, percent, relvol, curr_vol, openp,
-                    alert_type="3 Green Closes"
-                )
-                send_telegram_async(msg)
-                state.last_price_spike_ts = state.last_3_closes_ts[3]
+    # Need at least 4 candles (so last 3 completed)
+    if len(candles[symbol]) < 4:
+        return
 
-        # --- 2. RELATIVE VOLUME SPIKE ---
-        state.vol_history.append(curr_vol)
-        if len(state.vol_history) > REL_VOL_LOOKBACK:
-            avg_vol = sum(list(state.vol_history)[-REL_VOL_LOOKBACK-1:-1]) / REL_VOL_LOOKBACK
-            rel_vol = curr_vol / avg_vol if avg_vol else 0
-            if rel_vol >= REL_VOL_THRESHOLD and ts != state.last_relvol_spike_ts:
-                if should_cooldown(symbol, "relvol_spike"):
-                    continue
-                percent = ((close - openp) / openp) * 100 if openp else 0
-                msg = pretty_alert(
-                    symbol, close, percent, rel_vol, curr_vol, openp,
-                    alert_type=f"RelVol Spike ({rel_vol:.1f}x)"
-                )
-                send_telegram_async(msg)
-                state.last_relvol_spike_ts = ts
+    c = candles[symbol]
+    # 1. PRICE INCREASE ALERT: last 3 candle close vs 1st
+    price_3ago = c[0].close
+    price_now = c[-1].close
+    price_diff = price_now - price_3ago
+    if price_diff >= 0.20:
+        send_telegram_async(
+            f"🚨 <b>{symbol}</b> penny stock price up ${price_diff:.2f} over last 3 min candles.\n"
+            f"From ${price_3ago:.2f} to ${price_now:.2f}."
+        )
+        # Optionally scan for news here:
+        news_found = scan_recent_news(symbol, c[-1].start_time)
+        for headline, summary, url in news_found:
+            send_telegram_async(news_pretty_alert(symbol, headline, summary, url))
 
-        # --- 3. FAST PRICE JUMP ---
-        price_jump = close - openp
-        if (close > openp and price_jump >= FAST_JUMP_AMOUNT and ts != state.last_fastjump_ts):
-            if should_cooldown(symbol, "fast_jump"):
+    # 2. VOLUME SPIKE ALERT: volumes strictly increasing over last 3
+    if c[0].volume < c[1].volume < c[2].volume:
+        send_telegram_async(
+            f"🚨 <b>{symbol}</b> penny stock volume spike!\n"
+            f"Volumes: {c[0].volume:,} < {c[1].volume:,} < {c[2].volume:,} (last 3 mins)\n"
+            f"Current Price: ${c[2].close:.2f}"
+        )
+        # Optionally scan for news here:
+        news_found = scan_recent_news(symbol, c[-1].start_time)
+        for headline, summary, url in news_found:
+            send_telegram_async(news_pretty_alert(symbol, headline, summary, url))
+
+# --- Polygon News WebSocket ---
+def on_news_open(ws):
+    print("News WebSocket opened and subscribing...")
+    ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+    ws.send(json.dumps({"action": "subscribe", "params": "A.NEWS"}))
+
+def on_news_message(ws, message):
+    try:
+        payload = json.loads(message)
+        if not isinstance(payload, list):
+            payload = [payload]
+        for news in payload:
+            if news.get("ev") != "A":
                 continue
-            percent = ((close - openp) / openp) * 100 if openp else 0
-            avg_vol = sum(list(state.vol_history)[-REL_VOL_LOOKBACK-1:-1]) / REL_VOL_LOOKBACK if len(state.vol_history) > REL_VOL_LOOKBACK else 0
-            relvol = curr_vol / avg_vol if avg_vol else 1
-            msg = pretty_alert(
-                symbol, close, percent, relvol, curr_vol, openp,
-                alert_type=f"Fast Jump +${price_jump:.2f}"
-            )
-            send_telegram_async(msg)
-            state.last_fastjump_ts = ts
+            symbol = news.get("sym", "")
+            headline = news.get("title", "")
+            summary = news.get("summary", "")
+            url = news.get("url", "")
+            ntime = news.get("dt", None)
+            if ntime:
+                news_time = datetime.utcfromtimestamp(ntime / 1000).replace(tzinfo=pytz.UTC)
+            else:
+                news_time = datetime.utcnow().replace(tzinfo=pytz.UTC)
+            if not symbol or not headline:
+                continue
+            on_news_event(symbol, headline, summary, url, news_time)
+    except Exception as e:
+        print("News processing error:", e)
 
-def on_error(ws, error):
-    print("WebSocket error:", error)
+def on_news_error(ws, error):
+    print("News WebSocket error:", error)
 
-def on_close(ws, close_status_code, close_msg):
-    print("WebSocket closed:", close_status_code, close_msg)
+def on_news_close(ws, close_status_code, close_msg):
+    print("News WebSocket closed:", close_status_code, close_msg)
 
-def run_ws():
+def run_news_ws():
+    ws = websocket.WebSocketApp(
+        "wss://socket.polygon.io/news",
+        on_open=on_news_open,
+        on_message=on_news_message,
+        on_error=on_news_error,
+        on_close=on_news_close
+    )
+    ws.run_forever()
+
+# --- Polygon Trade Spike Detection WebSocket ---
+# Candle aggregation logic for 1-min candles
+TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
+trade_candle_builders = defaultdict(list)
+trade_candle_last_time = {}
+
+def on_trade_event(symbol, price, size, trade_time):
+    # Only aggregate penny stocks
+    if price > 5.0:
+        return
+
+    # Find the current candle start time for 1-min bins
+    candle_time = trade_time.replace(second=0, microsecond=0)
+    # If we have a previous candle and new minute started, finalize and push
+    last_time = trade_candle_last_time.get(symbol)
+    if last_time and candle_time != last_time:
+        trades = trade_candle_builders[symbol]
+        if trades:
+            prices = [t[0] for t in trades]
+            volumes = [t[1] for t in trades]
+            open_ = prices[0]
+            close = prices[-1]
+            high = max(prices)
+            low = min(prices)
+            volume = sum(volumes)
+            on_new_candle(symbol, open_, high, low, close, volume, last_time)
+        trade_candle_builders[symbol] = []
+    # Add trade to current candle
+    trade_candle_builders[symbol].append((price, size))
+    trade_candle_last_time[symbol] = candle_time
+
+def on_trade_open(ws):
+    print("Trade WebSocket opened and subscribing to ALL stocks...")
+    ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+    ws.send(json.dumps({"action": "subscribe", "params": "T.*"}))
+
+def on_trade_message(ws, message):
+    try:
+        payload = json.loads(message)
+        if not isinstance(payload, list):
+            payload = [payload]
+        for item in payload:
+            if item.get("ev") != "T":
+                continue
+            symbol = item.get("sym")
+            price = float(item.get("p"))
+            size = float(item.get("s", 0))  # trade size, may be 0 if not in message
+            trade_time = datetime.utcfromtimestamp(item.get("t") / 1000).replace(tzinfo=pytz.UTC)
+            on_trade_event(symbol, price, size, trade_time)
+    except Exception as e:
+        print("Trade message error:", e)
+
+def on_trade_error(ws, error):
+    print("Trade WebSocket error:", error)
+
+def on_trade_close(ws, close_status_code, close_msg):
+    print("Trade WebSocket closed:", close_status_code, close_msg)
+
+def run_trade_ws():
     ws = websocket.WebSocketApp(
         "wss://socket.polygon.io/stocks",
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
+        on_open=on_trade_open,
+        on_message=on_trade_message,
+        on_error=on_trade_error,
+        on_close=on_trade_close
     )
     ws.run_forever()
 
 if __name__ == "__main__":
-    print("Starting upgraded real-time WebSocket penny stock bot with smarter, faster, prettier alerts!")
-    send_telegram_async("✅ Penny bot restarted! Ready for action.")
-    run_ws()
+    print("Starting Polygon news + spike alert bot for penny stocks under $5...")
+    threading.Thread(target=run_news_ws, daemon=True).start()
+    run_trade_ws()
