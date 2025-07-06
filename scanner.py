@@ -4,29 +4,47 @@ import pytz
 from datetime import datetime
 import requests
 from collections import deque, defaultdict
+import threading
+import time
 
 # --- CONFIG ---
-POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
-TELEGRAM_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
-TELEGRAM_CHAT_ID = "-1002266463234"
+POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"  # Your API Key
+TELEGRAM_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"  # Your Bot Token
+TELEGRAM_CHAT_ID = "-1002266463234"  # Your Group or Channel ID
 
 PRICE_CUTOFF = 5.00
 REL_VOL_LOOKBACK = 10
 REL_VOL_THRESHOLD = 2.0
 FAST_JUMP_AMOUNT = 0.10
+MIN_VOL_THRESHOLD = 10000  # Don't alert on illiquid stuff
+ALERT_COOLDOWN_SEC = 180  # 3 minutes per ticker per alert type
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        requests.post(url, data=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram send error: {e}")
+def send_telegram_async(message):
+    def _send():
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        try:
+            requests.post(url, data=payload, timeout=10)
+        except Exception as e:
+            print(f"Telegram send error: {e}")
+    threading.Thread(target=_send).start()
+
+def pretty_alert(symbol, price, percent, relvol, volume, openp, alert_type):
+    eastern = pytz.timezone("US/Eastern")
+    now_et = datetime.now(eastern).strftime("%I:%M:%S %p ET")
+    chart_link = f"https://www.tradingview.com/chart/?symbol=NASDAQ:{symbol}"
+    msg = (
+        f"🔥 <b>${symbol}</b> | {percent:+.1f}% | <code>{price:.2f}</code>\n"
+        f"🟢 {alert_type}\n"
+        f"🔊 RelVol: <b>{relvol:.1f}x</b> | Vol: <code>{volume:,}</code>\n"
+        f"🕛 {now_et} | <a href='{chart_link}'>Chart</a>"
+    )
+    return msg
 
 def is_scan_window():
     # Only scan Mon-Fri, 4am-8pm EST
@@ -52,13 +70,22 @@ class SymbolState:
         self.last_price_spike_ts = 0
         self.last_relvol_spike_ts = 0
         self.last_fastjump_ts = 0
+        self.last_alert_time = {}  # {alert_type: unix_time}
+
+symbol_states = defaultdict(SymbolState)
+
+def should_cooldown(symbol, alert_type):
+    now = int(time.time())
+    state = symbol_states[symbol]
+    if state.last_alert_time.get(alert_type, 0) > now - ALERT_COOLDOWN_SEC:
+        return True
+    state.last_alert_time[alert_type] = now
+    return False
 
 def on_open(ws):
     print("WebSocket opened and subscribing...")
     ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
     ws.send(json.dumps({"action": "subscribe", "params": "AM.*"})) # AM.* = all minute aggregates
-
-symbol_states = defaultdict(SymbolState)
 
 def on_message(ws, message):
     if not is_scan_window():
@@ -73,7 +100,8 @@ def on_message(ws, message):
         close = bar.get("c")
         openp = bar.get("o")
         ts = bar.get("s", bar.get("t"))  # s is epoch for the candle; fallback to t if missing
-        if close is None or openp is None or close > PRICE_CUTOFF or close == 0:
+        curr_vol = bar.get("v", 0)
+        if close is None or openp is None or close > PRICE_CUTOFF or close == 0 or curr_vol < MIN_VOL_THRESHOLD:
             continue
 
         state = symbol_states[symbol]
@@ -87,37 +115,47 @@ def on_message(ws, message):
                 state.last_3closes[2] > state.last_3closes[1] and
                 state.last_3closes[3] > state.last_3closes[2] and
                 state.last_3_closes_ts[3] != state.last_price_spike_ts):
-                msg = (
-                    f"🚀 <b>{symbol}</b> PRICE SPIKE!\n"
-                    f"3 green closes: {state.last_3closes[0]:.2f} → {state.last_3closes[1]:.2f} → {state.last_3closes[2]:.2f} → {state.last_3closes[3]:.2f}\n"
-                    f"Latest price: ${state.last_3closes[3]:.2f}"
+                if should_cooldown(symbol, "price_spike"):
+                    continue
+                percent = ((close - openp) / openp) * 100 if openp else 0
+                avg_vol = sum(list(state.vol_history)[-REL_VOL_LOOKBACK-1:-1]) / REL_VOL_LOOKBACK if len(state.vol_history) > REL_VOL_LOOKBACK else 0
+                relvol = curr_vol / avg_vol if avg_vol else 1
+                msg = pretty_alert(
+                    symbol, close, percent, relvol, curr_vol, openp,
+                    alert_type="3 Green Closes"
                 )
-                send_telegram(msg)
+                send_telegram_async(msg)
                 state.last_price_spike_ts = state.last_3_closes_ts[3]
 
         # --- 2. RELATIVE VOLUME SPIKE ---
-        curr_vol = bar.get("v", 0)
         state.vol_history.append(curr_vol)
         if len(state.vol_history) > REL_VOL_LOOKBACK:
             avg_vol = sum(list(state.vol_history)[-REL_VOL_LOOKBACK-1:-1]) / REL_VOL_LOOKBACK
             rel_vol = curr_vol / avg_vol if avg_vol else 0
             if rel_vol >= REL_VOL_THRESHOLD and ts != state.last_relvol_spike_ts:
-                msg = (
-                    f"🔥 <b>{symbol}</b> RELATIVE VOLUME SPIKE!\n"
-                    f"Volume {curr_vol} ({rel_vol:.1f}x last {REL_VOL_LOOKBACK}min avg)\n"
-                    f"Price: ${close:.2f}"
+                if should_cooldown(symbol, "relvol_spike"):
+                    continue
+                percent = ((close - openp) / openp) * 100 if openp else 0
+                msg = pretty_alert(
+                    symbol, close, percent, rel_vol, curr_vol, openp,
+                    alert_type=f"RelVol Spike ({rel_vol:.1f}x)"
                 )
-                send_telegram(msg)
+                send_telegram_async(msg)
                 state.last_relvol_spike_ts = ts
 
         # --- 3. FAST PRICE JUMP ---
         price_jump = close - openp
         if (close > openp and price_jump >= FAST_JUMP_AMOUNT and ts != state.last_fastjump_ts):
-            msg = (
-                f"⚡ <b>{symbol}</b> FAST PRICE JUMP!\n"
-                f"1min candle: Open ${openp:.2f} → Close ${close:.2f} (+${price_jump:.2f})"
+            if should_cooldown(symbol, "fast_jump"):
+                continue
+            percent = ((close - openp) / openp) * 100 if openp else 0
+            avg_vol = sum(list(state.vol_history)[-REL_VOL_LOOKBACK-1:-1]) / REL_VOL_LOOKBACK if len(state.vol_history) > REL_VOL_LOOKBACK else 0
+            relvol = curr_vol / avg_vol if avg_vol else 1
+            msg = pretty_alert(
+                symbol, close, percent, relvol, curr_vol, openp,
+                alert_type=f"Fast Jump +${price_jump:.2f}"
             )
-            send_telegram(msg)
+            send_telegram_async(msg)
             state.last_fastjump_ts = ts
 
 def on_error(ws, error):
@@ -137,5 +175,6 @@ def run_ws():
     ws.run_forever()
 
 if __name__ == "__main__":
-    print("Starting real-time WebSocket penny stock bot with separate alerts!")
+    print("Starting upgraded real-time WebSocket penny stock bot with smarter, faster, prettier alerts!")
+    send_telegram_async("✅ Penny bot restarted! Ready for action.")
     run_ws()
