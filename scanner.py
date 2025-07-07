@@ -137,7 +137,6 @@ async def fetch_top_penny_symbols():
             data = await resp.json()
             for stock in data.get("results", []):
                 try:
-                    # Some tickers may not have daily close/price info; skip if so.
                     last_close = stock.get("last_close", {}).get("price", None)
                     if last_close is not None and last_close <= PRICE_THRESHOLD:
                         penny_symbols.append(stock["ticker"])
