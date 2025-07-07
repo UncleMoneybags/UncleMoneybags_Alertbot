@@ -104,25 +104,34 @@ async def on_trade_event(symbol, price, size, trade_time):
 
 async def fetch_top_penny_symbols():
     penny_symbols = set()
-    url_gainers = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_API_KEY}"
-    url_losers = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/losers?apiKey={POLYGON_API_KEY}"
+    # Use /v3/reference/tickers for a much broader universe than gainers/losers
+    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
     async with aiohttp.ClientSession() as session:
-        for url in [url_gainers, url_losers]:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        print("Polygon snapshot error:", await resp.text())
+        try:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                if "results" not in data:
+                    print("Tickers API response:", data)
+                    return []
+                for stock in data.get("results", []):
+                    ticker = stock.get("ticker")
+                    # Optionally, filter for common stock only
+                    if not ticker or stock.get("type") != "CS":
                         continue
-                    data = await resp.json()
-                    for stock in data.get("tickers", []):
-                        last = stock.get("last", {}).get("price")
-                        ticker = stock.get("ticker")
-                        if last is not None and last <= PRICE_THRESHOLD:
-                            penny_symbols.add(ticker)
-                        if len(penny_symbols) >= MAX_SYMBOLS:
-                            break
-            except Exception as e:
-                print("Snapshot fetch error:", e)
+                    # Fetch price for each ticker using the previous close endpoint
+                    price_url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
+                    try:
+                        async with session.get(price_url) as price_resp:
+                            price_data = await price_resp.json()
+                            results = price_data.get("results", [])
+                            if results and results[0].get("c") is not None and results[0]["c"] <= PRICE_THRESHOLD:
+                                penny_symbols.add(ticker)
+                                if len(penny_symbols) >= MAX_SYMBOLS:
+                                    break
+                    except Exception as e:
+                        print(f"Price fetch error for {ticker}: {e}")
+        except Exception as e:
+            print("Tickers API fetch error:", e)
     print(f"Fetched {len(penny_symbols)} penny stock symbols to scan.")
     return list(penny_symbols)[:MAX_SYMBOLS]
 
@@ -135,18 +144,14 @@ async def dynamic_symbol_manager(symbol_queue):
                 if set(symbols) != current_symbols:
                     await symbol_queue.put(symbols)
                     current_symbols = set(symbols)
+            else:
+                print("No penny stock symbols found. Retrying...")
+        else:
+            print("Market not open for scanning. Waiting...")
         await asyncio.sleep(SCREENER_REFRESH_SEC)
 
 async def trade_ws(symbol_queue):
-    ws = None
     subscribed_symbols = set()
-    async def subscribe_symbols(ws, symbols):
-        if not symbols:
-            return
-        params = ",".join([f"T.{s}" for s in symbols])
-        await ws.send(json.dumps({"action": "subscribe", "params": params}))
-        print(f"Subscribed to {len(symbols)} symbols.")
-
     while True:
         try:
             uri = "wss://socket.polygon.io/stocks"
@@ -154,8 +159,15 @@ async def trade_ws(symbol_queue):
                 await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
                 print("Trade WebSocket opened.")
                 symbols = await symbol_queue.get()
-                await subscribe_symbols(ws, symbols)
+                if not symbols:
+                    print("No symbols to subscribe to, skipping websocket subscription.")
+                    await asyncio.sleep(SCREENER_REFRESH_SEC)
+                    continue
+                params = ",".join([f"T.{s}" for s in symbols])
+                await ws.send(json.dumps({"action": "subscribe", "params": params}))
                 subscribed_symbols = set(symbols)
+                print(f"Subscribed to {len(symbols)} symbols.")
+
                 async def ws_recv():
                     async for message in ws:
                         payload = json.loads(message)
@@ -170,6 +182,7 @@ async def trade_ws(symbol_queue):
                             ts = item.get("t") / 1000
                             trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
                             await on_trade_event(symbol, price, size, trade_time)
+
                 async def ws_symbols():
                     while True:
                         new_symbols = await symbol_queue.get()
@@ -184,6 +197,7 @@ async def trade_ws(symbol_queue):
                         subscribed_symbols.clear()
                         subscribed_symbols.update(new_symbols)
                         print(f"Dynamically updated to {len(new_symbols)} symbols.")
+
                 await asyncio.gather(ws_recv(), ws_symbols())
         except Exception as e:
             print(f"Trade WebSocket error: {e}. Reconnecting soon...")
