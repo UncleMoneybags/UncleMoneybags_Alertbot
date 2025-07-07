@@ -52,10 +52,23 @@ class Candle:
         self.start_time = start_time
 
 candles = defaultdict(lambda: deque(maxlen=4))  # 4 to check previous 3 and current
+first_alert_sent = set()
+hod_tracker = {}  # symbol -> (high of day, hod_date)
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
         return
+
+    # Track high of day per symbol (reset at day start)
+    ny = pytz.timezone("America/New_York")
+    now_ny = datetime.now(ny).date()
+    hod, hod_date = hod_tracker.get(symbol, (None, None))
+    if hod_date != now_ny:
+        hod = None  # reset high of day for new day
+    if hod is None or high > hod:
+        hod = high
+        hod_date = now_ny
+    hod_tracker[symbol] = (hod, hod_date)
 
     candles[symbol].append(Candle(open_, high, low, close, volume, start_time))
 
@@ -63,24 +76,30 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         return
 
     c = candles[symbol]
-    # Check green candles with increasing volume for 3 previous candles (c[0], c[1], c[2])
+    # Check 3 consecutive green candles with rising volume
     if (c[0].close < c[1].close < c[2].close and
         c[0].volume < c[1].volume < c[2].volume):
-        # Check price spike: latest close >= prev close + $0.10
+        # Price spike: latest close >= prev close + $0.10
         price_spike = c[3].close >= c[2].close + 0.10
         # Volume spike: latest volume >= 2x average of previous 3 green candles
         avg_vol = (c[0].volume + c[1].volume + c[2].volume) / 3
         volume_spike = c[3].volume >= 2 * avg_vol
         if price_spike and volume_spike:
-            msg = (
-                f"🚨 <b>${escape_html(symbol)}</b> SPIKE ALERT!\n"
-                f"Time: {c[3].start_time.strftime('%Y-%m-%d %H:%M')}\n"
-                f"Open: ${c[3].open:.2f}, High: ${c[3].high:.2f}, Low: ${c[3].low:.2f}, Close: ${c[3].close:.2f}\n"
-                f"Volume: {c[3].volume:,}\n"
-                f"Prev close: ${c[2].close:.2f}, Prev avg vol: {int(avg_vol):,}\n"
-                f"3 consecutive green candles with rising volume, then spike!\n"
-            )
-            await send_telegram_async(msg)
+            if symbol not in first_alert_sent:
+                msg = (
+                    f"🚨 {escape_html(symbol)} stock price up ${c[3].close - c[0].close:.2f} over last 3 min candles.\n"
+                    f"From ${c[0].close:.2f} to ${c[3].close:.2f}."
+                )
+                await send_telegram_async(msg)
+                first_alert_sent.add(symbol)
+                hod_tracker[symbol] = (max(hod, c[3].close), hod_date)
+            else:
+                # Only alert on new high of day (💰 emoji)
+                hod, _ = hod_tracker[symbol]
+                if c[3].close > hod:
+                    msg = f"💰 {escape_html(symbol)} new high of day: ${c[3].close:.2f}"
+                    await send_telegram_async(msg)
+                    hod_tracker[symbol] = (c[3].close, hod_date)
 
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
 trade_candle_builders = defaultdict(list)
