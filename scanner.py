@@ -78,6 +78,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"🚨 {escape_html(symbol)} stock price up ${c[3].close - c[0].close:.2f} over last 3 min candles.\n"
                 f"From ${c[0].close:.2f} to ${c[3].close:.2f}."
             )
+            print(f"ALERT: {symbol} triggers spike condition!")  # Debug print
             await send_telegram_async(msg)
 
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
@@ -114,15 +115,23 @@ async def fetch_top_penny_symbols():
                     print("Tickers snapshot API response:", data)
                     return []
                 for stock in data.get("tickers", []):
-                    # Use last trade price if present, else fallback to day close
-                    last_trade = stock.get("lastTrade", {})
-                    price = last_trade.get("p")
-                    if price is None:
-                        day = stock.get("day", {})
-                        price = day.get("c")
                     ticker = stock.get("ticker")
-                    if price is not None and price <= PRICE_THRESHOLD:
+                    last_trade = stock.get("lastTrade", {})
+                    day = stock.get("day", {})
+                    price = None
+                    price_time = 0
+
+                    # Use latest valid price between last trade and day close
+                    if last_trade and last_trade.get("p", 0) > 0:
+                        price = last_trade["p"]
+                        price_time = last_trade.get("t", 0)
+                    if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
+                        price = day["c"]
+
+                    # Only add actual penny stocks: price > 0 and <= 5
+                    if price is not None and 0 < price <= PRICE_THRESHOLD:
                         penny_symbols.add(ticker)
+                        print(f"Adding {ticker} at ${price:.2f} to scan list")  # Debug
                         if len(penny_symbols) >= MAX_SYMBOLS:
                             break
         except Exception as e:
@@ -176,6 +185,7 @@ async def trade_ws(symbol_queue):
                             size = float(item.get("s", 0))
                             ts = item.get("t") / 1000
                             trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
+                            print(f"Trade: {symbol}, price={price}, size={size}, time={trade_time}")  # Debug
                             await on_trade_event(symbol, price, size, trade_time)
 
                 async def ws_symbols():
@@ -227,6 +237,8 @@ async def main():
 
 if __name__ == "__main__":
     print("Starting real-time penny stock spike scanner ($5 & under, 4am–8pm ET, Mon–Fri)...")
+    # TEST YOUR TELEGRAM ALERTS: Uncomment the next line to force a test message!
+    # asyncio.run(send_telegram_async("Test alert from penny scanner"))
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
