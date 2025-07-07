@@ -2,6 +2,7 @@ import asyncio
 import websockets
 import aiohttp
 import json
+import html
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, time
 import pytz
@@ -12,7 +13,10 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 
-# Broadened news keywords (Option 1)
+# Only alert for stocks $10 or less
+PRICE_THRESHOLD = 10.00
+
+# Broadened news keywords
 NEWS_KEYWORDS = [
     "AI", "artificial intelligence", "Federal Reserve", "interest rate", "Big Tech", "earnings",
     "Apple", "Microsoft", "Google", "Amazon", "Nvidia", "Meta", "EV", "electric vehicle", "Tesla",
@@ -57,7 +61,14 @@ async def send_telegram_async(message):
         except Exception as e:
             print(f"Telegram send error: {e}")
 
+def escape_html(s):
+    return html.escape(s or "")
+
 def news_pretty_alert(symbol, headline, summary, url):
+    symbol = escape_html(symbol)
+    headline = escape_html(headline)
+    summary = escape_html(summary)
+    url = escape_html(url)
     msg = (
         f"📰 <b>${symbol}</b> News Alert\n"
         f"<b>{headline}</b>\n"
@@ -67,6 +78,8 @@ def news_pretty_alert(symbol, headline, summary, url):
     return msg
 
 def price_pretty_alert(symbol, event_type, price, event_time):
+    symbol = escape_html(symbol)
+    event_type = escape_html(event_type)
     msg = (
         f"🚨 <b>{event_type}</b>\n"
         f"Symbol: <b>${symbol}</b>\n"
@@ -103,7 +116,6 @@ async def on_price_alert(symbol, event_type, price, event_time):
         msg = news_pretty_alert(symbol, headline, summary, url)
         await send_telegram_async(msg)
 
-# --- Candle structure and logic for price/volume alerts (all stocks, not just penny) ---
 class Candle:
     def __init__(self, open_, high, low, close, volume, start_time):
         self.open = open_
@@ -119,6 +131,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time():
         return
 
+    # Only alert on price/volume spikes for stocks <= $10
+    if close > PRICE_THRESHOLD:
+        return
+
     candles[symbol].append(Candle(open_, high, low, close, volume, start_time))
 
     if len(candles[symbol]) < 4:
@@ -130,7 +146,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     price_diff = price_now - price_3ago
     if price_diff >= 0.20:
         await send_telegram_async(
-            f"🚨 <b>{symbol}</b> stock price up ${price_diff:.2f} over last 3 min candles.\n"
+            f"🚨 <b>{escape_html(symbol)}</b> stock price up ${price_diff:.2f} over last 3 min candles.\n"
             f"From ${price_3ago:.2f} to ${price_now:.2f}."
         )
         news_found = scan_recent_news(symbol, c[-1].start_time)
@@ -139,7 +155,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     if c[0].volume < c[1].volume < c[2].volume:
         await send_telegram_async(
-            f"🚨 <b>{symbol}</b> stock volume spike!\n"
+            f"🚨 <b>{escape_html(symbol)}</b> stock volume spike!\n"
             f"Volumes: {c[0].volume:,} < {c[1].volume:,} < {c[2].volume:,} (last 3 mins)\n"
             f"Current Price: ${c[2].close:.2f}"
         )
@@ -147,7 +163,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         for headline, summary, url in news_found:
             await send_telegram_async(news_pretty_alert(symbol, headline, summary, url))
 
-# --- Robust async reconnect logic for trade WebSocket ---
 async def ws_connect_loop(ws_handler, name):
     delay = 1
     while True:
@@ -162,7 +177,6 @@ async def ws_connect_loop(ws_handler, name):
 # --- ASYNC Polygon News Polling (REST API, not WebSocket) ---
 async def news_rest_poll():
     seen_ids = set()
-    # Option 4: Track news for all stocks, not just penny
     url = f"https://api.polygon.io/v2/reference/news?limit=50&apiKey={POLYGON_API_KEY}"
     while True:
         try:
@@ -174,7 +188,6 @@ async def news_rest_poll():
                         news_id = news["id"]
                         if news_id not in seen_ids:
                             seen_ids.add(news_id)
-                            # Option 4: Send for all symbols in news, not just penny
                             symbols = news.get("symbols") or []
                             headline = news.get("title", "")
                             summary = news.get("description", "")
@@ -184,18 +197,18 @@ async def news_rest_poll():
                                 news_time = datetime.strptime(news["published_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC)
                             except Exception:
                                 news_time = datetime.utcnow().replace(tzinfo=pytz.UTC)
-                            # Record for each symbol
+                            # If no symbols, still send alert with "MARKET"
+                            if not symbols:
+                                symbols = ["MARKET"]
                             for symbol in symbols:
                                 on_news_event(symbol, headline, summary, url_, news_time)
-                                # Option 3: Send all news alerts as soon as they are received (not just after a spike)
                                 msg = news_pretty_alert(symbol, headline, summary, url_)
                                 await send_telegram_async(msg)
-            await asyncio.sleep(30)  # poll every 30s
+            await asyncio.sleep(30)
         except Exception as e:
             print("News polling error:", e)
             await asyncio.sleep(60)
 
-# --- ASYNC Polygon Trade WebSocket and Candle Aggregation (all stocks) ---
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
 trade_candle_builders = defaultdict(list)
 trade_candle_last_time = {}
@@ -240,7 +253,6 @@ async def trade_ws():
             except Exception as e:
                 print("Trade message error:", e)
 
-# --- Graceful shutdown support ---
 def setup_signal_handlers(loop):
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
@@ -261,8 +273,8 @@ async def main():
     )
 
 if __name__ == "__main__":
-    print("Starting Polygon news + spike alert bot for ALL stocks, all news, with robust reconnects...")
+    print("Starting Polygon news + spike alert bot for stocks $10 and under (price/volume spikes), all news, robust reconnects...")
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
         print("Bot stopped gracefully.")
