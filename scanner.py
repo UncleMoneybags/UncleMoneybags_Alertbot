@@ -109,6 +109,7 @@ async def fetch_top_penny_symbols():
         try:
             async with session.get(url) as resp:
                 data = await resp.json()
+                print("Raw Polygon snapshot response:", json.dumps(data)[:2000])  # Print first 2000 chars for debug
                 if "tickers" not in data:
                     print("Tickers snapshot API response:", data)
                     return []
@@ -175,13 +176,18 @@ async def trade_ws(symbol_queue):
                 async def ws_symbols():
                     while True:
                         new_symbols = await symbol_queue.get()
-                        remove_syms = [s for s in subscribed_symbols if s not in new_symbols]
-                        if remove_syms:
-                            remove_params = ",".join([f"T.{s}" for s in remove_syms])
+                        to_unsubscribe = [s for s in subscribed_symbols if s not in new_symbols]
+                        to_subscribe = [s for s in new_symbols if s not in subscribed_symbols]
+                        # Only resubscribe if there's a change
+                        if not to_unsubscribe and not to_subscribe:
+                            print("No symbol changes; skipping resubscription.")
+                            continue
+                        if to_unsubscribe:
+                            remove_params = ",".join([f"T.{s}" for s in to_unsubscribe])
                             await ws.send(json.dumps({"action": "unsubscribe", "params": remove_params}))
-                        add_syms = [s for s in new_symbols if s not in subscribed_symbols]
-                        if add_syms:
-                            add_params = ",".join([f"T.{s}" for s in add_syms])
+                            await asyncio.sleep(0.5)  # Give WS time to process
+                        if to_subscribe:
+                            add_params = ",".join([f"T.{s}" for s in to_subscribe])
                             await ws.send(json.dumps({"action": "subscribe", "params": add_params}))
                         subscribed_symbols.clear()
                         subscribed_symbols.update(new_symbols)
