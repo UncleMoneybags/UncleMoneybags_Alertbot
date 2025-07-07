@@ -54,33 +54,41 @@ class Candle:
         self.volume = volume
         self.start_time = start_time
 
-candles = defaultdict(lambda: deque(maxlen=4))  # 4 to check previous 3 and current
+# Now need to store up to SIX candles per symbol for the new logic (5 previous + current)
+candles = defaultdict(lambda: deque(maxlen=6))  # 6 to check previous 5 and current
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
         return
 
+    # Store up to 6 candles for this symbol (5 previous + current)
     candles[symbol].append(Candle(open_, high, low, close, volume, start_time))
-
-    if len(candles[symbol]) < 4:
+    if len(candles[symbol]) < 6:
         return
 
     c = candles[symbol]
-    # Check 3 consecutive green candles with rising volume
-    if (c[0].close < c[1].close < c[2].close and
-        c[0].volume < c[1].volume < c[2].volume):
-        # Price spike: latest close >= prev close + $0.10
-        price_spike = c[3].close >= c[2].close + 0.10
-        # Volume spike: latest volume >= 2x average of previous 3 green candles
-        avg_vol = (c[0].volume + c[1].volume + c[2].volume) / 3
-        volume_spike = c[3].volume >= 2 * avg_vol
-        if price_spike and volume_spike:
-            msg = (
-                f"🚨 {escape_html(symbol)} stock price up ${c[3].close - c[0].close:.2f} over last 3 min candles.\n"
-                f"From ${c[0].close:.2f} to ${c[3].close:.2f}."
-            )
-            print(f"ALERT: {symbol} triggers spike condition!")  # Debug print
-            await send_telegram_async(msg)
+
+    # ALERT 1: 3 consecutive green candles (price increasing)
+    if c[2].close > c[1].close > c[0].close:
+        # Only send this alert once per sequence (optional: track last alerted time or sequence if you want to avoid repeated alerts)
+        msg = (
+            f"🟢 {escape_html(symbol)} 3 consecutive green 1-min candles!\n"
+            f"Closes: {c[0].close:.2f} → {c[1].close:.2f} → {c[2].close:.2f}."
+        )
+        print(f"ALERT: {symbol} 3 consecutive green candles!")  # Debug print
+        await send_telegram_async(msg)
+
+    # ALERT 2: Volume spike after 3 up-candles
+    avg_vol = sum(c[j].volume for j in range(0, 5)) / 5
+    if c[2].close > c[1].close > c[0].close and c[5].volume >= 2 * avg_vol:
+        msg = (
+            f"🚨 {escape_html(symbol)} volume spike!\n"
+            f"Last 3 closes: {c[0].close:.2f}, {c[1].close:.2f}, {c[2].close:.2f}\n"
+            f"Current candle close: {c[5].close:.2f}, volume: {c[5].volume}\n"
+            f"Prev 5-candle avg volume: {avg_vol:.0f}"
+        )
+        print(f"ALERT: {symbol} triggers new spike condition!")  # Debug print
+        await send_telegram_async(msg)
 
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
 trade_candle_builders = defaultdict(list)
