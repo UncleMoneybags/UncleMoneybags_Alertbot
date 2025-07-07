@@ -13,7 +13,7 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 PRICE_THRESHOLD = 5.00
-MAX_SYMBOLS = 500 
+MAX_SYMBOLS = 500  # Polygon Advanced Plan max per connection
 SCREENER_REFRESH_SEC = 60
 
 def is_market_scan_time():
@@ -127,9 +127,7 @@ async def on_trade_event(symbol, price, size, trade_time):
 
 async def fetch_top_penny_symbols():
     penny_symbols = set()
-    # Get gainers
     url_gainers = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_API_KEY}"
-    # Get losers
     url_losers = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/losers?apiKey={POLYGON_API_KEY}"
     async with aiohttp.ClientSession() as session:
         for url in [url_gainers, url_losers]:
@@ -237,7 +235,7 @@ async def main():
     )
 
 if __name__ == "__main__":
-    print("Starting Polygon news + spike alert bot for ALL stocks, all news, with robust reconnects...")
+    print("Starting real-time penny stock spike scanner ($5 & under, 4am–8pm ET, Mon–Fri)...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
