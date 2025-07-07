@@ -104,34 +104,23 @@ async def on_trade_event(symbol, price, size, trade_time):
 
 async def fetch_top_penny_symbols():
     penny_symbols = set()
-    # Use /v3/reference/tickers for a much broader universe than gainers/losers
-    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}&limit=1000"
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url) as resp:
                 data = await resp.json()
-                if "results" not in data:
-                    print("Tickers API response:", data)
+                if "tickers" not in data:
+                    print("Tickers snapshot API response:", data)
                     return []
-                for stock in data.get("results", []):
+                for stock in data.get("tickers", []):
+                    last = stock.get("last", {}).get("price")
                     ticker = stock.get("ticker")
-                    # Optionally, filter for common stock only
-                    if not ticker or stock.get("type") != "CS":
-                        continue
-                    # Fetch price for each ticker using the previous close endpoint
-                    price_url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
-                    try:
-                        async with session.get(price_url) as price_resp:
-                            price_data = await price_resp.json()
-                            results = price_data.get("results", [])
-                            if results and results[0].get("c") is not None and results[0]["c"] <= PRICE_THRESHOLD:
-                                penny_symbols.add(ticker)
-                                if len(penny_symbols) >= MAX_SYMBOLS:
-                                    break
-                    except Exception as e:
-                        print(f"Price fetch error for {ticker}: {e}")
+                    if last is not None and last <= PRICE_THRESHOLD:
+                        penny_symbols.add(ticker)
+                        if len(penny_symbols) >= MAX_SYMBOLS:
+                            break
         except Exception as e:
-            print("Tickers API fetch error:", e)
+            print("Tickers snapshot fetch error:", e)
     print(f"Fetched {len(penny_symbols)} penny stock symbols to scan.")
     return list(penny_symbols)[:MAX_SYMBOLS]
 
