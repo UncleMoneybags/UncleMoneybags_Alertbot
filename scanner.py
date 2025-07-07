@@ -3,6 +3,7 @@ import websockets
 import aiohttp
 import json
 import html
+import re
 from collections import deque, defaultdict
 from datetime import datetime, timedelta, time
 import pytz
@@ -13,7 +14,7 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 PRICE_THRESHOLD = 5.00
-MAX_SYMBOLS = 500
+MAX_SYMBOLS = 100  # Batch size for Polygon WebSocket stability
 SCREENER_REFRESH_SEC = 60
 
 def is_market_scan_time():
@@ -103,41 +104,52 @@ async def on_trade_event(symbol, price, size, trade_time):
     trade_candle_builders[symbol].append((price, size))
     trade_candle_last_time[symbol] = candle_time
 
+def is_equity_symbol(ticker):
+    # Exclude symbols ending with W, WS, U, R, P, or containing a dot (.)
+    if re.search(r'(\.|\bW$|\bWS$|\bU$|\bR$|\bP$)', ticker):
+        return False
+    if ticker.endswith(('W', 'U', 'R', 'P', 'WS')) or '.' in ticker:
+        return False
+    # Exclude some known penny warrant/rights patterns
+    if any(x in ticker for x in ['WS', 'W', 'U', 'R', 'P', '.']):
+        return False
+    return True
+
 async def fetch_top_penny_symbols():
-    penny_symbols = set()
+    penny_symbols = []
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}&limit=1000"
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url) as resp:
                 data = await resp.json()
-                print("Raw Polygon snapshot response:", json.dumps(data)[:2000])  # Debug output
                 if "tickers" not in data:
                     print("Tickers snapshot API response:", data)
                     return []
                 for stock in data.get("tickers", []):
                     ticker = stock.get("ticker")
+                    if not is_equity_symbol(ticker):
+                        continue
                     last_trade = stock.get("lastTrade", {})
                     day = stock.get("day", {})
                     price = None
                     price_time = 0
-
                     # Use latest valid price between last trade and day close
                     if last_trade and last_trade.get("p", 0) > 0:
                         price = last_trade["p"]
                         price_time = last_trade.get("t", 0)
                     if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
                         price = day["c"]
-
-                    # Only add actual penny stocks: price > 0 and <= 5
-                    if price is not None and 0 < price <= PRICE_THRESHOLD:
-                        penny_symbols.add(ticker)
-                        print(f"Adding {ticker} at ${price:.2f} to scan list")  # Debug
+                    volume = day.get("v", 0)
+                    # Only add actual penny stocks: price > 0 and <= 5, volume at least 10k
+                    if price is not None and 0 < price <= PRICE_THRESHOLD and volume >= 10000:
+                        penny_symbols.append(ticker)
+                        print(f"Adding {ticker} at ${price:.2f}, vol={volume} to scan list")
                         if len(penny_symbols) >= MAX_SYMBOLS:
                             break
         except Exception as e:
             print("Tickers snapshot fetch error:", e)
     print(f"Fetched {len(penny_symbols)} penny stock symbols to scan.")
-    return list(penny_symbols)[:MAX_SYMBOLS]
+    return penny_symbols
 
 async def dynamic_symbol_manager(symbol_queue):
     current_symbols = set()
@@ -167,8 +179,15 @@ async def trade_ws(symbol_queue):
                     print("No symbols to subscribe to, skipping websocket subscription.")
                     await asyncio.sleep(SCREENER_REFRESH_SEC)
                     continue
-                params = ",".join([f"T.{s}" for s in symbols])
-                await ws.send(json.dumps({"action": "subscribe", "params": params}))
+
+                # Batch subscribe to avoid policy violation
+                BATCH_SIZE = 100
+                params_batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+                for batch in params_batches:
+                    params = ",".join([f"T.{s}" for s in batch])
+                    await ws.send(json.dumps({"action": "subscribe", "params": params}))
+                    await asyncio.sleep(0.2)  # Prevent rate limit
+
                 subscribed_symbols = set(symbols)
                 print(f"Subscribed to {len(symbols)} symbols.")
 
@@ -197,13 +216,18 @@ async def trade_ws(symbol_queue):
                         if not to_unsubscribe and not to_subscribe:
                             print("No symbol changes; skipping resubscription.")
                             continue
+                        # Unsubscribe and subscribe in batches
+                        BATCH_SIZE = 100
                         if to_unsubscribe:
-                            remove_params = ",".join([f"T.{s}" for s in to_unsubscribe])
-                            await ws.send(json.dumps({"action": "unsubscribe", "params": remove_params}))
-                            await asyncio.sleep(0.5)  # Give WS time to process
+                            for i in range(0, len(to_unsubscribe), BATCH_SIZE):
+                                remove_params = ",".join([f"T.{s}" for s in to_unsubscribe[i:i+BATCH_SIZE]])
+                                await ws.send(json.dumps({"action": "unsubscribe", "params": remove_params}))
+                                await asyncio.sleep(0.2)
                         if to_subscribe:
-                            add_params = ",".join([f"T.{s}" for s in to_subscribe])
-                            await ws.send(json.dumps({"action": "subscribe", "params": add_params}))
+                            for i in range(0, len(to_subscribe), BATCH_SIZE):
+                                add_params = ",".join([f"T.{s}" for s in to_subscribe[i:i+BATCH_SIZE]])
+                                await ws.send(json.dumps({"action": "subscribe", "params": add_params}))
+                                await asyncio.sleep(0.2)
                         subscribed_symbols.clear()
                         subscribed_symbols.update(new_symbols)
                         print(f"Dynamically updated to {len(new_symbols)} symbols.")
@@ -237,7 +261,7 @@ async def main():
 
 if __name__ == "__main__":
     print("Starting real-time penny stock spike scanner ($5 & under, 4am–8pm ET, Mon–Fri)...")
-    # TEST YOUR TELEGRAM ALERTS: Uncomment the next line to force a test message!
+    # Uncomment this line to test Telegram delivery
     # asyncio.run(send_telegram_async("Test alert from penny scanner"))
     try:
         asyncio.run(main())
