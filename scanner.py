@@ -109,14 +109,19 @@ async def fetch_top_penny_symbols():
         try:
             async with session.get(url) as resp:
                 data = await resp.json()
-                print("Raw Polygon snapshot response:", json.dumps(data)[:2000])  # Print first 2000 chars for debug
+                print("Raw Polygon snapshot response:", json.dumps(data)[:2000])  # Debug output
                 if "tickers" not in data:
                     print("Tickers snapshot API response:", data)
                     return []
                 for stock in data.get("tickers", []):
-                    last = stock.get("last", {}).get("price")
+                    # Use last trade price if present, else fallback to day close
+                    last_trade = stock.get("lastTrade", {})
+                    price = last_trade.get("p")
+                    if price is None:
+                        day = stock.get("day", {})
+                        price = day.get("c")
                     ticker = stock.get("ticker")
-                    if last is not None and last <= PRICE_THRESHOLD:
+                    if price is not None and price <= PRICE_THRESHOLD:
                         penny_symbols.add(ticker)
                         if len(penny_symbols) >= MAX_SYMBOLS:
                             break
