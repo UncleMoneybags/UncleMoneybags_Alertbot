@@ -13,6 +13,8 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 PRICE_THRESHOLD = 5.00
+MAX_SYMBOLS = 500  # Polygon Advanced Plan max per connection
+SCREENER_REFRESH_SEC = 60
 
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
@@ -123,38 +125,96 @@ async def on_trade_event(symbol, price, size, trade_time):
     trade_candle_builders[symbol].append((price, size))
     trade_candle_last_time[symbol] = candle_time
 
-async def trade_ws():
-    uri = "wss://socket.polygon.io/stocks"
-    async with websockets.connect(uri, ping_interval=30, ping_timeout=10) as ws:
-        await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-        await ws.send(json.dumps({"action": "subscribe", "params": "T.*"}))
-        print("Trade WebSocket opened and subscribing to ALL stocks...")
-        async for message in ws:
-            try:
-                payload = json.loads(message)
-                if not isinstance(payload, list):
-                    payload = [payload]
-                for item in payload:
-                    if item.get("ev") != "T":
-                        continue
-                    symbol = item.get("sym")
-                    price = float(item.get("p"))
-                    size = float(item.get("s", 0))
-                    trade_time = datetime.utcfromtimestamp(item.get("t") / 1000).replace(tzinfo=pytz.UTC)
-                    await on_trade_event(symbol, price, size, trade_time)
-            except Exception as e:
-                print("Trade message error:", e)
+async def fetch_top_penny_symbols():
+    # Uses Polygon REST API to get actives under $5, sorted by volume descending
+    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&sort=volume&order=desc&limit=1000&apiKey={POLYGON_API_KEY}"
+    penny_symbols = []
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                print("Polygon screener error:", await resp.text())
+                return []
+            data = await resp.json()
+            for stock in data.get("results", []):
+                try:
+                    # Some tickers may not have daily close/price info; skip if so.
+                    last_close = stock.get("last_close", {}).get("price", None)
+                    if last_close is not None and last_close <= PRICE_THRESHOLD:
+                        penny_symbols.append(stock["ticker"])
+                except Exception:
+                    continue
+                if len(penny_symbols) >= MAX_SYMBOLS:
+                    break
+    print(f"Fetched {len(penny_symbols)} penny stock symbols to scan.")
+    return penny_symbols
 
-async def ws_connect_loop(ws_handler, name):
-    delay = 1
+async def dynamic_symbol_manager(symbol_queue):
+    current_symbols = set()
+    while True:
+        if is_market_scan_time():
+            symbols = await fetch_top_penny_symbols()
+            if symbols:
+                # Only send if symbol set actually changed
+                if set(symbols) != current_symbols:
+                    await symbol_queue.put(symbols)
+                    current_symbols = set(symbols)
+        await asyncio.sleep(SCREENER_REFRESH_SEC)
+
+async def trade_ws(symbol_queue):
+    ws = None
+    subscribed_symbols = set()
+    async def subscribe_symbols(ws, symbols):
+        if not symbols:
+            return
+        params = ",".join([f"T.{s}" for s in symbols])
+        await ws.send(json.dumps({"action": "subscribe", "params": params}))
+        print(f"Subscribed to {len(symbols)} symbols.")
+
     while True:
         try:
-            await ws_handler()
-            print(f"{name} WebSocket ended, reconnecting...")
+            uri = "wss://socket.polygon.io/stocks"
+            async with websockets.connect(uri, ping_interval=30, ping_timeout=10) as ws:
+                await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+                print("Trade WebSocket opened.")
+                # Initial subscribe
+                symbols = await symbol_queue.get()
+                await subscribe_symbols(ws, symbols)
+                subscribed_symbols = set(symbols)
+                # Listen for new symbol updates and messages
+                async def ws_recv():
+                    async for message in ws:
+                        payload = json.loads(message)
+                        if not isinstance(payload, list):
+                            payload = [payload]
+                        for item in payload:
+                            if item.get("ev") != "T":
+                                continue
+                            symbol = item.get("sym")
+                            price = float(item.get("p"))
+                            size = float(item.get("s", 0))
+                            ts = item.get("t") / 1000
+                            trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
+                            await on_trade_event(symbol, price, size, trade_time)
+                async def ws_symbols():
+                    while True:
+                        new_symbols = await symbol_queue.get()
+                        # Unsubscribe old symbols
+                        remove_syms = [s for s in subscribed_symbols if s not in new_symbols]
+                        if remove_syms:
+                            remove_params = ",".join([f"T.{s}" for s in remove_syms])
+                            await ws.send(json.dumps({"action": "unsubscribe", "params": remove_params}))
+                        # Subscribe new symbols
+                        add_syms = [s for s in new_symbols if s not in subscribed_symbols]
+                        if add_syms:
+                            add_params = ",".join([f"T.{s}" for s in add_syms])
+                            await ws.send(json.dumps({"action": "subscribe", "params": add_params}))
+                        subscribed_symbols.clear()
+                        subscribed_symbols.update(new_symbols)
+                        print(f"Dynamically updated to {len(new_symbols)} symbols.")
+                await asyncio.gather(ws_recv(), ws_symbols())
         except Exception as e:
-            print(f"{name} WebSocket error: {e}. Reconnecting in {delay}s...")
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 60)  # Exponential backoff up to 60s
+            print(f"Trade WebSocket error: {e}. Reconnecting soon...")
+            await asyncio.sleep(5)
 
 def setup_signal_handlers(loop):
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -170,10 +230,17 @@ async def shutdown(loop, sig):
 async def main():
     loop = asyncio.get_event_loop()
     setup_signal_handlers(loop)
-    await ws_connect_loop(trade_ws, "TRADE")
+    symbol_queue = asyncio.Queue()
+    # Seed with initial symbol list so WebSocket connects immediately
+    init_syms = await fetch_top_penny_symbols()
+    await symbol_queue.put(init_syms)
+    await asyncio.gather(
+        dynamic_symbol_manager(symbol_queue),
+        trade_ws(symbol_queue)
+    )
 
 if __name__ == "__main__":
-    print("Starting penny stock spike alert scanner ($5 & under, 4am–8pm ET, Mon–Fri)...")
+    print("Starting real-time penny stock spike scanner ($5 & under, 4am–8pm ET, Mon–Fri)...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
