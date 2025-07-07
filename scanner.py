@@ -12,7 +12,7 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 
-# Option 1: Broadened news keywords
+# Broadened news keywords (Option 1)
 NEWS_KEYWORDS = [
     "AI", "artificial intelligence", "Federal Reserve", "interest rate", "Big Tech", "earnings",
     "Apple", "Microsoft", "Google", "Amazon", "Nvidia", "Meta", "EV", "electric vehicle", "Tesla",
@@ -22,7 +22,7 @@ NEWS_KEYWORDS = [
     "travel", "healthcare", "innovation", "stimulus", "infrastructure", "ESG", "green energy",
     "consumer spending", "retail", "inflation", "cost of living", "strike", "union", "antitrust",
     "regulation", "streaming", "Netflix", "Disney", "election",
-    # Broadened list for biotech/clinical news
+    # Biotech/clinical/health-related
     "trial", "results", "patients", "clinical", "top-line", "data", "study", "endpoint", "significance",
     "phase", "enrollment", "dose", "primary", "secondary", "summit", "approval", "efficacy", "safety",
     "treatment", "response", "cohort", "interim", "complete response", "partial response", "disease",
@@ -103,7 +103,7 @@ async def on_price_alert(symbol, event_type, price, event_time):
         msg = news_pretty_alert(symbol, headline, summary, url)
         await send_telegram_async(msg)
 
-# --- Candle structure and logic for price/volume alerts ---
+# --- Candle structure and logic for price/volume alerts (all stocks, not just penny) ---
 class Candle:
     def __init__(self, open_, high, low, close, volume, start_time):
         self.open = open_
@@ -147,7 +147,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         for headline, summary, url in news_found:
             await send_telegram_async(news_pretty_alert(symbol, headline, summary, url))
 
-# --- Robust async reconnect logic for WebSockets ---
+# --- Robust async reconnect logic for trade WebSocket ---
 async def ws_connect_loop(ws_handler, name):
     delay = 1
     while True:
@@ -159,40 +159,43 @@ async def ws_connect_loop(ws_handler, name):
         await asyncio.sleep(delay)
         delay = min(delay * 2, 60)  # Exponential backoff up to 60s
 
-# --- ASYNC Polygon News WebSocket ---
-async def news_ws():
-    uri = "wss://socket.polygon.io/news"
-    async with websockets.connect(uri, ping_interval=30, ping_timeout=10) as ws:
-        await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-        await ws.send(json.dumps({"action": "subscribe", "params": "A.NEWS"}))
-        print("News WebSocket opened and subscribing...")
-        async for message in ws:
-            try:
-                payload = json.loads(message)
-                if not isinstance(payload, list):
-                    payload = [payload]
-                for news in payload:
-                    if news.get("ev") != "A":
-                        continue
-                    symbol = news.get("sym", "")
-                    headline = news.get("title", "")
-                    summary = news.get("summary", "")
-                    url = news.get("url", "")
-                    ntime = news.get("dt", None)
-                    if ntime:
-                        news_time = datetime.utcfromtimestamp(ntime / 1000).replace(tzinfo=pytz.UTC)
-                    else:
-                        news_time = datetime.utcnow().replace(tzinfo=pytz.UTC)
-                    if not symbol or not headline:
-                        continue
-                    on_news_event(symbol, headline, summary, url, news_time)
-                    # Option 3/4: Send all news alerts for all stocks, not just penny stocks or keyword matches
-                    msg = news_pretty_alert(symbol, headline, summary, url)
-                    await send_telegram_async(msg)
-            except Exception as e:
-                print("News processing error:", e)
+# --- ASYNC Polygon News Polling (REST API, not WebSocket) ---
+async def news_rest_poll():
+    seen_ids = set()
+    # Option 4: Track news for all stocks, not just penny
+    url = f"https://api.polygon.io/v2/reference/news?limit=50&apiKey={POLYGON_API_KEY}"
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    data = await resp.json()
+                    results = data.get("results", [])
+                    for news in results:
+                        news_id = news["id"]
+                        if news_id not in seen_ids:
+                            seen_ids.add(news_id)
+                            # Option 4: Send for all symbols in news, not just penny
+                            symbols = news.get("symbols") or []
+                            headline = news.get("title", "")
+                            summary = news.get("description", "")
+                            url_ = news.get("article_url", "")
+                            news_time = None
+                            try:
+                                news_time = datetime.strptime(news["published_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC)
+                            except Exception:
+                                news_time = datetime.utcnow().replace(tzinfo=pytz.UTC)
+                            # Record for each symbol
+                            for symbol in symbols:
+                                on_news_event(symbol, headline, summary, url_, news_time)
+                                # Option 3: Send all news alerts as soon as they are received (not just after a spike)
+                                msg = news_pretty_alert(symbol, headline, summary, url_)
+                                await send_telegram_async(msg)
+            await asyncio.sleep(30)  # poll every 30s
+        except Exception as e:
+            print("News polling error:", e)
+            await asyncio.sleep(60)
 
-# --- ASYNC Polygon Trade WebSocket and Candle Aggregation ---
+# --- ASYNC Polygon Trade WebSocket and Candle Aggregation (all stocks) ---
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
 trade_candle_builders = defaultdict(list)
 trade_candle_last_time = {}
@@ -253,12 +256,12 @@ async def main():
     loop = asyncio.get_event_loop()
     setup_signal_handlers(loop)
     await asyncio.gather(
-        ws_connect_loop(news_ws, "NEWS"),
         ws_connect_loop(trade_ws, "TRADE"),
+        news_rest_poll(),  # use REST polling for news
     )
 
 if __name__ == "__main__":
-    print("Starting ASYNC Polygon news + spike alert bot for ALL stocks, all news, with robust reconnects...")
+    print("Starting Polygon news + spike alert bot for ALL stocks, all news, with robust reconnects...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
