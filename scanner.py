@@ -13,7 +13,7 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 PRICE_THRESHOLD = 5.00
-MAX_SYMBOLS = 500  # Polygon Advanced Plan max per connection
+MAX_SYMBOLS = 500
 SCREENER_REFRESH_SEC = 60
 
 def is_market_scan_time():
@@ -54,23 +54,10 @@ class Candle:
         self.start_time = start_time
 
 candles = defaultdict(lambda: deque(maxlen=4))  # 4 to check previous 3 and current
-first_alert_sent = set()
-hod_tracker = {}  # symbol -> (high of day, hod_date)
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
         return
-
-    # Track high of day per symbol (reset at day start)
-    ny = pytz.timezone("America/New_York")
-    now_ny = datetime.now(ny).date()
-    hod, hod_date = hod_tracker.get(symbol, (None, None))
-    if hod_date != now_ny:
-        hod = None  # reset high of day for new day
-    if hod is None or high > hod:
-        hod = high
-        hod_date = now_ny
-    hod_tracker[symbol] = (hod, hod_date)
 
     candles[symbol].append(Candle(open_, high, low, close, volume, start_time))
 
@@ -87,21 +74,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         avg_vol = (c[0].volume + c[1].volume + c[2].volume) / 3
         volume_spike = c[3].volume >= 2 * avg_vol
         if price_spike and volume_spike:
-            if symbol not in first_alert_sent:
-                msg = (
-                    f"🚨 {escape_html(symbol)} stock price up ${c[3].close - c[0].close:.2f} over last 3 min candles.\n"
-                    f"From ${c[0].close:.2f} to ${c[3].close:.2f}."
-                )
-                await send_telegram_async(msg)
-                first_alert_sent.add(symbol)
-                hod_tracker[symbol] = (max(hod, c[3].close), hod_date)
-            else:
-                # Only alert on new high of day (💰 emoji)
-                hod, _ = hod_tracker[symbol]
-                if c[3].close > hod:
-                    msg = f"💰 {escape_html(symbol)} new high of day: ${c[3].close:.2f}"
-                    await send_telegram_async(msg)
-                    hod_tracker[symbol] = (c[3].close, hod_date)
+            msg = (
+                f"🚨 {escape_html(symbol)} stock price up ${c[3].close - c[0].close:.2f} over last 3 min candles.\n"
+                f"From ${c[0].close:.2f} to ${c[3].close:.2f}."
+            )
+            await send_telegram_async(msg)
 
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
 trade_candle_builders = defaultdict(list)
