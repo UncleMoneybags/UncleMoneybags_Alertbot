@@ -13,7 +13,7 @@ import signal
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
-PRICE_THRESHOLD = 5.00
+PRICE_THRESHOLD = 10.00  # Changed from 5.00 to 10.00
 MAX_SYMBOLS = 100  # Batch size for Polygon WebSocket stability
 SCREENER_REFRESH_SEC = 60
 MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents
@@ -70,10 +70,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         change = c[2].close - c[0].close
         if change >= MIN_ALERT_MOVE:
             msg = (
-                f"🚨 {escape_html(symbol)} stock price up ${change:.2f} over last 3 min candles.\n"
-                f"From ${c[0].close:.2f} to ${c[2].close:.2f}."
+                f"🚨 {escape_html(symbol)} stock price up ${change:.2f} over last 3 minutes.\n"
+                f"${c[2].close:.2f}."
             )
-            print(f"ALERT: {symbol} 3-candle up move!")  # Debug print
+            print(f"ALERT: {symbol} 3-minute up move!")  # Debug print
             await send_telegram_async(msg)
 
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
@@ -134,7 +134,7 @@ async def fetch_top_penny_symbols():
                     if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
                         price = day["c"]
                     volume = day.get("v", 0)
-                    # Only add actual penny stocks: price > 0 and <= 5, volume at least 10k
+                    # Only add actual penny stocks: price > 0 and <= 10, volume at least 10k
                     if price is not None and 0 < price <= PRICE_THRESHOLD and volume >= 10000:
                         penny_symbols.append(ticker)
                         print(f"Adding {ticker} at ${price:.2f}, vol={volume} to scan list")
@@ -254,7 +254,7 @@ async def main():
     )
 
 if __name__ == "__main__":
-    print("Starting real-time penny stock spike scanner ($5 & under, 4am–8pm ET, Mon–Fri)...")
+    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri)...")
     # Uncomment this line to test Telegram delivery
     # asyncio.run(send_telegram_async("Test alert from penny scanner"))
     try:
