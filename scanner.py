@@ -136,8 +136,8 @@ async def fetch_top_penny_symbols():
                     if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
                         price = day["c"]
                     volume = day.get("v", 0)
-                    # Only add actual penny stocks: price > 0 and <= 10, volume at least 10k
-                    if price is not None and 0 < price <= PRICE_THRESHOLD and volume >= 10000:
+                    # Only add actual penny stocks: price > 0 and <= 10
+                    if price is not None and 0 < price <= PRICE_THRESHOLD:
                         penny_symbols.append(ticker)
                         print(f"Adding {ticker} at ${price:.2f}, vol={volume} to scan list")
                         if len(penny_symbols) >= MAX_SYMBOLS:
