@@ -48,46 +48,21 @@ async def send_telegram_async(message):
 def escape_html(s):
     return html.escape(s or "")
 
-class Candle:
-    def __init__(self, open_, high, low, close, volume, start_time):
-        self.open = open_
-        self.high = high
-        self.low = low
-        self.close = close
-        self.volume = volume
-        self.start_time = start_time
-
-candles = defaultdict(lambda: deque(maxlen=3))  # 3 for 3-min price move alert
-
-async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
-    if not is_market_scan_time() or close > PRICE_THRESHOLD:
-        return
-
-    candles[symbol].append(Candle(open_, high, low, close, volume, start_time))
-    if len(candles[symbol]) < 3:
-        return
-
-    c = candles[symbol]
-    if c[2].close > c[1].close > c[0].close:
-        change = c[2].close - c[0].close
-        if change >= MIN_ALERT_MOVE:
-            msg = (
-                f"🚨 {escape_html(symbol)} stock price up ${change:.2f} over last 3 minutes.\n"
-                f"${c[2].close:.2f}."
-            )
-            print(f"ALERT: {symbol} 3-minute up move!")  # Debug print
-            await send_telegram_async(msg)
-
-TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
-trade_candle_builders = defaultdict(list)
-trade_candle_last_time = {}
+# Robust candle and trade logic
+candles = defaultdict(lambda: deque(maxlen=3))  # Store 3 finalized 1-min candles per symbol
+trade_candle_builders = defaultdict(list)  # Store trades for current minute per symbol
+trade_candle_last_time = {}  # Track last finalized minute per symbol
 
 async def on_trade_event(symbol, price, size, trade_time):
+    # Always round down to minute
     candle_time = trade_time.replace(second=0, microsecond=0)
     last_time = trade_candle_last_time.get(symbol)
-    if last_time and candle_time != last_time:
+    if last_time is not None and candle_time != last_time:
+        # Finalize previous minute's candle
         trades = trade_candle_builders[symbol]
         if trades:
+            # Sort trades by their timestamp!
+            trades.sort(key=lambda t: t[2])
             prices = [t[0] for t in trades]
             volumes = [t[1] for t in trades]
             open_ = prices[0]
@@ -95,10 +70,38 @@ async def on_trade_event(symbol, price, size, trade_time):
             high = max(prices)
             low = min(prices)
             volume = sum(volumes)
-            await on_new_candle(symbol, open_, high, low, close, volume, last_time)
+            start_time = last_time
+            await on_new_candle(symbol, open_, high, low, close, volume, start_time)
         trade_candle_builders[symbol] = []
-    trade_candle_builders[symbol].append((price, size))
+    # Save every trade with its timestamp
+    trade_candle_builders[symbol].append((price, size, trade_time))
     trade_candle_last_time[symbol] = candle_time
+
+async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
+    if not is_market_scan_time() or close > PRICE_THRESHOLD:
+        return
+    # Store candle as dict for clarity
+    candles[symbol].append({
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "start_time": start_time,
+    })
+    print(f"[DEBUG] {symbol} new candle: open={open_}, close={close}, time={start_time}")
+    if len(candles[symbol]) == 3:
+        c0, c1, c2 = candles[symbol]
+        print(f"[DEBUG] {symbol} 3m closes: {c0['close']}, {c1['close']}, {c2['close']}")
+        # True three green candles
+        if c0["close"] < c1["close"] < c2["close"]:
+            move = c2["close"] - c0["close"]
+            if move >= MIN_ALERT_MOVE:
+                msg = (
+                    f"🚨 {escape_html(symbol)} stock price up ${move:.2f} over last 3 minutes.\n"
+                    f"${c2['close']:.2f}."
+                )
+                print(f"ALERT: {symbol} 3-minute up move!")  # Debug print
+                await send_telegram_async(msg)
 
 def is_equity_symbol(ticker):
     # Exclude symbols ending with W, WS, U, R, P, or containing a dot (.)
