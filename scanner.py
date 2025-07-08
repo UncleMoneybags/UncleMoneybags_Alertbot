@@ -16,6 +16,7 @@ TELEGRAM_CHAT_ID = "-1002266463234"
 PRICE_THRESHOLD = 5.00
 MAX_SYMBOLS = 100  # Batch size for Polygon WebSocket stability
 SCREENER_REFRESH_SEC = 60
+MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents
 
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
@@ -65,15 +66,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         return
 
     c = candles[symbol]
-    # Simple 3 up-candle alert: last close > close 2 candles ago and all closes increasing
     if c[2].close > c[1].close > c[0].close:
         change = c[2].close - c[0].close
-        msg = (
-            f"🚨 {escape_html(symbol)} stock price up ${change:.2f} over last 3 min candles.\n"
-            f"From ${c[0].close:.2f} to ${c[2].close:.2f}."
-        )
-        print(f"ALERT: {symbol} 3-candle up move!")  # Debug print
-        await send_telegram_async(msg)
+        if change >= MIN_ALERT_MOVE:
+            msg = (
+                f"🚨 {escape_html(symbol)} stock price up ${change:.2f} over last 3 min candles.\n"
+                f"From ${c[0].close:.2f} to ${c[2].close:.2f}."
+            )
+            print(f"ALERT: {symbol} 3-candle up move!")  # Debug print
+            await send_telegram_async(msg)
 
 TRADE_CANDLE_INTERVAL = timedelta(minutes=1)
 trade_candle_builders = defaultdict(list)
