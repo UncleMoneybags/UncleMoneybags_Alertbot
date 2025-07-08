@@ -108,7 +108,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         ):
             move = c2["close"] - c0["close"]
             msg = (
-                f"🚨 {escape_html(symbol)} up ${move:.2f} ({total_volume:,} shares/3min).\n"
+                f"🚨 {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
                 f"Now ${c2['close']:.2f}."
             )
             print(f"ALERT: {symbol} 3 green candles, {total_volume} shares!")  # Debug print
