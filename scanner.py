@@ -20,7 +20,9 @@ MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents
 
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
-    now_ny = datetime.now(ny)
+    now_utc = datetime.now(pytz.UTC)
+    now_ny = now_utc.astimezone(ny)
+    print(f"[DEBUG] NY time: {now_ny}, NY weekday: {now_ny.weekday()}")
     if now_ny.weekday() >= 5:
         return False  # Saturday or Sunday
     scan_start = time(4, 0)
