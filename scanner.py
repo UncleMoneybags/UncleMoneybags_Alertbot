@@ -13,10 +13,12 @@ import signal
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
-PRICE_THRESHOLD = 10.00  # Changed from 5.00 to 10.00
+PRICE_THRESHOLD = 10.00
 MAX_SYMBOLS = 100  # Batch size for Polygon WebSocket stability
 SCREENER_REFRESH_SEC = 60
 MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents
+MIN_3MIN_VOLUME = 10000  # Alert only if at least this much total volume in last 3 min
+MIN_PER_CANDLE_VOL = 1000  # Optional: per candle minimum volume
 
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
@@ -86,22 +88,30 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         "high": high,
         "low": low,
         "close": close,
+        "volume": volume,
         "start_time": start_time,
     })
-    print(f"[DEBUG] {symbol} new candle: open={open_}, close={close}, time={start_time}")
+    print(f"[DEBUG] {symbol} new candle: open={open_}, close={close}, volume={volume}, time={start_time}")
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
-        print(f"[DEBUG] {symbol} 3m closes: {c0['close']}, {c1['close']}, {c2['close']}")
-        # True three green candles
-        if c0["close"] < c1["close"] < c2["close"]:
+        total_volume = c0["volume"] + c1["volume"] + c2["volume"]
+        print(f"[DEBUG] {symbol} 3m closes: {c0['close']}, {c1['close']}, {c2['close']} | volumes: {c0['volume']}, {c1['volume']}, {c2['volume']} | total_vol: {total_volume}")
+        # True three green candles, min move, and enough total volume
+        if (
+            c0["close"] < c1["close"] < c2["close"]
+            and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
+            and total_volume >= MIN_3MIN_VOLUME
+            and c0["volume"] >= MIN_PER_CANDLE_VOL
+            and c1["volume"] >= MIN_PER_CANDLE_VOL
+            and c2["volume"] >= MIN_PER_CANDLE_VOL
+        ):
             move = c2["close"] - c0["close"]
-            if move >= MIN_ALERT_MOVE:
-                msg = (
-                    f"🚨 {escape_html(symbol)} stock price up ${move:.2f} over last 3 minutes.\n"
-                    f"${c2['close']:.2f}."
-                )
-                print(f"ALERT: {symbol} 3-minute up move!")  # Debug print
-                await send_telegram_async(msg)
+            msg = (
+                f"🚨 {escape_html(symbol)} up ${move:.2f} ({total_volume:,} shares/3min).\n"
+                f"Now ${c2['close']:.2f}."
+            )
+            print(f"ALERT: {symbol} 3 green candles, {total_volume} shares!")  # Debug print
+            await send_telegram_async(msg)
 
 def is_equity_symbol(ticker):
     # Exclude symbols ending with W, WS, U, R, P, or containing a dot (.)
