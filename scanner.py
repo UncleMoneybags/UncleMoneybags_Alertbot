@@ -50,9 +50,6 @@ def alert(message):
     threading.Thread(target=send_telegram_alert, args=(message,)).start()
 
 def fetch_all_us_tickers():
-    """
-    Returns a list of all active, common stock US tickers.
-    """
     print("Fetching all tickers...")
     tickers = []
     url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
@@ -73,10 +70,6 @@ def fetch_all_us_tickers():
     return tickers
 
 def get_last_prices_batch(batch):
-    """
-    Fetches last trade price for a batch of tickers.
-    Returns dict {ticker: last_price}
-    """
     symbols = ",".join(batch)
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers={symbols}&apiKey={POLYGON_API_KEY}"
     prices = {}
@@ -84,16 +77,13 @@ def get_last_prices_batch(batch):
         r = requests.get(url)
         for t in r.json().get("tickers", []):
             price = t.get("lastTrade", {}).get("p", 0)
-            prices[t["ticker"]] = price
+            vol = t.get("day", {}).get("v", 0)
+            prices[t["ticker"]] = (price, vol)
     except Exception as e:
         print(f"[WARN] Price batch failed: {e}")
     return prices
 
 def get_minute_bar_batch(tickers):
-    """
-    Fetches the most recent 1-min bars for a batch of tickers.
-    Returns dict {ticker: bar}
-    """
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{datetime.datetime.utcnow().strftime('%Y-%m-%d')}?adjusted=true&apiKey={POLYGON_API_KEY}"
     try:
         r = requests.get(url)
@@ -193,31 +183,35 @@ def get_ipos():
         return []
 
 def main_loop():
-    print("Starting Real-Time Stock Alert Service...")
-    # Cache the full US ticker list in memory (refresh at startup or if empty)
-    all_tickers = []
+    print("Starting FULL INJECT Penny Stock Scanner! Ctrl+C to exit.")
     while True:
         if not is_market_time():
             print("Not market hours. Sleeping 60s...")
             time.sleep(60)
             continue
-        if not all_tickers:
-            all_tickers = fetch_all_us_tickers()
+        # Fetch all tickers each cycle for truly dynamic scanning
+        all_tickers = fetch_all_us_tickers()
         under10_tickers = []
         # Batch fetch last prices for all tickers
         for i in range(0, len(all_tickers), TICKER_BATCH_SIZE):
             batch = all_tickers[i:i + TICKER_BATCH_SIZE]
             prices = get_last_prices_batch(batch)
-            for t, p in prices.items():
+            for t, (p, vol) in prices.items():
                 if p > 0 and p <= PRICE_MAX:
                     under10_tickers.append(t)
-            time.sleep(0.1)  # avoid API burst
-        print(f"Tickers under ${PRICE_MAX} right now: {len(under10_tickers)}")
-        # Batch process for volume/price/news
+                    print(f"Adding {t} at ${p:.2f}, vol={vol} to scan list")
+            time.sleep(0.1)
+        print(f"Fetched {len(under10_tickers)} penny stock symbols to scan.")
+        print(f"Dynamically updated to {len(under10_tickers)} symbols.")
+        # Scan all valid tickers now
         for i in range(0, len(under10_tickers), TICKER_BATCH_SIZE):
             batch = under10_tickers[i:i + TICKER_BATCH_SIZE]
             bars = get_minute_bar_batch(batch)
-            for ticker, bar in bars.items():
+            for ticker in batch:
+                print(f"SCANNING {ticker}")  # <--- Explicit scan log
+                bar = bars.get(ticker)
+                if not bar:
+                    continue
                 detect_volume_spike(ticker, bar)
                 detect_price_spike(ticker, bar)
                 for alert_msg in get_recent_news(ticker):
@@ -227,12 +221,13 @@ def main_loop():
                 alert(halt_msg)
             for ipo_msg in get_ipos():
                 alert(ipo_msg)
-            time.sleep(1)  # avoid API burst
-        # Full loop every ~len(under10_tickers)/BATCH_SIZE minutes
-        # Reset all_tickers every loop for up-to-date coverage
-        all_tickers = []
-        # Optionally, sleep a short while before next loop (e.g., 10s)
+            time.sleep(1)
+        # Sleep a short while before next loop for real-time
+        print(f"Scan complete. Restarting in 10 seconds...\n")
         time.sleep(10)
 
 if __name__ == "__main__":
-    main_loop()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("Bot stopped manually (KeyboardInterrupt).")
