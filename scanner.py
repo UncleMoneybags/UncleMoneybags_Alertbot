@@ -1,278 +1,238 @@
-import asyncio
-import websockets
-import aiohttp
-import json
-import html
-import re
-from collections import deque, defaultdict
-from datetime import datetime, timedelta, time
-import pytz
-import signal
+import requests
+import time
+import datetime
+import threading
+from collections import deque
+from zoneinfo import ZoneInfo
 
-# --- CONFIG ---
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
-PRICE_THRESHOLD = 10.00
-MAX_SYMBOLS = 100  # Batch size for Polygon WebSocket stability
-SCREENER_REFRESH_SEC = 60
-MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents
-MIN_3MIN_VOLUME = 10000  # Alert only if at least this much total volume in last 3 min
-MIN_PER_CANDLE_VOL = 1000  # Optional: per candle minimum volume
 
-def is_market_scan_time():
-    ny = pytz.timezone("America/New_York")
-    now_utc = datetime.now(pytz.UTC)
-    now_ny = now_utc.astimezone(ny)
-    print(f"[DEBUG] NY time: {now_ny}, NY weekday: {now_ny.weekday()}")
-    if now_ny.weekday() >= 5:
-        return False  # Saturday or Sunday
-    scan_start = time(4, 0)
-    scan_end = time(20, 0)
-    return scan_start <= now_ny.time() <= scan_end
+PRICE_MAX = 10.0
+VOLUME_SPIKE_MULT = 2.0
+PRICE_SPIKE_PCT = 3.0
+NEWS_LOOKBACK_MINUTES = 5
+TICKER_BATCH_SIZE = 50
 
-async def send_telegram_async(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+volume_history = {}
+price_history = {}
+alerted_news_ids = set()
+alerted_halts = set()
+alerted_ipos = set()
+
+TRADING_START_HOUR = 4
+TRADING_END_HOUR = 20
+
+def is_market_time():
+    now_ny = datetime.datetime.now(ZoneInfo("America/New_York"))
+    weekday = now_ny.weekday()
+    hour = now_ny.hour
+    return (weekday < 5) and (TRADING_START_HOUR <= hour < TRADING_END_HOUR)
+
+def send_telegram_alert(message):
+    url = (
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
     }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, data=payload, timeout=10) as resp:
-                if resp.status != 200:
-                    print("Telegram send error:", await resp.text())
-        except Exception as e:
-            print(f"Telegram send error: {e}")
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"[WARN] Telegram alert failed: {e}")
 
-def escape_html(s):
-    return html.escape(s or "")
+def alert(message):
+    print(message)
+    threading.Thread(target=send_telegram_alert, args=(message,)).start()
 
-# Robust candle and trade logic
-candles = defaultdict(lambda: deque(maxlen=3))  # Store 3 finalized 1-min candles per symbol
-trade_candle_builders = defaultdict(list)  # Store trades for current minute per symbol
-trade_candle_last_time = {}  # Track last finalized minute per symbol
+def fetch_all_us_tickers():
+    """
+    Returns a list of all active, common stock US tickers.
+    """
+    print("Fetching all tickers...")
+    tickers = []
+    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
+    while url:
+        r = requests.get(url)
+        data = r.json()
+        for t in data.get("results", []):
+            if t.get("type") != "CS":
+                continue
+            symbol = t["ticker"]
+            if symbol.startswith("C:") or symbol.startswith("W:") or "." in symbol:
+                continue
+            tickers.append(symbol)
+        url = data.get("next_url")
+        if url:
+            url += f"&apiKey={POLYGON_API_KEY}"
+    print(f"Total US common stock tickers fetched: {len(tickers)}")
+    return tickers
 
-async def on_trade_event(symbol, price, size, trade_time):
-    # Always round down to minute
-    candle_time = trade_time.replace(second=0, microsecond=0)
-    last_time = trade_candle_last_time.get(symbol)
-    if last_time is not None and candle_time != last_time:
-        # Finalize previous minute's candle
-        trades = trade_candle_builders[symbol]
-        if trades:
-            # Sort trades by their timestamp!
-            trades.sort(key=lambda t: t[2])
-            prices = [t[0] for t in trades]
-            volumes = [t[1] for t in trades]
-            open_ = prices[0]
-            close = prices[-1]
-            high = max(prices)
-            low = min(prices)
-            volume = sum(volumes)
-            start_time = last_time
-            await on_new_candle(symbol, open_, high, low, close, volume, start_time)
-        trade_candle_builders[symbol] = []
-    # Save every trade with its timestamp
-    trade_candle_builders[symbol].append((price, size, trade_time))
-    trade_candle_last_time[symbol] = candle_time
+def get_last_prices_batch(batch):
+    """
+    Fetches last trade price for a batch of tickers.
+    Returns dict {ticker: last_price}
+    """
+    symbols = ",".join(batch)
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers={symbols}&apiKey={POLYGON_API_KEY}"
+    prices = {}
+    try:
+        r = requests.get(url)
+        for t in r.json().get("tickers", []):
+            price = t.get("lastTrade", {}).get("p", 0)
+            prices[t["ticker"]] = price
+    except Exception as e:
+        print(f"[WARN] Price batch failed: {e}")
+    return prices
 
-async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
-    if not is_market_scan_time() or close > PRICE_THRESHOLD:
-        return
-    # Store candle as dict for clarity
-    candles[symbol].append({
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-        "volume": volume,
-        "start_time": start_time,
-    })
-    print(f"[DEBUG] {symbol} new candle: open={open_}, close={close}, volume={volume}, time={start_time}")
-    if len(candles[symbol]) == 3:
-        c0, c1, c2 = candles[symbol]
-        total_volume = c0["volume"] + c1["volume"] + c2["volume"]
-        print(f"[DEBUG] {symbol} 3m closes: {c0['close']}, {c1['close']}, {c2['close']} | volumes: {c0['volume']}, {c1['volume']}, {c2['volume']} | total_vol: {total_volume}")
-        # True three green candles, min move, and enough total volume
-        if (
-            c0["close"] < c1["close"] < c2["close"]
-            and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
-            and total_volume >= MIN_3MIN_VOLUME
-            and c0["volume"] >= MIN_PER_CANDLE_VOL
-            and c1["volume"] >= MIN_PER_CANDLE_VOL
-            and c2["volume"] >= MIN_PER_CANDLE_VOL
-        ):
-            move = c2["close"] - c0["close"]
-            msg = (
-                f"🚨 {escape_html(symbol)} up ${move:.2f} ({total_volume:,} shares/3min).\n"
-                f"Now ${c2['close']:.2f}."
-            )
-            print(f"ALERT: {symbol} 3 green candles, {total_volume} shares!")  # Debug print
-            await send_telegram_async(msg)
+def get_minute_bar_batch(tickers):
+    """
+    Fetches the most recent 1-min bars for a batch of tickers.
+    Returns dict {ticker: bar}
+    """
+    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{datetime.datetime.utcnow().strftime('%Y-%m-%d')}?adjusted=true&apiKey={POLYGON_API_KEY}"
+    try:
+        r = requests.get(url)
+        bars = {}
+        for bar in r.json().get("results", []):
+            sym = bar["T"]
+            if sym in tickers:
+                bars[sym] = bar
+        return bars
+    except Exception as e:
+        print(f"[WARN] Minute bar batch failed: {e}")
+        return {}
 
-def is_equity_symbol(ticker):
-    # Exclude symbols ending with W, WS, U, R, P, or containing a dot (.)
-    if re.search(r'(\.|\bW$|\bWS$|\bU$|\bR$|\bP$)', ticker):
-        return False
-    if ticker.endswith(('W', 'U', 'R', 'P', 'WS')) or '.' in ticker:
-        return False
-    # Exclude some known penny warrant/rights patterns
-    if any(x in ticker for x in ['WS', 'W', 'U', 'R', 'P', '.']):
-        return False
-    return True
+def detect_volume_spike(ticker, bar):
+    vol = bar.get("v", 0)
+    hist = volume_history.setdefault(ticker, deque(maxlen=10))
+    if len(hist) == hist.maxlen:
+        avg = sum(hist) / len(hist)
+        if avg > 0 and vol >= avg * VOLUME_SPIKE_MULT:
+            alert(f"🚨 *{ticker}* volume spike {vol/1000:.2f}K vs avg {avg/1000:.2f}K\nhttps://finance.yahoo.com/quote/{ticker}")
+    hist.append(vol)
 
-async def fetch_top_penny_symbols():
-    penny_symbols = []
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}&limit=1000"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                if "tickers" not in data:
-                    print("Tickers snapshot API response:", data)
-                    return []
-                for stock in data.get("tickers", []):
-                    ticker = stock.get("ticker")
-                    if not is_equity_symbol(ticker):
-                        continue
-                    last_trade = stock.get("lastTrade", {})
-                    day = stock.get("day", {})
-                    price = None
-                    price_time = 0
-                    # Use latest valid price between last trade and day close
-                    if last_trade and last_trade.get("p", 0) > 0:
-                        price = last_trade["p"]
-                        price_time = last_trade.get("t", 0)
-                    if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
-                        price = day["c"]
-                    volume = day.get("v", 0)
-                    # Only add actual penny stocks: price > 0 and <= 10
-                    if price is not None and 0 < price <= PRICE_THRESHOLD:
-                        penny_symbols.append(ticker)
-                        print(f"Adding {ticker} at ${price:.2f}, vol={volume} to scan list")
-                        if len(penny_symbols) >= MAX_SYMBOLS:
-                            break
-        except Exception as e:
-            print("Tickers snapshot fetch error:", e)
-    print(f"Fetched {len(penny_symbols)} penny stock symbols to scan.")
-    return penny_symbols
+def detect_price_spike(ticker, bar):
+    this_close = bar.get("c", 0)
+    hist = price_history.setdefault(ticker, deque(maxlen=10))
+    if len(hist) >= 3:
+        avg = sum(hist) / len(hist)
+        if avg > 0:
+            pct_change = (this_close - avg) / avg * 100
+            if abs(pct_change) >= PRICE_SPIKE_PCT:
+                alert(f"⚡️ *{ticker}* price spike {pct_change:.2f}% to ${this_close:.2f}\nhttps://finance.yahoo.com/quote/{ticker}")
+    hist.append(this_close)
 
-async def dynamic_symbol_manager(symbol_queue):
-    current_symbols = set()
-    while True:
-        if is_market_scan_time():
-            symbols = await fetch_top_penny_symbols()
-            if symbols:
-                if set(symbols) != current_symbols:
-                    await symbol_queue.put(symbols)
-                    current_symbols = set(symbols)
-            else:
-                print("No penny stock symbols found. Retrying...")
-        else:
-            print("Market not open for scanning. Waiting...")
-        await asyncio.sleep(SCREENER_REFRESH_SEC)
-
-async def trade_ws(symbol_queue):
-    subscribed_symbols = set()
-    while True:
-        try:
-            uri = "wss://socket.polygon.io/stocks"
-            async with websockets.connect(uri, ping_interval=30, ping_timeout=10) as ws:
-                await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-                print("Trade WebSocket opened.")
-                symbols = await symbol_queue.get()
-                if not symbols:
-                    print("No symbols to subscribe to, skipping websocket subscription.")
-                    await asyncio.sleep(SCREENER_REFRESH_SEC)
-                    continue
-
-                # Batch subscribe to avoid policy violation
-                BATCH_SIZE = 100
-                params_batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-                for batch in params_batches:
-                    params = ",".join([f"T.{s}" for s in batch])
-                    await ws.send(json.dumps({"action": "subscribe", "params": params}))
-                    await asyncio.sleep(0.2)  # Prevent rate limit
-
-                subscribed_symbols = set(symbols)
-                print(f"Subscribed to {len(symbols)} symbols.")
-
-                async def ws_recv():
-                    async for message in ws:
-                        payload = json.loads(message)
-                        if not isinstance(payload, list):
-                            payload = [payload]
-                        for item in payload:
-                            if item.get("ev") != "T":
-                                continue
-                            symbol = item.get("sym")
-                            price = float(item.get("p"))
-                            size = float(item.get("s", 0))
-                            ts = item.get("t") / 1000
-                            trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
-                            print(f"Trade: {symbol}, price={price}, size={size}, time={trade_time}")  # Debug
-                            await on_trade_event(symbol, price, size, trade_time)
-
-                async def ws_symbols():
-                    while True:
-                        new_symbols = await symbol_queue.get()
-                        to_unsubscribe = [s for s in subscribed_symbols if s not in new_symbols]
-                        to_subscribe = [s for s in new_symbols if s not in subscribed_symbols]
-                        # Only resubscribe if there's a change
-                        if not to_unsubscribe and not to_subscribe:
-                            print("No symbol changes; skipping resubscription.")
-                            continue
-                        # Unsubscribe and subscribe in batches
-                        BATCH_SIZE = 100
-                        if to_unsubscribe:
-                            for i in range(0, len(to_unsubscribe), BATCH_SIZE):
-                                remove_params = ",".join([f"T.{s}" for s in to_unsubscribe[i:i+BATCH_SIZE]])
-                                await ws.send(json.dumps({"action": "unsubscribe", "params": remove_params}))
-                                await asyncio.sleep(0.2)
-                        if to_subscribe:
-                            for i in range(0, len(to_subscribe), BATCH_SIZE):
-                                add_params = ",".join([f"T.{s}" for s in to_subscribe[i:i+BATCH_SIZE]])
-                                await ws.send(json.dumps({"action": "subscribe", "params": add_params}))
-                                await asyncio.sleep(0.2)
-                        subscribed_symbols.clear()
-                        subscribed_symbols.update(new_symbols)
-                        print(f"Dynamically updated to {len(new_symbols)} symbols.")
-
-                await asyncio.gather(ws_recv(), ws_symbols())
-        except Exception as e:
-            print(f"Trade WebSocket error: {e}. Reconnecting soon...")
-            await asyncio.sleep(5)
-
-def setup_signal_handlers(loop):
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
-
-async def shutdown(loop, sig):
-    print(f"Received exit signal {sig.name}...")
-    tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
-
-async def main():
-    loop = asyncio.get_event_loop()
-    setup_signal_handlers(loop)
-    symbol_queue = asyncio.Queue()
-    init_syms = await fetch_top_penny_symbols()
-    await symbol_queue.put(init_syms)
-    await asyncio.gather(
-        dynamic_symbol_manager(symbol_queue),
-        trade_ws(symbol_queue)
+def get_recent_news(ticker):
+    now = datetime.datetime.utcnow()
+    start = now - datetime.timedelta(minutes=NEWS_LOOKBACK_MINUTES)
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        f"https://api.polygon.io/v2/reference/news?"
+        f"ticker={ticker}&published_utc.gte={start_str}&apiKey={POLYGON_API_KEY}"
     )
+    try:
+        r = requests.get(url)
+        articles = r.json().get("results", [])
+        new_alerts = []
+        for a in articles:
+            news_id = a.get("id")
+            if news_id not in alerted_news_ids:
+                alerted_news_ids.add(news_id)
+                headline = a.get("title","")
+                url_link = a.get("article_url","")
+                new_alerts.append(f"📰 *{ticker}* - {headline}\n{url_link}")
+        return new_alerts
+    except Exception as e:
+        print(f"[WARN] News check failed for {ticker}: {e}")
+        return []
+
+def get_halts():
+    url = f"https://api.polygon.io/v3/reference/market-status/halts?apiKey={POLYGON_API_KEY}"
+    try:
+        r = requests.get(url)
+        data = r.json().get("results", [])
+        new_halts = []
+        for h in data:
+            key = (h.get("ticker"), h.get("halt_time"))
+            if key not in alerted_halts:
+                alerted_halts.add(key)
+                reason = h.get("reason_code")
+                new_halts.append(f"⏸️ HALT: *{h['ticker']}* - Reason: {reason} @ {h.get('halt_time')}")
+        return new_halts
+    except Exception as e:
+        print(f"[WARN] Halt check failed: {e}")
+        return []
+
+def get_ipos():
+    now = datetime.datetime.utcnow()
+    start = now - datetime.timedelta(days=3)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = now.strftime("%Y-%m-%d")
+    url = (
+        f"https://api.polygon.io/v3/reference/market-activity/ipos?from={start_str}&to={end_str}&apiKey={POLYGON_API_KEY}"
+    )
+    try:
+        r = requests.get(url)
+        ipos = r.json().get("results", [])
+        new_ipos = []
+        for ipo in ipos:
+            symbol = ipo.get("ticker")
+            if symbol and symbol not in alerted_ipos:
+                alerted_ipos.add(symbol)
+                name = ipo.get("name", "")
+                date = ipo.get("expected_date", "")
+                new_ipos.append(f"🆕 IPO: *{symbol}* ({name}) - Expected: {date}")
+        return new_ipos
+    except Exception as e:
+        print(f"[WARN] IPO check failed: {e}")
+        return []
+
+def main_loop():
+    print("Starting Real-Time Stock Alert Service...")
+    # Cache the full US ticker list in memory (refresh at startup or if empty)
+    all_tickers = []
+    while True:
+        if not is_market_time():
+            print("Not market hours. Sleeping 60s...")
+            time.sleep(60)
+            continue
+        if not all_tickers:
+            all_tickers = fetch_all_us_tickers()
+        under10_tickers = []
+        # Batch fetch last prices for all tickers
+        for i in range(0, len(all_tickers), TICKER_BATCH_SIZE):
+            batch = all_tickers[i:i + TICKER_BATCH_SIZE]
+            prices = get_last_prices_batch(batch)
+            for t, p in prices.items():
+                if p > 0 and p <= PRICE_MAX:
+                    under10_tickers.append(t)
+            time.sleep(0.1)  # avoid API burst
+        print(f"Tickers under ${PRICE_MAX} right now: {len(under10_tickers)}")
+        # Batch process for volume/price/news
+        for i in range(0, len(under10_tickers), TICKER_BATCH_SIZE):
+            batch = under10_tickers[i:i + TICKER_BATCH_SIZE]
+            bars = get_minute_bar_batch(batch)
+            for ticker, bar in bars.items():
+                detect_volume_spike(ticker, bar)
+                detect_price_spike(ticker, bar)
+                for alert_msg in get_recent_news(ticker):
+                    alert(alert_msg)
+            # Halt and IPO checks every batch
+            for halt_msg in get_halts():
+                alert(halt_msg)
+            for ipo_msg in get_ipos():
+                alert(ipo_msg)
+            time.sleep(1)  # avoid API burst
+        # Full loop every ~len(under10_tickers)/BATCH_SIZE minutes
+        # Reset all_tickers every loop for up-to-date coverage
+        all_tickers = []
+        # Optionally, sleep a short while before next loop (e.g., 10s)
+        time.sleep(10)
 
 if __name__ == "__main__":
-    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri)...")
-    # Uncomment this line to test Telegram delivery
-    # asyncio.run(send_telegram_async("Test alert from penny scanner"))
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-        print("Bot stopped gracefully.")
+    main_loop()
