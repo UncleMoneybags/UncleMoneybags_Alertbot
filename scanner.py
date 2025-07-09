@@ -26,7 +26,6 @@ def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(pytz.UTC)
     now_ny = now_utc.astimezone(ny)
-    print(f"[DEBUG] NY time: {now_ny}, NY weekday: {now_ny.weekday()}")
     if now_ny.weekday() >= 5:
         return False  # Saturday or Sunday
     scan_start = time(4, 0)
@@ -92,11 +91,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         "volume": volume,
         "start_time": start_time,
     })
-    print(f"[DEBUG] {symbol} new candle: open={open_}, close={close}, volume={volume}, time={start_time}")
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
-        print(f"[DEBUG] {symbol} 3m closes: {c0['close']}, {c1['close']}, {c2['close']} | volumes: {c0['volume']}, {c1['volume']}, {c2['volume']} | total_vol: {total_volume}")
         if (
             c0["close"] < c1["close"] < c2["close"]
             and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
@@ -109,7 +106,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             prev_price = last_alerted_price.get(symbol)
             # First alert = 🚨, subsequent (price-based cooldown) = 💰
             if prev_price is not None and (c2["close"] - prev_price) < ALERT_PRICE_DELTA:
-                print(f"[DEBUG] {symbol} skipped: move since last alert (${prev_price} -> ${c2['close']}) < ${ALERT_PRICE_DELTA}")
                 return
             if prev_price is None:
                 emoji = "🚨"
@@ -120,7 +116,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
                 f"Now ${c2['close']:.2f}."
             )
-            print(f"ALERT: {symbol} 3 green candles, {total_volume} shares!")
             await send_telegram_async(msg)
 
 def is_equity_symbol(ticker):
@@ -162,7 +157,6 @@ async def fetch_top_penny_symbols():
                     if not is_equity_symbol(ticker):
                         continue
                     if await is_recent_ipo(ticker):
-                        print(f"Skipping IPO: {ticker}")
                         continue
                     last_trade = stock.get("lastTrade", {})
                     day = stock.get("day", {})
@@ -176,12 +170,10 @@ async def fetch_top_penny_symbols():
                     volume = day.get("v", 0)
                     if price is not None and 0 < price <= PRICE_THRESHOLD:
                         penny_symbols.append(ticker)
-                        print(f"Adding {ticker} at ${price:.2f}, vol={volume} to scan list")
                         if len(penny_symbols) >= MAX_SYMBOLS:
                             break
         except Exception as e:
             print("Tickers snapshot fetch error:", e)
-    print(f"Fetched {len(penny_symbols)} penny stock symbols to scan.")
     return penny_symbols
 
 async def dynamic_symbol_manager(symbol_queue):
@@ -193,10 +185,6 @@ async def dynamic_symbol_manager(symbol_queue):
                 if set(symbols) != current_symbols:
                     await symbol_queue.put(symbols)
                     current_symbols = set(symbols)
-            else:
-                print("No penny stock symbols found. Retrying...")
-        else:
-            print("Market not open for scanning. Waiting...")
         await asyncio.sleep(SCREENER_REFRESH_SEC)
 
 async def handle_halt_event(item):
@@ -204,13 +192,10 @@ async def handle_halt_event(item):
     if not symbol or not is_equity_symbol(symbol):
         return
     # Only alert for penny stocks
-    # Polygon halt event doesn't always provide price, so fetch last price if needed
-    # We fetch price only if not present in event (to avoid excess API calls)
     price = None
     if "p" in item and item["p"] is not None:
         price = float(item["p"])
     if price is None:
-        # Fallback: fetch last price from polygon snapshot
         url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
         try:
             async with aiohttp.ClientSession() as session:
@@ -224,7 +209,6 @@ async def handle_halt_event(item):
         return
     # Exclude recent IPOs
     if await is_recent_ipo(symbol):
-        print(f"[HALT ALERT] Skipping IPO: {symbol}")
         return
     # Avoid duplicate alerts for same halt event
     halt_ts = item.get("t") if "t" in item else None
@@ -235,7 +219,6 @@ async def handle_halt_event(item):
         last_halt_alert[symbol] = halt_ts
     # Send the alert
     msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
-    print(f"[HALT ALERT] {msg}")
     await send_telegram_async(msg)
 
 async def trade_ws(symbol_queue):
@@ -245,10 +228,8 @@ async def trade_ws(symbol_queue):
             uri = "wss://socket.polygon.io/stocks"
             async with websockets.connect(uri, ping_interval=30, ping_timeout=10) as ws:
                 await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-                print("Trade WebSocket opened.")
                 symbols = await symbol_queue.get()
                 if not symbols:
-                    print("No symbols to subscribe to, skipping websocket subscription.")
                     await asyncio.sleep(SCREENER_REFRESH_SEC)
                     continue
                 BATCH_SIZE = 100
@@ -258,7 +239,6 @@ async def trade_ws(symbol_queue):
                     await ws.send(json.dumps({"action": "subscribe", "params": params}))
                     await asyncio.sleep(0.2)
                 subscribed_symbols = set(symbols)
-                print(f"Subscribed to {len(symbols)} symbols.")
 
                 async def ws_recv():
                     async for message in ws:
@@ -272,10 +252,8 @@ async def trade_ws(symbol_queue):
                                 size = float(item.get("s", 0))
                                 ts = item.get("t") / 1000
                                 trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
-                                print(f"Trade: {symbol}, price={price}, size={size}, time={trade_time}")
                                 await on_trade_event(symbol, price, size, trade_time)
                             elif item.get("ev") == "H":
-                                # HALT event!
                                 await handle_halt_event(item)
 
                 async def ws_symbols():
@@ -284,7 +262,6 @@ async def trade_ws(symbol_queue):
                         to_unsubscribe = [s for s in subscribed_symbols if s not in new_symbols]
                         to_subscribe = [s for s in new_symbols if s not in subscribed_symbols]
                         if not to_unsubscribe and not to_subscribe:
-                            print("No symbol changes; skipping resubscription.")
                             continue
                         BATCH_SIZE = 100
                         if to_unsubscribe:
@@ -299,7 +276,6 @@ async def trade_ws(symbol_queue):
                                 await asyncio.sleep(0.2)
                         subscribed_symbols.clear()
                         subscribed_symbols.update(new_symbols)
-                        print(f"Dynamically updated to {len(new_symbols)} symbols.")
 
                 await asyncio.gather(ws_recv(), ws_symbols())
         except Exception as e:
