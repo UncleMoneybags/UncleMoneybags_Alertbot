@@ -22,6 +22,10 @@ MIN_PER_CANDLE_VOL = 1000  # Optional: per candle minimum volume
 MIN_IPO_DAYS = 30  # Exclude stocks IPO'ed in last 30 days
 ALERT_PRICE_DELTA = 0.25  # Only alert if price is up another $0.25+ from last alert
 
+# Relative Volume config
+rvol_history = defaultdict(lambda: deque(maxlen=20))  # 20 samples = last hour if 3-min candles
+RVOL_MIN = 3.0  # Minimum RVOL threshold (3x)
+
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(pytz.UTC)
@@ -94,6 +98,21 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
+
+        # --- Relative Volume logic ---
+        rvol_history[symbol].append(total_volume)
+        # Only proceed if enough trailing samples
+        if len(rvol_history[symbol]) >= 5:
+            trailing_vols = list(rvol_history[symbol])[:-1]  # Exclude the current
+            if trailing_vols:
+                avg_trailing = sum(trailing_vols) / len(trailing_vols)
+                if avg_trailing > 0:
+                    rvol = total_volume / avg_trailing
+                    if rvol < RVOL_MIN:
+                        return  # Not enough relative volume -- skip alert
+        else:
+            return  # Not enough history yet -- skip alert
+
         if (
             c0["close"] < c1["close"] < c2["close"]
             and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
@@ -339,7 +358,7 @@ async def main():
     )
 
 if __name__ == "__main__":
-    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri)...")
+    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL filter...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
