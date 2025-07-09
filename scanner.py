@@ -14,24 +14,33 @@ POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
 TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
 TELEGRAM_CHAT_ID = "-1002266463234"
 PRICE_THRESHOLD = 10.00
-MAX_SYMBOLS = 400  # Increased from 100 to 400 tickers scanned at once
+MAX_SYMBOLS = 400
 SCREENER_REFRESH_SEC = 60
-MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents over 3 min
-MIN_3MIN_VOLUME = 10000  # Alert only if at least this much total volume in last 3 min
-MIN_PER_CANDLE_VOL = 1000  # Optional: per candle minimum volume
-MIN_IPO_DAYS = 30  # Exclude stocks IPO'ed in last 30 days
-ALERT_PRICE_DELTA = 0.25  # Only alert if price is up another $0.25+ from last alert
+MIN_ALERT_MOVE = 0.15
+MIN_3MIN_VOLUME = 10000
+MIN_PER_CANDLE_VOL = 1000
+MIN_IPO_DAYS = 30
+ALERT_PRICE_DELTA = 0.25
 
 # Relative Volume config
-rvol_history = defaultdict(lambda: deque(maxlen=20))  # 20 samples = last hour if 3-min candles
-RVOL_MIN = 3.0  # Minimum RVOL threshold (3x)
+rvol_history = defaultdict(lambda: deque(maxlen=20))
+RVOL_MIN = 3.0
+
+# --- News Keyword Filter ---
+KEYWORDS = [
+    "offering", "FDA", "approval", "acquisition", "merger", "bankruptcy", "delisting", "reverse split", "split",
+    "halt", "investigation", "lawsuit", "earnings", "guidance", "clinical", "phase 1", "phase 2", "phase 3",
+    "partnership", "contract", "dividend", "buyback", "sec", "subpoena", "settlement", "short squeeze", "recall",
+    "resigns", "appoints", "collaboration", "sec filing", "patent", "discontinued", "withdraw", "spike", "upsize",
+    "pricing", "withdraws", "grants", "fires", "director", "ceo", "cfo"
+]
 
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(pytz.UTC)
     now_ny = now_utc.astimezone(ny)
     if now_ny.weekday() >= 5:
-        return False  # Saturday or Sunday
+        return False
     scan_start = time(4, 0)
     scan_end = time(20, 0)
     return scan_start <= now_ny.time() <= scan_end
@@ -55,14 +64,65 @@ async def send_telegram_async(message):
 def escape_html(s):
     return html.escape(s or "")
 
-candles = defaultdict(lambda: deque(maxlen=3))  # Store 3 finalized 1-min candles per symbol
-trade_candle_builders = defaultdict(list)  # Store trades for current minute per symbol
-trade_candle_last_time = {}  # Track last finalized minute per symbol
-
-last_alerted_price = {}  # symbol -> price
-
-# To avoid duplicate halt alerts for the same event
+candles = defaultdict(lambda: deque(maxlen=3))
+trade_candle_builders = defaultdict(list)
+trade_candle_last_time = {}
+last_alerted_price = {}
 last_halt_alert = {}
+news_seen = set()
+
+# News keyword filter check
+def news_matches_keywords(headline, summary):
+    text_block = f"{headline} {summary}".lower()
+    return any(word.lower() in text_block for word in KEYWORDS)
+
+# Separate news alert
+async def send_news_telegram_async(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, data=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    print("Telegram send error (news):", await resp.text())
+        except Exception as e:
+            print(f"Telegram send error (news): {e}")
+
+async def news_alerts_task():
+    url = f"https://api.polygon.io/v2/reference/news?apiKey={POLYGON_API_KEY}&limit=50"
+    global news_seen
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    data = await resp.json()
+                    for item in data.get('results', []):
+                        news_id = item['id']
+                        if news_id in news_seen:
+                            continue
+                        headline = item.get('title', '')
+                        summary = item.get('description', '')
+                        if not news_matches_keywords(headline, summary):
+                            continue
+                        news_seen.add(news_id)
+                        url_link = item.get('article_url', '')
+                        msg = (
+                            f"📰 <b>NEWS ALERT</b>\n"
+                            f"<b>{escape_html(headline)}</b>\n"
+                            f"{escape_html(summary)}\n"
+                            f"<a href=\"{url_link}\">Read more</a>"
+                        )
+                        await send_news_telegram_async(msg)
+            if len(news_seen) > 500:
+                news_seen = set(list(news_seen)[-500:])
+        except Exception as e:
+            print(f"News fetch error: {e}")
+        await asyncio.sleep(30)
 
 async def on_trade_event(symbol, price, size, trade_time):
     candle_time = trade_time.replace(second=0, microsecond=0)
@@ -99,19 +159,22 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         c0, c1, c2 = candles[symbol]
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
 
-        # --- Relative Volume logic ---
+        # RVOL logic
         rvol_history[symbol].append(total_volume)
-        # Only proceed if enough trailing samples
         if len(rvol_history[symbol]) >= 5:
-            trailing_vols = list(rvol_history[symbol])[:-1]  # Exclude the current
+            trailing_vols = list(rvol_history[symbol])[:-1]
             if trailing_vols:
                 avg_trailing = sum(trailing_vols) / len(trailing_vols)
                 if avg_trailing > 0:
                     rvol = total_volume / avg_trailing
                     if rvol < RVOL_MIN:
-                        return  # Not enough relative volume -- skip alert
+                        return
+                else:
+                    return
+            else:
+                return
         else:
-            return  # Not enough history yet -- skip alert
+            return
 
         if (
             c0["close"] < c1["close"] < c2["close"]
@@ -123,17 +186,35 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         ):
             move = c2["close"] - c0["close"]
             prev_price = last_alerted_price.get(symbol)
-            # First alert = 🚨, subsequent (price-based cooldown) = 💰
             if prev_price is not None and (c2["close"] - prev_price) < ALERT_PRICE_DELTA:
                 return
-            if prev_price is None:
-                emoji = "🚨"
-            else:
-                emoji = "💰"
+            emoji = "🚨" if prev_price is None else "💰"
             last_alerted_price[symbol] = c2["close"]
+
+            pct_move = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
+
+            conf = 1
+            if 'rvol' in locals():
+                if rvol >= 5:
+                    conf += 2
+                elif rvol >= 3:
+                    conf += 1
+            if pct_move >= 0.10:
+                conf += 2
+            elif pct_move >= 0.05:
+                conf += 1
+            if move >= 0.50:
+                conf += 2
+            elif move >= 0.30:
+                conf += 1
+            if min(c0["volume"], c1["volume"], c2["volume"]) >= 10000:
+                conf += 1
+            conf = min(conf, 10)
+
             msg = (
-                f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
-                f"Now ${c2['close']:.2f}."
+                f"{emoji} {escape_html(symbol)} up ${move:.2f} ({pct_move*100:.1f}%) in 3 minutes.\n"
+                f"Now ${c2['close']:.2f}. "
+                f"<b>Confidence: {conf}/10</b>"
             )
             await send_telegram_async(msg)
 
@@ -195,8 +276,10 @@ async def fetch_top_penny_symbols():
             print("Tickers snapshot fetch error:", e)
     return penny_symbols
 
+current_symbols = set()
+
 async def dynamic_symbol_manager(symbol_queue):
-    current_symbols = set()
+    global current_symbols
     while True:
         if is_market_scan_time():
             symbols = await fetch_top_penny_symbols()
@@ -210,7 +293,6 @@ async def handle_halt_event(item):
     symbol = item.get("sym")
     if not symbol or not is_equity_symbol(symbol):
         return
-    # Only alert for penny stocks
     price = None
     if "p" in item and item["p"] is not None:
         price = float(item["p"])
@@ -226,17 +308,14 @@ async def handle_halt_event(item):
             print(f"[HALT ALERT] Could not get price for {symbol}: {e}")
     if price is None or price > PRICE_THRESHOLD or price <= 0:
         return
-    # Exclude recent IPOs
     if await is_recent_ipo(symbol):
         return
-    # Avoid duplicate alerts for same halt event
     halt_ts = item.get("t") if "t" in item else None
     global last_halt_alert
     if halt_ts is not None:
         if symbol in last_halt_alert and last_halt_alert[symbol] == halt_ts:
             return
         last_halt_alert[symbol] = halt_ts
-    # Send the alert
     msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
     await send_telegram_async(msg)
 
@@ -312,7 +391,6 @@ async def shutdown(loop, sig):
     await asyncio.gather(*tasks, return_exceptions=True)
     loop.stop()
 
-# --- SCHEDULED ALERTS ---
 async def send_scheduled_alerts():
     sent_open_msg = False
     sent_close_msg = False
@@ -322,21 +400,18 @@ async def send_scheduled_alerts():
         ny = pytz.timezone("America/New_York")
         now_ny = now_utc.astimezone(ny)
         weekday = now_ny.weekday()
-        # 9:25 AM ET Monday-Friday
         if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
             if not sent_open_msg:
                 await send_telegram_async("Market opens in 5 mins...secure the damn bag!")
                 sent_open_msg = True
         else:
             sent_open_msg = False
-        # 8:01 PM ET Monday-Thursday
         if weekday < 4 and now_ny.hour == 20 and now_ny.minute == 1:
             if not sent_close_msg:
                 await send_telegram_async("Market closed, reconvene in pre market tomorrow morning.")
                 sent_close_msg = True
         else:
             sent_close_msg = False
-        # 12:00 PM ET Saturday - book/ebook alert
         if weekday == 5 and now_ny.hour == 12 and now_ny.minute == 0:
             if not sent_ebook_msg:
                 await send_telegram_async("📚 Need help trading? My ebook has everything you need to know!")
@@ -354,11 +429,12 @@ async def main():
     await asyncio.gather(
         dynamic_symbol_manager(symbol_queue),
         trade_ws(symbol_queue),
-        send_scheduled_alerts()
+        send_scheduled_alerts(),
+        news_alerts_task()
     )
 
 if __name__ == "__main__":
-    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL filter...")
+    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
