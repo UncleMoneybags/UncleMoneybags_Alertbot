@@ -16,10 +16,11 @@ TELEGRAM_CHAT_ID = "-1002266463234"
 PRICE_THRESHOLD = 10.00
 MAX_SYMBOLS = 400  # Increased from 100 to 400 tickers scanned at once
 SCREENER_REFRESH_SEC = 60
-MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents
+MIN_ALERT_MOVE = 0.15  # Only alert if move is at least 15 cents over 3 min
 MIN_3MIN_VOLUME = 10000  # Alert only if at least this much total volume in last 3 min
 MIN_PER_CANDLE_VOL = 1000  # Optional: per candle minimum volume
 MIN_IPO_DAYS = 30  # Exclude stocks IPO'ed in last 30 days
+ALERT_PRICE_DELTA = 0.25  # Only alert if price is up another $0.25+ from last alert
 
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
@@ -51,20 +52,21 @@ async def send_telegram_async(message):
 def escape_html(s):
     return html.escape(s or "")
 
-# Robust candle and trade logic
 candles = defaultdict(lambda: deque(maxlen=3))  # Store 3 finalized 1-min candles per symbol
 trade_candle_builders = defaultdict(list)  # Store trades for current minute per symbol
 trade_candle_last_time = {}  # Track last finalized minute per symbol
 
+last_alerted_price = {}  # symbol -> price
+
+# To avoid duplicate halt alerts for the same event
+last_halt_alert = {}
+
 async def on_trade_event(symbol, price, size, trade_time):
-    # Always round down to minute
     candle_time = trade_time.replace(second=0, microsecond=0)
     last_time = trade_candle_last_time.get(symbol)
     if last_time is not None and candle_time != last_time:
-        # Finalize previous minute's candle
         trades = trade_candle_builders[symbol]
         if trades:
-            # Sort trades by their timestamp!
             trades.sort(key=lambda t: t[2])
             prices = [t[0] for t in trades]
             volumes = [t[1] for t in trades]
@@ -76,14 +78,12 @@ async def on_trade_event(symbol, price, size, trade_time):
             start_time = last_time
             await on_new_candle(symbol, open_, high, low, close, volume, start_time)
         trade_candle_builders[symbol] = []
-    # Save every trade with its timestamp
     trade_candle_builders[symbol].append((price, size, trade_time))
     trade_candle_last_time[symbol] = candle_time
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
         return
-    # Store candle as dict for clarity
     candles[symbol].append({
         "open": open_,
         "high": high,
@@ -97,7 +97,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         c0, c1, c2 = candles[symbol]
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
         print(f"[DEBUG] {symbol} 3m closes: {c0['close']}, {c1['close']}, {c2['close']} | volumes: {c0['volume']}, {c1['volume']}, {c2['volume']} | total_vol: {total_volume}")
-        # True three green candles, min move, and enough total volume
         if (
             c0["close"] < c1["close"] < c2["close"]
             and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
@@ -107,20 +106,28 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and c2["volume"] >= MIN_PER_CANDLE_VOL
         ):
             move = c2["close"] - c0["close"]
+            prev_price = last_alerted_price.get(symbol)
+            # First alert = 🚨, subsequent (price-based cooldown) = 💰
+            if prev_price is not None and (c2["close"] - prev_price) < ALERT_PRICE_DELTA:
+                print(f"[DEBUG] {symbol} skipped: move since last alert (${prev_price} -> ${c2['close']}) < ${ALERT_PRICE_DELTA}")
+                return
+            if prev_price is None:
+                emoji = "🚨"
+            else:
+                emoji = "💰"
+            last_alerted_price[symbol] = c2["close"]
             msg = (
-                f"🚨 {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
+                f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
                 f"Now ${c2['close']:.2f}."
             )
-            print(f"ALERT: {symbol} 3 green candles, {total_volume} shares!")  # Debug print
+            print(f"ALERT: {symbol} 3 green candles, {total_volume} shares!")
             await send_telegram_async(msg)
 
 def is_equity_symbol(ticker):
-    # Exclude symbols ending with W, WS, U, R, P, or containing a dot (.)
     if re.search(r'(\.|\bW$|\bWS$|\bU$|\bR$|\bP$)', ticker):
         return False
     if ticker.endswith(('W', 'U', 'R', 'P', 'WS')) or '.' in ticker:
         return False
-    # Exclude some known penny warrant/rights patterns
     if any(x in ticker for x in ['WS', 'W', 'U', 'R', 'P', '.']):
         return False
     return True
@@ -138,7 +145,7 @@ async def is_recent_ipo(ticker):
                     return days_since_ipo < MIN_IPO_DAYS
         except Exception as e:
             print(f"IPO check failed for {ticker}: {e}")
-    return False  # treat as NOT recent IPO if check fails
+    return False
 
 async def fetch_top_penny_symbols():
     penny_symbols = []
@@ -154,7 +161,6 @@ async def fetch_top_penny_symbols():
                     ticker = stock.get("ticker")
                     if not is_equity_symbol(ticker):
                         continue
-                    # IPO filter
                     if await is_recent_ipo(ticker):
                         print(f"Skipping IPO: {ticker}")
                         continue
@@ -162,14 +168,12 @@ async def fetch_top_penny_symbols():
                     day = stock.get("day", {})
                     price = None
                     price_time = 0
-                    # Use latest valid price between last trade and day close
                     if last_trade and last_trade.get("p", 0) > 0:
                         price = last_trade["p"]
                         price_time = last_trade.get("t", 0)
                     if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
                         price = day["c"]
                     volume = day.get("v", 0)
-                    # Only add actual penny stocks: price > 0 and <= 10
                     if price is not None and 0 < price <= PRICE_THRESHOLD:
                         penny_symbols.append(ticker)
                         print(f"Adding {ticker} at ${price:.2f}, vol={volume} to scan list")
@@ -195,6 +199,45 @@ async def dynamic_symbol_manager(symbol_queue):
             print("Market not open for scanning. Waiting...")
         await asyncio.sleep(SCREENER_REFRESH_SEC)
 
+async def handle_halt_event(item):
+    symbol = item.get("sym")
+    if not symbol or not is_equity_symbol(symbol):
+        return
+    # Only alert for penny stocks
+    # Polygon halt event doesn't always provide price, so fetch last price if needed
+    # We fetch price only if not present in event (to avoid excess API calls)
+    price = None
+    if "p" in item and item["p"] is not None:
+        price = float(item["p"])
+    if price is None:
+        # Fallback: fetch last price from polygon snapshot
+        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}?apiKey={POLYGON_API_KEY}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    data = await resp.json()
+                    snap = data.get("ticker", {})
+                    price = snap.get("lastTrade", {}).get("p") or snap.get("day", {}).get("c")
+        except Exception as e:
+            print(f"[HALT ALERT] Could not get price for {symbol}: {e}")
+    if price is None or price > PRICE_THRESHOLD or price <= 0:
+        return
+    # Exclude recent IPOs
+    if await is_recent_ipo(symbol):
+        print(f"[HALT ALERT] Skipping IPO: {symbol}")
+        return
+    # Avoid duplicate alerts for same halt event
+    halt_ts = item.get("t") if "t" in item else None
+    global last_halt_alert
+    if halt_ts is not None:
+        if symbol in last_halt_alert and last_halt_alert[symbol] == halt_ts:
+            return
+        last_halt_alert[symbol] = halt_ts
+    # Send the alert
+    msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
+    print(f"[HALT ALERT] {msg}")
+    await send_telegram_async(msg)
+
 async def trade_ws(symbol_queue):
     subscribed_symbols = set()
     while True:
@@ -208,15 +251,12 @@ async def trade_ws(symbol_queue):
                     print("No symbols to subscribe to, skipping websocket subscription.")
                     await asyncio.sleep(SCREENER_REFRESH_SEC)
                     continue
-
-                # Batch subscribe to avoid policy violation
                 BATCH_SIZE = 100
                 params_batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
                 for batch in params_batches:
                     params = ",".join([f"T.{s}" for s in batch])
                     await ws.send(json.dumps({"action": "subscribe", "params": params}))
-                    await asyncio.sleep(0.2)  # Prevent rate limit
-
+                    await asyncio.sleep(0.2)
                 subscribed_symbols = set(symbols)
                 print(f"Subscribed to {len(symbols)} symbols.")
 
@@ -226,26 +266,26 @@ async def trade_ws(symbol_queue):
                         if not isinstance(payload, list):
                             payload = [payload]
                         for item in payload:
-                            if item.get("ev") != "T":
-                                continue
-                            symbol = item.get("sym")
-                            price = float(item.get("p"))
-                            size = float(item.get("s", 0))
-                            ts = item.get("t") / 1000
-                            trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
-                            print(f"Trade: {symbol}, price={price}, size={size}, time={trade_time}")  # Debug
-                            await on_trade_event(symbol, price, size, trade_time)
+                            if item.get("ev") == "T":
+                                symbol = item.get("sym")
+                                price = float(item.get("p"))
+                                size = float(item.get("s", 0))
+                                ts = item.get("t") / 1000
+                                trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
+                                print(f"Trade: {symbol}, price={price}, size={size}, time={trade_time}")
+                                await on_trade_event(symbol, price, size, trade_time)
+                            elif item.get("ev") == "H":
+                                # HALT event!
+                                await handle_halt_event(item)
 
                 async def ws_symbols():
                     while True:
                         new_symbols = await symbol_queue.get()
                         to_unsubscribe = [s for s in subscribed_symbols if s not in new_symbols]
                         to_subscribe = [s for s in new_symbols if s not in subscribed_symbols]
-                        # Only resubscribe if there's a change
                         if not to_unsubscribe and not to_subscribe:
                             print("No symbol changes; skipping resubscription.")
                             continue
-                        # Unsubscribe and subscribe in batches
                         BATCH_SIZE = 100
                         if to_unsubscribe:
                             for i in range(0, len(to_unsubscribe), BATCH_SIZE):
@@ -277,6 +317,39 @@ async def shutdown(loop, sig):
     await asyncio.gather(*tasks, return_exceptions=True)
     loop.stop()
 
+# --- SCHEDULED ALERTS ---
+async def send_scheduled_alerts():
+    sent_open_msg = False
+    sent_close_msg = False
+    sent_ebook_msg = False
+    while True:
+        now_utc = datetime.now(pytz.UTC)
+        ny = pytz.timezone("America/New_York")
+        now_ny = now_utc.astimezone(ny)
+        weekday = now_ny.weekday()
+        # 9:25 AM ET Monday-Friday
+        if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
+            if not sent_open_msg:
+                await send_telegram_async("Market opens in 5 mins...secure the damn bag!")
+                sent_open_msg = True
+        else:
+            sent_open_msg = False
+        # 8:01 PM ET Monday-Thursday
+        if weekday < 4 and now_ny.hour == 20 and now_ny.minute == 1:
+            if not sent_close_msg:
+                await send_telegram_async("Market closed, reconvene in pre market tomorrow morning.")
+                sent_close_msg = True
+        else:
+            sent_close_msg = False
+        # 12:00 PM ET Saturday - book/ebook alert
+        if weekday == 5 and now_ny.hour == 12 and now_ny.minute == 0:
+            if not sent_ebook_msg:
+                await send_telegram_async("📚 Need help trading? My ebook has everything you need to know!")
+                sent_ebook_msg = True
+        else:
+            sent_ebook_msg = False
+        await asyncio.sleep(30)
+
 async def main():
     loop = asyncio.get_event_loop()
     setup_signal_handlers(loop)
@@ -285,13 +358,12 @@ async def main():
     await symbol_queue.put(init_syms)
     await asyncio.gather(
         dynamic_symbol_manager(symbol_queue),
-        trade_ws(symbol_queue)
+        trade_ws(symbol_queue),
+        send_scheduled_alerts()
     )
 
 if __name__ == "__main__":
     print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri)...")
-    # Uncomment this line to test Telegram delivery
-    # asyncio.run(send_telegram_async("Test alert from penny scanner"))
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
