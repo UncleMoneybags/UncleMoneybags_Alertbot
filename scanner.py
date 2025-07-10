@@ -45,6 +45,17 @@ def is_market_scan_time():
     scan_end = time(20, 0)
     return scan_start <= now_ny.time() <= scan_end
 
+def is_news_alert_time():
+    # Only send news between 7am and 8pm ET, Monday–Friday
+    ny = pytz.timezone("America/New_York")
+    now_utc = datetime.now(pytz.UTC)
+    now_ny = now_utc.astimezone(ny)
+    if now_ny.weekday() >= 5:
+        return False
+    start = time(7, 0)
+    end = time(20, 0)
+    return start <= now_ny.time() <= end
+
 async def send_telegram_async(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -71,12 +82,39 @@ last_alerted_price = {}
 last_halt_alert = {}
 news_seen = set()
 
-# News keyword filter check
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
     return any(word.lower() in text_block for word in KEYWORDS)
 
-# Separate news alert
+def bold_keywords(text, keywords):
+    # Bold all keywords in the headline (case-insensitive, whole word)
+    def replacer(match):
+        return f"<b>{match.group(0)}</b>"
+    for kw in keywords:
+        regex = re.compile(rf'\b({re.escape(kw)})\b', re.IGNORECASE)
+        text = regex.sub(replacer, text)
+    return text
+
+async def is_under_10(tickers):
+    for ticker in tickers:
+        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    data = await resp.json()
+                    price = None
+                    last_trade = data.get("ticker", {}).get("lastTrade", {})
+                    day = data.get("ticker", {}).get("day", {})
+                    if last_trade and last_trade.get("p", 0) > 0:
+                        price = last_trade["p"]
+                    elif day and day.get("c", 0) > 0:
+                        price = day["c"]
+                    if price is not None and 0 < price <= 10.00:
+                        return True
+        except Exception as e:
+            print(f"Price check failed for {ticker}: {e}")
+    return False
+
 async def send_news_telegram_async(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -97,6 +135,9 @@ async def news_alerts_task():
     url = f"https://api.polygon.io/v2/reference/news?apiKey={POLYGON_API_KEY}&limit=50"
     global news_seen
     while True:
+        if not is_news_alert_time():
+            await asyncio.sleep(30)
+            continue
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
@@ -107,16 +148,15 @@ async def news_alerts_task():
                             continue
                         headline = item.get('title', '')
                         summary = item.get('description', '')
+                        tickers = item.get('tickers', [])
                         if not news_matches_keywords(headline, summary):
                             continue
+                        if not await is_under_10(tickers):
+                            continue
                         news_seen.add(news_id)
-                        url_link = item.get('article_url', '')
-                        msg = (
-                            f"📰 <b>NEWS ALERT</b>\n"
-                            f"<b>{escape_html(headline)}</b>\n"
-                            f"{escape_html(summary)}\n"
-                            f"<a href=\"{url_link}\">Read more</a>"
-                        )
+                        ticker_str = f"[{', '.join(tickers)}]" if tickers else ""
+                        headline_bold = bold_keywords(escape_html(headline), KEYWORDS)
+                        msg = f"📰 NEWS ALERT {ticker_str} {headline_bold}"
                         await send_news_telegram_async(msg)
             if len(news_seen) > 500:
                 news_seen = set(list(news_seen)[-500:])
