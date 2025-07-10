@@ -5,7 +5,7 @@ import json
 import html
 import re
 from collections import deque, defaultdict
-from datetime import datetime, time
+from datetime import datetime, time, timezone, timedelta
 import pytz
 import signal
 
@@ -80,6 +80,7 @@ trade_candle_last_time = {}
 last_alerted_price = {}
 last_halt_alert = {}
 news_seen = set()
+latest_news_time = None  # For live news only
 
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
@@ -138,9 +139,32 @@ async def send_news_telegram_async(message):
                 print(f"Telegram send error (news): {e}")
                 return
 
+# --- Price move filter for news (UP ONLY) ---
+async def has_recent_price_move(ticker, percent_threshold=5, minutes=15):
+    now = datetime.utcnow()
+    start = now - timedelta(minutes=minutes)
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/"
+        f"{start.strftime('%Y-%m-%d')}/{now.strftime('%Y-%m-%d')}?apiKey={POLYGON_API_KEY}&limit={minutes}"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                results = data.get("results", [])
+                if not results or len(results) < 2:
+                    return False
+                open_price = results[0]["o"]
+                close_price = results[-1]["c"]
+                price_change = ((close_price - open_price) / open_price) * 100
+                return price_change >= percent_threshold  # <--- Only up moves
+    except Exception as e:
+        print(f"Price move check failed for {ticker}: {e}")
+    return False
+
 async def news_alerts_task():
+    global news_seen, latest_news_time
     url = f"https://api.polygon.io/v2/reference/news?apiKey={POLYGON_API_KEY}&limit=50"
-    global news_seen
     while True:
         if not is_news_alert_time():
             await asyncio.sleep(30)
@@ -149,7 +173,27 @@ async def news_alerts_task():
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     data = await resp.json()
-                    for item in data.get('results', []):
+                    news_batch = data.get('results', [])
+                    # Find the most recent news publish time in batch
+                    if news_batch:
+                        times = [datetime.fromisoformat(item.get('published_utc').replace('Z', '+00:00')) for item in news_batch if item.get('published_utc')]
+                        most_recent = max(times) if times else None
+                    else:
+                        most_recent = None
+
+                    # On first run after 7am, just set latest_news_time and don't send any news
+                    if latest_news_time is None:
+                        latest_news_time = most_recent
+                        await asyncio.sleep(30)
+                        continue
+
+                    for item in sorted(news_batch, key=lambda x: x.get('published_utc')):
+                        ntime = item.get('published_utc')
+                        if not ntime:
+                            continue
+                        ntime_dt = datetime.fromisoformat(ntime.replace('Z', '+00:00'))
+                        if ntime_dt <= latest_news_time:
+                            continue
                         news_id = item['id']
                         if news_id in news_seen:
                             continue
@@ -160,12 +204,23 @@ async def news_alerts_task():
                             continue
                         if not await is_under_10(tickers):
                             continue
+                        # Only send alert if at least one ticker is moving UP >5% in last 15 minutes
+                        price_moving = False
+                        for ticker in tickers:
+                            if await has_recent_price_move(ticker, percent_threshold=5, minutes=15):
+                                price_moving = True
+                                break
+                        if not price_moving:
+                            continue
                         news_seen.add(news_id)
                         ticker_str = f"[{', '.join(tickers)}]" if tickers else ""
                         headline_bold = bold_keywords(escape_html(headline), KEYWORDS)
                         msg = f"📰 NEWS ALERT {ticker_str} {headline_bold}"
                         await send_news_telegram_async(msg)
                         await asyncio.sleep(3)  # Throttle to avoid hitting Telegram rate limit
+                    # After sending, update latest_news_time
+                    if most_recent:
+                        latest_news_time = most_recent
             if len(news_seen) > 500:
                 news_seen = set(list(news_seen)[-500:])
         except Exception as e:
@@ -482,7 +537,7 @@ async def main():
     )
 
 if __name__ == "__main__":
-    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts...")
+    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for price-moving stocks UP 5%+)...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
