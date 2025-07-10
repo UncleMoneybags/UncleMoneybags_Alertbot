@@ -5,7 +5,7 @@ import json
 import html
 import re
 from collections import deque, defaultdict
-from datetime import datetime, timedelta, time
+from datetime import datetime, time
 import pytz
 import signal
 
@@ -46,7 +46,6 @@ def is_market_scan_time():
     return scan_start <= now_ny.time() <= scan_end
 
 def is_news_alert_time():
-    # Only send news between 7am and 8pm ET, Monday–Friday
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(pytz.UTC)
     now_ny = now_utc.astimezone(ny)
@@ -87,7 +86,6 @@ def news_matches_keywords(headline, summary):
     return any(word.lower() in text_block for word in KEYWORDS)
 
 def bold_keywords(text, keywords):
-    # Bold all keywords in the headline (case-insensitive, whole word)
     def replacer(match):
         return f"<b>{match.group(0)}</b>"
     for kw in keywords:
@@ -124,12 +122,21 @@ async def send_news_telegram_async(message):
         "disable_web_page_preview": False
     }
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, data=payload, timeout=10) as resp:
-                if resp.status != 200:
-                    print("Telegram send error (news):", await resp.text())
-        except Exception as e:
-            print(f"Telegram send error (news): {e}")
+        while True:
+            try:
+                async with session.post(url, data=payload, timeout=10) as resp:
+                    if resp.status == 429:
+                        data = await resp.json()
+                        retry = data.get("parameters", {}).get("retry_after", 30)
+                        print(f"Rate limited. Waiting {retry} seconds before retrying...")
+                        await asyncio.sleep(retry)
+                        continue
+                    if resp.status != 200:
+                        print("Telegram send error (news):", await resp.text())
+                    return
+            except Exception as e:
+                print(f"Telegram send error (news): {e}")
+                return
 
 async def news_alerts_task():
     url = f"https://api.polygon.io/v2/reference/news?apiKey={POLYGON_API_KEY}&limit=50"
@@ -158,6 +165,7 @@ async def news_alerts_task():
                         headline_bold = bold_keywords(escape_html(headline), KEYWORDS)
                         msg = f"📰 NEWS ALERT {ticker_str} {headline_bold}"
                         await send_news_telegram_async(msg)
+                        await asyncio.sleep(3)  # Throttle to avoid hitting Telegram rate limit
             if len(news_seen) > 500:
                 news_seen = set(list(news_seen)[-500:])
         except Exception as e:
