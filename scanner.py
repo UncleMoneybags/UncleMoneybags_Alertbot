@@ -32,6 +32,10 @@ MIN_PER_CANDLE_VOL = 1000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
 
+# --- 1m volume spike config (NEW for less noise) ---
+MIN_1M_PRICE_MOVE_PCT = 0.02   # 2%
+MIN_1M_PRICE_MOVE_ABS = 0.05   # $0.05
+
 # Relative Volume config
 rvol_history = defaultdict(lambda: deque(maxlen=20))
 RVOL_MIN = 3.0
@@ -289,15 +293,22 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         "start_time": start_time,
     })
 
-    # 💥 BEGIN VOLUME SPIKE UP ALERT INJECTION
+    # 💥 BEGIN VOLUME SPIKE UP ALERT INJECTION (REVISED)
     prev_vols = [c["volume"] for c in list(candles[symbol])[:-1]]
     if len(prev_vols) >= 2:
         avg_prev = sum(prev_vols) / len(prev_vols)
-        if volume > 5000 and volume >= 2.5 * avg_prev and close > open_:
+        price_move = close - open_
+        price_move_pct = price_move / open_ if open_ > 0 else 0
+        if (
+            volume > 5000
+            and volume >= 2.5 * avg_prev
+            and close > open_
+            and (price_move >= MIN_1M_PRICE_MOVE_ABS or price_move_pct >= MIN_1M_PRICE_MOVE_PCT)
+        ):
             now = datetime.now(timezone.utc)
             if (now - last_volume_spike_time[symbol]).total_seconds() > 600:
                 last_volume_spike_time[symbol] = now
-                msg = f"💥 {symbol} 1m volume spike UP! {volume:,} shares (avg: {avg_prev:,.0f}), closed up to ${close:.2f}"
+                msg = f"💥 {symbol} ${close:.2f}"
                 await send_telegram_async(msg)
     # 💥 END VOLUME SPIKE UP ALERT INJECTION
 
