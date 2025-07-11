@@ -140,6 +140,8 @@ latest_news_time = None  # For live news only
 
 # 💥 1-minute volume spike state
 last_volume_spike_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+# 👀 Dual alert state (for runner warming up)
+last_runner_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
 
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
@@ -302,25 +304,56 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap_cum_pv[symbol] += close * volume
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
-    # 💥 BEGIN VOLUME SPIKE UP ALERT INJECTION (REVISED WITH VWAP)
+    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (INJECTED) ===
+    # Configurable thresholds
+    DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
+    DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
+    DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
+    PRE_BREAKOUT_DIST_PCT = 0.02    # 2% from session high counts as “warming up”
+    PRE_BREAKOUT_DIST_ABS = 0.05    # or within $0.05 of session high
+    VOLUME_SPIKE_MULTIPLIER = 2.5
+    VOLUME_SPIKE_MIN = 5000
+
     prev_vols = [c["volume"] for c in list(candles[symbol])[:-1]]
     if len(prev_vols) >= 2 and vwap is not None:
         avg_prev = sum(prev_vols) / len(prev_vols)
         price_move = close - open_
         price_move_pct = price_move / open_ if open_ > 0 else 0
+        min_abs = DUAL_MIN_1M_PRICE_MOVE_ABS if close < 2 else DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS
+        session_high = max([c["high"] for c in candles[symbol]])
+        dist_from_high = session_high - close
+        dist_pct = dist_from_high / session_high if session_high > 0 else 0
+        now = datetime.now(timezone.utc)
+
+        # --- Breakout Alert: new high on volume/price ---
         if (
-            volume > 5000
-            and volume >= 2.5 * avg_prev
+            volume > VOLUME_SPIKE_MIN
+            and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
             and close > open_
-            and (price_move >= MIN_1M_PRICE_MOVE_ABS or price_move_pct >= MIN_1M_PRICE_MOVE_PCT)
             and close > vwap
+            and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
+            and close >= session_high
+            and (now - last_volume_spike_time[symbol]).total_seconds() > 600
         ):
-            now = datetime.now(timezone.utc)
-            if (now - last_volume_spike_time[symbol]).total_seconds() > 600:
-                last_volume_spike_time[symbol] = now
-                msg = f"💥 {symbol} ${close:.2f}"
-                await send_telegram_async(msg)
-    # 💥 END VOLUME SPIKE UP ALERT INJECTION
+            last_volume_spike_time[symbol] = now
+            msg = f"💥 {symbol} BREAKOUT! ${close:.2f} (NEW HIGH)"
+            await send_telegram_async(msg)
+
+        # --- Runner Warming Up Alert: near high on volume/price ---
+        elif (
+            volume > VOLUME_SPIKE_MIN
+            and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
+            and close > open_
+            and close > vwap
+            and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
+            and close < session_high
+            and (dist_from_high <= PRE_BREAKOUT_DIST_ABS or dist_pct <= PRE_BREAKOUT_DIST_PCT)
+            and (now - last_runner_alert_time[symbol]).total_seconds() > 900  # less frequent
+        ):
+            last_runner_alert_time[symbol] = now
+            msg = f"👀 {symbol} runner warming up: ${close:.2f} (within {dist_from_high:.2f} of high)"
+            await send_telegram_async(msg)
+    # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (INJECTED) ===
 
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
