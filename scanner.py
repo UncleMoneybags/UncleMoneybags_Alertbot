@@ -304,8 +304,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap_cum_pv[symbol] += close * volume
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
-    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (INJECTED) ===
-    # Configurable thresholds
+    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (FIXED!) ===
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
     DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
@@ -332,14 +331,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and close > open_
             and close > vwap
             and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
-            and close >= session_high
+            and abs(close - session_high) < 1e-6  # exactly at new high
             and (now - last_volume_spike_time[symbol]).total_seconds() > 600
         ):
             last_volume_spike_time[symbol] = now
             msg = f"💥 {symbol} BREAKOUT! ${close:.2f} (NEW HIGH)"
             await send_telegram_async(msg)
 
-        # --- Runner Warming Up Alert: near high on volume/price ---
+        # --- Runner Warming Up Alert: near high, but not at high ---
         elif (
             volume > VOLUME_SPIKE_MIN
             and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
@@ -347,13 +346,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and close > vwap
             and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
             and close < session_high
-            and (dist_from_high <= PRE_BREAKOUT_DIST_ABS or dist_pct <= PRE_BREAKOUT_DIST_PCT)
+            and (0 < dist_from_high <= PRE_BREAKOUT_DIST_ABS or 0 < dist_pct <= PRE_BREAKOUT_DIST_PCT)
             and (now - last_runner_alert_time[symbol]).total_seconds() > 900  # less frequent
         ):
             last_runner_alert_time[symbol] = now
             msg = f"👀 {symbol} runner warming up: ${close:.2f} (within {dist_from_high:.2f} of high)"
             await send_telegram_async(msg)
-    # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (INJECTED) ===
+    # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (FIXED!) ===
 
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
