@@ -11,6 +11,12 @@ from datetime import datetime, time, timezone, timedelta
 import pytz
 import signal
 
+# ==== ML & Logging Imports (INJECTED) ====
+import csv
+import os
+import joblib
+import numpy as np
+
 print("Imports completed successfully.")
 
 # --- CONFIG ---
@@ -29,6 +35,43 @@ ALERT_PRICE_DELTA = 0.25
 # Relative Volume config
 rvol_history = defaultdict(lambda: deque(maxlen=20))
 RVOL_MIN = 3.0
+
+# ==== ML Event Logging and Scoring Functions (INJECTED) ====
+EVENT_LOG_FILE = "event_log.csv"
+
+def log_event(event_type, symbol, price, volume, event_time, extra_features=None):
+    extra_features = extra_features or {}
+    row = {
+        "event_type": event_type,
+        "symbol": symbol,
+        "price": price,
+        "volume": volume,
+        "event_time_utc": event_time.isoformat(),
+        **extra_features
+    }
+    header = list(row.keys())
+    write_header = not os.path.exists(EVENT_LOG_FILE) or os.path.getsize(EVENT_LOG_FILE) == 0
+    with open(EVENT_LOG_FILE, "a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=header)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+try:
+    runner_clf = joblib.load("runner_model.joblib")
+    print("Loaded ML runner model.")
+except Exception as e:
+    print("WARNING: Could not load runner model:", e)
+    runner_clf = None
+
+def score_event_ml(event_type, symbol, price, volume, rvol, prepost):
+    if runner_clf is None:
+        return 0.0
+    event_type_code = 0 if event_type == "spike" else 1
+    prepost_f = float(prepost)
+    X = np.array([[price, volume if volume is not None else 0, rvol if rvol is not None else 1.0, prepost_f, event_type_code]])
+    prob = runner_clf.predict_proba(X)[0,1]
+    return prob
 
 # --- News Keyword Filter ---
 KEYWORDS = [
@@ -322,6 +365,22 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(msg)
 
+            # ==== ML event logging and scoring for spike (INJECTED) ====
+            log_event(
+                event_type="spike",
+                symbol=symbol,
+                price=c2["close"],
+                volume=total_volume,
+                event_time=start_time,
+                extra_features={"rvol": rvol if 'rvol' in locals() else None, "prepost": 0}  # set prepost to 1 if pre/post market!
+            )
+            ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
+            if ml_prob > 0.7:
+                await send_telegram_async(
+                    f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} ML score: {ml_prob:.2f} 🚀"
+                )
+            # ==== END ML event logging and scoring for spike ====
+
 def is_equity_symbol(ticker):
     if re.search(r'(\.|\bW$|\bWS$|\bU$|\bR$|\bP$)', ticker):
         return False
@@ -431,6 +490,22 @@ async def handle_halt_event(item):
         last_halt_alert[symbol] = halt_ts
     msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
     await send_telegram_async(msg)
+
+    # ==== ML event logging and scoring for halt (INJECTED) ====
+    log_event(
+        event_type="halt",
+        symbol=symbol,
+        price=price,
+        volume=None,
+        event_time=datetime.now(timezone.utc),
+        extra_features={"rvol": None, "prepost": 0}
+    )
+    ml_prob = score_event_ml("halt", symbol, price, 0, 1.0, 0)
+    if ml_prob > 0.7:
+        await send_telegram_async(
+            f"🔥 <b>HIGH POTENTIAL HALT</b> {escape_html(symbol)} ML score: {ml_prob:.2f} 🚀"
+        )
+    # ==== END ML event logging and scoring for halt ====
 
 async def trade_ws(symbol_queue):
     print("trade_ws started")
