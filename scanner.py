@@ -249,11 +249,30 @@ async def news_alerts_task():
                             continue
                         if not await is_under_10(tickers):
                             continue
-                        # (REMOVED price move filter here)
+
+                        # ----------- FORMATTED NEWS ALERT START -----------
+                        # Format tickers as bold, linked to Yahoo Finance
+                        if tickers:
+                            tickers_html = ", ".join([
+                                f'<a href="https://finance.yahoo.com/quote/{escape_html(t)}">{escape_html(t)}</a>'
+                                for t in tickers
+                            ])
+                            tickers_str = f"<b>{tickers_html}</b>"
+                        else:
+                            tickers_str = ""
+
+                        headline_clean = escape_html(headline)
+                        summary_clean = escape_html(summary)
+
+                        msg = f"📰 {tickers_str}\n{headline_clean}"
+                        if summary_clean:
+                            msg += f"\n\n<small>{summary_clean}</small>"
+                        url_ = item.get("article_url") or item.get("url")
+                        if url_:
+                            msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
+                        # ----------- FORMATTED NEWS ALERT END -----------
+
                         news_seen.add(news_id)
-                        ticker_str = f"[{', '.join(tickers)}]" if tickers else ""
-                        headline_bold = bold_keywords(escape_html(headline), KEYWORDS)
-                        msg = f"📰 NEWS ALERT {ticker_str} {headline_bold}"
                         await send_news_telegram_async(msg)
                         await asyncio.sleep(3)  # Throttle to avoid hitting Telegram rate limit
                     # After sending, update latest_news_time
@@ -335,7 +354,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and (now - last_volume_spike_time[symbol]).total_seconds() > 600
         ):
             last_volume_spike_time[symbol] = now
-            msg = f"💥 {symbol} BREAKOUT! ${close:.2f} (NEW HIGH)"
+            msg = f"🚀 {symbol} BREAKOUT! ${close:.2f} (NEW HIGH)"
             await send_telegram_async(msg)
 
         # --- Runner Warming Up Alert: near high, but not at high ---
