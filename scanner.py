@@ -87,6 +87,9 @@ last_halt_alert = {}
 news_seen = set()
 latest_news_time = None  # For live news only
 
+# 💥 1-minute volume spike state
+last_volume_spike_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
     return any(word.lower() in text_block for word in KEYWORDS)
@@ -242,6 +245,19 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         "volume": volume,
         "start_time": start_time,
     })
+
+    # 💥 BEGIN VOLUME SPIKE UP ALERT INJECTION
+    prev_vols = [c["volume"] for c in list(candles[symbol])[:-1]]
+    if len(prev_vols) >= 2:
+        avg_prev = sum(prev_vols) / len(prev_vols)
+        if volume > 5000 and volume >= 2.5 * avg_prev and close > open_:
+            now = datetime.now(timezone.utc)
+            if (now - last_volume_spike_time[symbol]).total_seconds() > 600:
+                last_volume_spike_time[symbol] = now
+                msg = f"💥 {symbol} 1m volume spike UP! {volume:,} shares (avg: {avg_prev:,.0f}), closed up to ${close:.2f}"
+                await send_telegram_async(msg)
+    # 💥 END VOLUME SPIKE UP ALERT INJECTION
+
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
