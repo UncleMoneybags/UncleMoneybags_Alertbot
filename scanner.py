@@ -284,6 +284,84 @@ async def news_alerts_task():
             print(f"News fetch error: {e}")
         await asyncio.sleep(30)
 
+def is_equity_symbol(ticker):
+    if re.search(r'(\.|\bW$|\bWS$|\bU$|\bR$|\bP$)', ticker):
+        return False
+    if ticker.endswith(('W', 'U', 'R', 'P', 'WS')) or '.' in ticker:
+        return False
+    if any(x in ticker for x in ['WS', 'W', 'U', 'R', 'P', '.']):
+        return False
+    return True
+
+async def is_recent_ipo(ticker):
+    url = f"https://api.polygon.io/v3/reference/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                list_date_str = data.get("results", {}).get("list_date")
+                if list_date_str:
+                    list_date = datetime.strptime(list_date_str, "%Y-%m-%d").date()
+                    days_since_ipo = (datetime.utcnow().date() - list_date).days
+                    if days_since_ipo < MIN_IPO_DAYS:
+                        print(f"{ticker} is a recent IPO ({days_since_ipo} days).")
+                    return days_since_ipo < MIN_IPO_DAYS
+        except Exception as e:
+            print(f"IPO check failed for {ticker}: {e}")
+    return False
+
+async def fetch_top_penny_symbols():
+    print("fetch_top_penny_symbols called")
+    penny_symbols = []
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}&limit=1000"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                if "tickers" not in data:
+                    print("Tickers snapshot API response:", data)
+                    return []
+                for stock in data.get("tickers", []):
+                    ticker = stock.get("ticker")
+                    if not is_equity_symbol(ticker):
+                        continue
+                    if await is_recent_ipo(ticker):
+                        continue
+                    last_trade = stock.get("lastTrade", {})
+                    day = stock.get("day", {})
+                    price = None
+                    price_time = 0
+                    if last_trade and last_trade.get("p", 0) > 0:
+                        price = last_trade["p"]
+                        price_time = last_trade.get("t", 0)
+                    if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
+                        price = day["c"]
+                    volume = day.get("v", 0)
+                    if price is not None and 0 < price <= PRICE_THRESHOLD:
+                        penny_symbols.append(ticker)
+                        if len(penny_symbols) >= MAX_SYMBOLS:
+                            break
+        except Exception as e:
+            print("Tickers snapshot fetch error:", e)
+    print(f"fetch_top_penny_symbols: found {len(penny_symbols)} symbols")
+    return penny_symbols
+
+current_symbols = set()
+
+async def dynamic_symbol_manager(symbol_queue):
+    print("dynamic_symbol_manager started")
+    global current_symbols
+    while True:
+        print("dynamic_symbol_manager loop")
+        if is_market_scan_time():
+            symbols = await fetch_top_penny_symbols()
+            if symbols:
+                if set(symbols) != current_symbols:
+                    print(f"dynamic_symbol_manager: updating symbol_queue with {len(symbols)} symbols")
+                    await symbol_queue.put(symbols)
+                    current_symbols = set(symbols)
+        await asyncio.sleep(SCREENER_REFRESH_SEC)
+
 async def on_trade_event(symbol, price, size, trade_time):
     print(f"on_trade_event: {symbol}, price: {price}, size: {size}")
     candle_time = trade_time.replace(second=0, microsecond=0)
@@ -327,8 +405,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
     DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
-    PRE_BREAKOUT_DIST_PCT = 0.02    # 2% from session high counts as “warming up”
-    PRE_BREAKOUT_DIST_ABS = 0.05    # or within $0.05 of session high
+    PRE_BREAKOUT_DIST_PCT = 0.02
+    PRE_BREAKOUT_DIST_ABS = 0.05
     VOLUME_SPIKE_MULTIPLIER = 2.5
     VOLUME_SPIKE_MIN = 5000
 
@@ -350,7 +428,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and close > open_
             and close > vwap
             and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
-            and abs(close - session_high) < 1e-6  # exactly at new high
+            and abs(close - session_high) < 1e-6
             and (now - last_volume_spike_time[symbol]).total_seconds() > 600
         ):
             last_volume_spike_time[symbol] = now
@@ -366,7 +444,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
             and close < session_high
             and (0 < dist_from_high <= PRE_BREAKOUT_DIST_ABS or 0 < dist_pct <= PRE_BREAKOUT_DIST_PCT)
-            and (now - last_runner_alert_time[symbol]).total_seconds() > 900  # less frequent
+            and (now - last_runner_alert_time[symbol]).total_seconds() > 900
         ):
             last_runner_alert_time[symbol] = now
             msg = f"👀 {symbol} runner warming up: ${close:.2f} (within {dist_from_high:.2f} of high)"
@@ -437,100 +515,19 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(msg)
 
-            # ==== ML event logging and scoring for spike (INJECTED) ====
             log_event(
                 event_type="spike",
                 symbol=symbol,
                 price=c2["close"],
                 volume=total_volume,
                 event_time=start_time,
-                extra_features={"rvol": rvol if 'rvol' in locals() else None, "prepost": 0}  # set prepost to 1 if pre/post market!
+                extra_features={"rvol": rvol if 'rvol' in locals() else None, "prepost": 0}
             )
             ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
             if ml_prob > 0.7:
                 await send_telegram_async(
                     f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} ML score: {ml_prob:.2f} 🚀"
                 )
-            # ==== END ML event logging and scoring for spike ====
-
-def is_equity_symbol(ticker):
-    if re.search(r'(\.|\bW$|\bWS$|\bU$|\bR$|\bP$)', ticker):
-        return False
-    if ticker.endswith(('W', 'U', 'R', 'P', 'WS')) or '.' in ticker:
-        return False
-    if any(x in ticker for x in ['WS', 'W', 'U', 'R', 'P', '.']):
-        return False
-    return True
-
-async def is_recent_ipo(ticker):
-    url = f"https://api.polygon.io/v3/reference/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                list_date_str = data.get("results", {}).get("list_date")
-                if list_date_str:
-                    list_date = datetime.strptime(list_date_str, "%Y-%m-%d").date()
-                    days_since_ipo = (datetime.utcnow().date() - list_date).days
-                    # Only print if it's a recent IPO
-                    if days_since_ipo < MIN_IPO_DAYS:
-                        print(f"{ticker} is a recent IPO ({days_since_ipo} days).")
-                    return days_since_ipo < MIN_IPO_DAYS
-        except Exception as e:
-            print(f"IPO check failed for {ticker}: {e}")
-    return False
-
-async def fetch_top_penny_symbols():
-    print("fetch_top_penny_symbols called")
-    penny_symbols = []
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}&limit=1000"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                if "tickers" not in data:
-                    print("Tickers snapshot API response:", data)
-                    return []
-                for stock in data.get("tickers", []):
-                    ticker = stock.get("ticker")
-                    if not is_equity_symbol(ticker):
-                        continue
-                    if await is_recent_ipo(ticker):
-                        continue
-                    last_trade = stock.get("lastTrade", {})
-                    day = stock.get("day", {})
-                    price = None
-                    price_time = 0
-                    if last_trade and last_trade.get("p", 0) > 0:
-                        price = last_trade["p"]
-                        price_time = last_trade.get("t", 0)
-                    if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
-                        price = day["c"]
-                    volume = day.get("v", 0)
-                    if price is not None and 0 < price <= PRICE_THRESHOLD:
-                        penny_symbols.append(ticker)
-                        if len(penny_symbols) >= MAX_SYMBOLS:
-                            break
-        except Exception as e:
-            print("Tickers snapshot fetch error:", e)
-    print(f"fetch_top_penny_symbols: found {len(penny_symbols)} symbols")
-    return penny_symbols
-
-current_symbols = set()
-
-async def dynamic_symbol_manager(symbol_queue):
-    print("dynamic_symbol_manager started")
-    global current_symbols
-    while True:
-        print("dynamic_symbol_manager loop")
-        if is_market_scan_time():
-            symbols = await fetch_top_penny_symbols()
-            if symbols:
-                if set(symbols) != current_symbols:
-                    print(f"dynamic_symbol_manager: updating symbol_queue with {len(symbols)} symbols")
-                    await symbol_queue.put(symbols)
-                    current_symbols = set(symbols)
-        await asyncio.sleep(SCREENER_REFRESH_SEC)
 
 async def handle_halt_event(item):
     print(f"handle_halt_event called: {item}")
@@ -563,7 +560,6 @@ async def handle_halt_event(item):
     msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
     await send_telegram_async(msg)
 
-    # ==== ML event logging and scoring for halt (INJECTED) ====
     log_event(
         event_type="halt",
         symbol=symbol,
@@ -577,11 +573,54 @@ async def handle_halt_event(item):
         await send_telegram_async(
             f"🔥 <b>HIGH POTENTIAL HALT</b> {escape_html(symbol)} ML score: {ml_prob:.2f} 🚀"
         )
-    # ==== END ML event logging and scoring for halt ====
+
+async def send_scheduled_alerts():
+    print("send_scheduled_alerts started")
+    sent_open_msg = False
+    sent_close_msg = False
+    sent_ebook_msg = False
+    while True:
+        print("send_scheduled_alerts loop")
+        now_utc = datetime.now(pytz.UTC)
+        ny = pytz.timezone("America/New_York")
+        now_ny = now_utc.astimezone(ny)
+        weekday = now_ny.weekday()
+        if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
+            if not sent_open_msg:
+                await send_telegram_async("Market opens in 5 mins...secure the damn bag!")
+                sent_open_msg = True
+        else:
+            sent_open_msg = False
+        if weekday < 4 and now_ny.hour == 20 and now_ny.minute == 1:
+            if not sent_close_msg:
+                await send_telegram_async("Market closed, reconvene in pre market tomorrow morning.")
+                sent_close_msg = True
+        else:
+            sent_close_msg = False
+        if weekday == 5 and now_ny.hour == 12 and now_ny.minute == 0:
+            if not sent_ebook_msg:
+                await send_telegram_async("📚 Need help trading? My ebook has everything you need to know!")
+                sent_ebook_msg = True
+        else:
+            sent_ebook_msg = False
+        await asyncio.sleep(30)
+
+def setup_signal_handlers(loop):
+    print("setup_signal_handlers called")
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
+
+async def shutdown(loop, sig):
+    print(f"Received exit signal {sig.name}...")
+    tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+    [task.cancel() for task in tasks]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
 
 async def trade_ws(symbol_queue):
     print("trade_ws started")
     subscribed_symbols = set()
+    halt_subscribed = False
     while True:
         print("trade_ws loop")
         try:
@@ -599,6 +638,11 @@ async def trade_ws(symbol_queue):
                     await ws.send(json.dumps({"action": "subscribe", "params": params}))
                     await asyncio.sleep(0.2)
                 subscribed_symbols = set(symbols)
+
+                # --- NEW: Subscribe to all halts (for all US stocks) ---
+                if not halt_subscribed:
+                    await ws.send(json.dumps({"action": "subscribe", "params": "H.*"}))
+                    halt_subscribed = True
 
                 async def ws_recv():
                     print("ws_recv started")
@@ -643,49 +687,6 @@ async def trade_ws(symbol_queue):
         except Exception as e:
             print(f"Trade WebSocket error: {e}. Reconnecting soon...")
             await asyncio.sleep(5)
-
-def setup_signal_handlers(loop):
-    print("setup_signal_handlers called")
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
-
-async def shutdown(loop, sig):
-    print(f"Received exit signal {sig.name}...")
-    tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
-
-async def send_scheduled_alerts():
-    print("send_scheduled_alerts started")
-    sent_open_msg = False
-    sent_close_msg = False
-    sent_ebook_msg = False
-    while True:
-        print("send_scheduled_alerts loop")
-        now_utc = datetime.now(pytz.UTC)
-        ny = pytz.timezone("America/New_York")
-        now_ny = now_utc.astimezone(ny)
-        weekday = now_ny.weekday()
-        if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
-            if not sent_open_msg:
-                await send_telegram_async("Market opens in 5 mins...secure the damn bag!")
-                sent_open_msg = True
-        else:
-            sent_open_msg = False
-        if weekday < 4 and now_ny.hour == 20 and now_ny.minute == 1:
-            if not sent_close_msg:
-                await send_telegram_async("Market closed, reconvene in pre market tomorrow morning.")
-                sent_close_msg = True
-        else:
-            sent_close_msg = False
-        if weekday == 5 and now_ny.hour == 12 and now_ny.minute == 0:
-            if not sent_ebook_msg:
-                await send_telegram_async("📚 Need help trading? My ebook has everything you need to know!")
-                sent_ebook_msg = True
-        else:
-            sent_ebook_msg = False
-        await asyncio.sleep(30)
 
 async def main():
     print("main() started.")
