@@ -526,7 +526,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
             if ml_prob > 0.7:
                 await send_telegram_async(
-                    f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} ML score: {ml_prob:.2f} 🚀"
+                    f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
                 )
 
 async def handle_halt_event(item):
@@ -571,7 +571,7 @@ async def handle_halt_event(item):
     ml_prob = score_event_ml("halt", symbol, price, 0, 1.0, 0)
     if ml_prob > 0.7:
         await send_telegram_async(
-            f"🔥 <b>HIGH POTENTIAL HALT</b> {escape_html(symbol)} ML score: {ml_prob:.2f} 🚀"
+            f"🔥 <b>HIGH POTENTIAL HALT</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
         )
 
 async def send_scheduled_alerts():
