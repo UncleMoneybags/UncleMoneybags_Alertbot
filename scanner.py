@@ -142,6 +142,8 @@ latest_news_time = None  # For live news only
 last_volume_spike_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
 # 👀 Dual alert state (for runner warming up)
 last_runner_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+# 🏃 Track runner alerts per symbol per day
+runner_alerted_today = set()
 
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
@@ -401,7 +403,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap_cum_pv[symbol] += close * volume
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
-    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (FIXED!) ===
+    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED FOR ONCE "WARMING UP", THEN "RUNNING") ===
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
     DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
@@ -435,7 +437,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             msg = f"🚀 {symbol} BREAKOUT! ${close:.2f} (NEW HIGH)"
             await send_telegram_async(msg)
 
-        # --- Runner Warming Up Alert: near high, but not at high ---
+        # --- Runner Warming Up Alert & Running Alert ---
         elif (
             volume > VOLUME_SPIKE_MIN
             and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
@@ -447,9 +449,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and (now - last_runner_alert_time[symbol]).total_seconds() > 900
         ):
             last_runner_alert_time[symbol] = now
-            msg = f"👀 {symbol} runner warming up: ${close:.2f} (within {dist_from_high:.2f} of high)"
+            today = datetime.now(timezone.utc).date()
+            symbol_day = f"{symbol}_{today}"
+            if symbol_day not in runner_alerted_today:
+                runner_alerted_today.add(symbol_day)
+                msg = f"👀 {symbol} runner warming up: ${close:.2f}"
+            else:
+                msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
             await send_telegram_async(msg)
-    # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (FIXED!) ===
+    # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED) ===
 
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
