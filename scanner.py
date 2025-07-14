@@ -484,20 +484,26 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Do not alert yet!
     # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED) ===
 
-    # --- Breakout confirmation: check if a pending breakout follows through
+    # --- PATCHED BREAKOUT CONFIRMATION LOGIC ---
     if symbol in pending_breakout_alert:
         candidate = pending_breakout_alert[symbol]
-        # Only check on the next immediate candle (1 minute after breakout)
-        if (start_time - candidate["breakout_time"]).total_seconds() == 60:
-            # If price holds within 2% of breakout close or higher
-            if close >= candidate["breakout_close"] * 0.98:
-                msg = f"🚀 {symbol} BREAKOUT! ${close:.2f}"
+        seconds = (start_time - candidate["breakout_time"]).total_seconds()
+        MIN_CONFIRM_VOL = 10000  # Set minimum confirmation candle volume
+        if seconds == 60:
+            # Must close >= breakout close, have minimum volume, AND set new high
+            if (
+                close >= candidate["breakout_close"] and
+                volume >= MIN_CONFIRM_VOL and
+                high > candidate["breakout_close"]
+            ):
+                msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f} (vol {volume:,})"
                 await send_telegram_async(msg)
             # Remove the pending candidate (whether triggered or not)
             del pending_breakout_alert[symbol]
         # If more than 1 minute has passed, discard candidate (missed window)
-        elif (start_time - candidate["breakout_time"]).total_seconds() > 60:
+        elif seconds > 60:
             del pending_breakout_alert[symbol]
+    # --- END PATCHED BREAKOUT CONFIRMATION LOGIC ---
 
     # --- Runner confirmation: check if a pending spike follows through
     if symbol in pending_runner_alert:
@@ -516,6 +522,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
 
+    # --- PATCHED 3-MINUTE SPIKE ALERT LOGIC WITH DEBUG & DOWN-BAR GUARD ---
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
@@ -538,6 +545,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         else:
             return
 
+        # PATCH: Add debug print so you see all the values, and guard for "down" moves
+        print(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
+
+        # Only alert if all closes are strictly increasing
         if (
             c0["close"] < c1["close"] < c2["close"]
             and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
