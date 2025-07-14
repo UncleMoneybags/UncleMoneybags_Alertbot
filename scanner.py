@@ -147,6 +147,29 @@ runner_alerted_today = set()
 
 # --- PATCH: pending runner confirmation state ---
 pending_runner_alert = {}
+# --- PATCH: pending breakout confirmation state ---
+pending_breakout_alert = {}
+# --- PATCH: Log all halt events for debugging ---
+HALT_LOG_FILE = "halt_event_log.csv"
+
+def log_halt_event(item, reason=None):
+    # Logs all halt events for audit/debug
+    import csv, os
+    row = {
+        "symbol": item.get("sym"),
+        "event_time": item.get("t"),
+        "price": item.get("p"),
+        "ev": item.get("ev"),
+        "raw": str(item),
+        "log_reason": reason or "",
+        "logged_at": datetime.now(timezone.utc).isoformat()
+    }
+    write_header = not os.path.exists(HALT_LOG_FILE) or os.path.getsize(HALT_LOG_FILE) == 0
+    with open(HALT_LOG_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
@@ -436,9 +459,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and abs(close - session_high) < 1e-6
             and (now - last_volume_spike_time[symbol]).total_seconds() > 600
         ):
+            # PATCH: store pending breakout, do not alert yet
+            pending_breakout_alert[symbol] = {
+                "breakout_close": close,
+                "breakout_time": start_time
+            }
             last_volume_spike_time[symbol] = now
-            msg = f"🚀 {symbol} BREAKOUT! ${close:.2f}"
-            await send_telegram_async(msg)
 
         # --- Runner Warming Up Alert (confirmation logic) ---
         elif (
@@ -451,7 +477,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and (0 < dist_from_high <= PRE_BREAKOUT_DIST_ABS or 0 < dist_pct <= PRE_BREAKOUT_DIST_PCT)
             and (now - last_runner_alert_time[symbol]).total_seconds() > 900
         ):
-            # Instead of alerting immediately, store the candidate for confirmation next candle
             pending_runner_alert[symbol] = {
                 "spike_close": close,
                 "spike_time": start_time,
@@ -459,12 +484,25 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Do not alert yet!
     # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED) ===
 
+    # --- Breakout confirmation: check if a pending breakout follows through
+    if symbol in pending_breakout_alert:
+        candidate = pending_breakout_alert[symbol]
+        # Only check on the next immediate candle (1 minute after breakout)
+        if (start_time - candidate["breakout_time"]).total_seconds() == 60:
+            # If price holds within 2% of breakout close or higher
+            if close >= candidate["breakout_close"] * 0.98:
+                msg = f"🚀 {symbol} BREAKOUT! ${close:.2f}"
+                await send_telegram_async(msg)
+            # Remove the pending candidate (whether triggered or not)
+            del pending_breakout_alert[symbol]
+        # If more than 1 minute has passed, discard candidate (missed window)
+        elif (start_time - candidate["breakout_time"]).total_seconds() > 60:
+            del pending_breakout_alert[symbol]
+
     # --- Runner confirmation: check if a pending spike follows through
     if symbol in pending_runner_alert:
         candidate = pending_runner_alert[symbol]
-        # Only check on the next immediate candle (1 minute after spike)
         if (start_time - candidate["spike_time"]).total_seconds() == 60:
-            # If price holds within 2% of spike close or higher
             if close >= candidate["spike_close"] * 0.98:
                 today = datetime.now(timezone.utc).date()
                 symbol_day = f"{symbol}_{today}"
@@ -474,9 +512,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 else:
                     msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
                 await send_telegram_async(msg)
-            # Remove the pending candidate (whether triggered or not)
             del pending_runner_alert[symbol]
-        # If more than 1 minute has passed, discard candidate (missed window)
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
 
@@ -560,9 +596,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
 async def handle_halt_event(item):
     print(f"handle_halt_event called: {item}")
+    log_halt_event(item, reason="received")  # Log every event, for audit
+
     symbol = item.get("sym")
     if not symbol or not is_equity_symbol(symbol):
+        log_halt_event(item, reason="not_equity_symbol")
         return
+
     price = None
     if "p" in item and item["p"] is not None:
         price = float(item["p"])
@@ -576,18 +616,29 @@ async def handle_halt_event(item):
                     price = snap.get("lastTrade", {}).get("p") or snap.get("day", {}).get("c")
         except Exception as e:
             print(f"[HALT ALERT] Could not get price for {symbol}: {e}")
-    if price is None or price > PRICE_THRESHOLD or price <= 0:
+            log_halt_event(item, reason=f"price_fetch_error: {e}")
+
+    # PATCH: Remove IPO filter and always send halt alert for price <= $10
+    if price is None:
+        log_halt_event(item, reason="price_none")
         return
-    if await is_recent_ipo(symbol):
+    if price > PRICE_THRESHOLD or price <= 0:
+        log_halt_event(item, reason=f"price_above_threshold: {price}")
         return
+
+    # PATCH: Remove recent IPO filter for halts
+
     halt_ts = item.get("t") if "t" in item else None
     global last_halt_alert
     if halt_ts is not None:
         if symbol in last_halt_alert and last_halt_alert[symbol] == halt_ts:
+            log_halt_event(item, reason="duplicate_halt")
             return
         last_halt_alert[symbol] = halt_ts
+
     msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
     await send_telegram_async(msg)
+    log_halt_event(item, reason="alert_sent")
 
     log_event(
         event_type="halt",
