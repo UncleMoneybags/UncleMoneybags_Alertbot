@@ -145,6 +145,9 @@ last_runner_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezon
 # 🏃 Track runner alerts per symbol per day
 runner_alerted_today = set()
 
+# --- PATCH: pending runner confirmation state ---
+pending_runner_alert = {}
+
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
     return any(word.lower() in text_block for word in KEYWORDS)
@@ -403,7 +406,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap_cum_pv[symbol] += close * volume
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
-    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED FOR ONCE "WARMING UP", THEN "RUNNING") ===
+    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED FOR CONFIRMATION) ===
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
     DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
@@ -437,7 +440,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             msg = f"🚀 {symbol} BREAKOUT! ${close:.2f}"
             await send_telegram_async(msg)
 
-        # --- Runner Warming Up Alert & Running Alert ---
+        # --- Runner Warming Up Alert (confirmation logic) ---
         elif (
             volume > VOLUME_SPIKE_MIN
             and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
@@ -448,16 +451,34 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and (0 < dist_from_high <= PRE_BREAKOUT_DIST_ABS or 0 < dist_pct <= PRE_BREAKOUT_DIST_PCT)
             and (now - last_runner_alert_time[symbol]).total_seconds() > 900
         ):
-            last_runner_alert_time[symbol] = now
-            today = datetime.now(timezone.utc).date()
-            symbol_day = f"{symbol}_{today}"
-            if symbol_day not in runner_alerted_today:
-                runner_alerted_today.add(symbol_day)
-                msg = f"👀 {symbol} runner warming up: ${close:.2f}"
-            else:
-                msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
-            await send_telegram_async(msg)
+            # Instead of alerting immediately, store the candidate for confirmation next candle
+            pending_runner_alert[symbol] = {
+                "spike_close": close,
+                "spike_time": start_time,
+            }
+            # Do not alert yet!
     # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED) ===
+
+    # --- Runner confirmation: check if a pending spike follows through
+    if symbol in pending_runner_alert:
+        candidate = pending_runner_alert[symbol]
+        # Only check on the next immediate candle (1 minute after spike)
+        if (start_time - candidate["spike_time"]).total_seconds() == 60:
+            # If price holds within 2% of spike close or higher
+            if close >= candidate["spike_close"] * 0.98:
+                today = datetime.now(timezone.utc).date()
+                symbol_day = f"{symbol}_{today}"
+                if symbol_day not in runner_alerted_today:
+                    runner_alerted_today.add(symbol_day)
+                    msg = f"👀 {symbol} runner warming up: ${close:.2f}"
+                else:
+                    msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
+                await send_telegram_async(msg)
+            # Remove the pending candidate (whether triggered or not)
+            del pending_runner_alert[symbol]
+        # If more than 1 minute has passed, discard candidate (missed window)
+        elif (start_time - candidate["spike_time"]).total_seconds() > 60:
+            del pending_runner_alert[symbol]
 
     if len(candles[symbol]) == 3:
         c0, c1, c2 = candles[symbol]
