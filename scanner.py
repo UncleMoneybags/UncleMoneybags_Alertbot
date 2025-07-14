@@ -411,6 +411,10 @@ async def on_trade_event(symbol, price, size, trade_time):
     trade_candle_builders[symbol].append((price, size, trade_time))
     trade_candle_last_time[symbol] = candle_time
 
+# === INJECTED: RUG PULL DETECTION PARAMETERS ===
+RUG_PULL_DROP_PCT = -0.10  # 10% drop in one candle
+RUG_PULL_BOUNCE_PCT = 0.05 # <5% bounce in next candle
+
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     print(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
@@ -428,6 +432,22 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap_cum_vol[symbol] += volume
     vwap_cum_pv[symbol] += close * volume
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
+
+    # === INJECTED: RUG PULL DETECTION ===
+    # Only check if we have at least 3 candles
+    if len(candles[symbol]) >= 3:
+        c0, c1, c2 = candles[symbol][-3:]  # c0=before drop, c1=drop, c2=after drop
+        drop_pct = (c1["close"] - c0["close"]) / c0["close"]
+        if drop_pct <= RUG_PULL_DROP_PCT:
+            bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
+            if bounce_pct < RUG_PULL_BOUNCE_PCT:
+                rug_msg = (
+                    f"⚠️ {symbol} rug pull warning: "
+                    f"down ${abs(c1['close'] - c0['close']):.2f} ({abs(drop_pct)*100:.1f}%) "
+                    f"and failed to bounce more than 5% next candle. "
+                    f"Now ${c2['close']:.2f}."
+                )
+                await send_telegram_async(rug_msg)
 
     # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED FOR CONFIRMATION) ===
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
