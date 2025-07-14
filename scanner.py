@@ -434,7 +434,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and (now - last_volume_spike_time[symbol]).total_seconds() > 600
         ):
             last_volume_spike_time[symbol] = now
-            msg = f"🚀 {symbol} BREAKOUT! ${close:.2f} (NEW HIGH)"
+            msg = f"🚀 {symbol} BREAKOUT! ${close:.2f}"
             await send_telegram_async(msg)
 
         # --- Runner Warming Up Alert & Running Alert ---
