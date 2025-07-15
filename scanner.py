@@ -111,7 +111,7 @@ def is_news_alert_time():
     return start <= now_ny.time() <= end
 
 async def send_telegram_async(message):
-    print("send_telegram_async called.")
+    print(f"send_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -119,13 +119,15 @@ async def send_telegram_async(message):
         "parse_mode": "HTML",
         "disable_web_page_preview": False
     }
-    async with aiohttp.ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.post(url, data=payload, timeout=10) as resp:
+                result_text = await resp.text()
+                print(f"Telegram API status: {resp.status}, response: {result_text}")
                 if resp.status != 200:
-                    print("Telegram send error:", await resp.text())
-        except Exception as e:
-            print(f"Telegram send error: {e}")
+                    print("Telegram send error:", result_text)
+    except Exception as e:
+        print(f"Telegram send error: {e}")
 
 def escape_html(s):
     return html.escape(s or "")
@@ -206,7 +208,7 @@ async def is_under_10(tickers):
     return False
 
 async def send_news_telegram_async(message):
-    print("send_news_telegram_async called.")
+    print(f"send_news_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -218,6 +220,8 @@ async def send_news_telegram_async(message):
         while True:
             try:
                 async with session.post(url, data=payload, timeout=10) as resp:
+                    result_text = await resp.text()
+                    print(f"Telegram API status (news): {resp.status}, response: {result_text}")
                     if resp.status == 429:
                         data = await resp.json()
                         retry = data.get("parameters", {}).get("retry_after", 30)
@@ -225,13 +229,11 @@ async def send_news_telegram_async(message):
                         await asyncio.sleep(retry)
                         continue
                     if resp.status != 200:
-                        print("Telegram send error (news):", await resp.text())
+                        print("Telegram send error (news):", result_text)
                     return
             except Exception as e:
                 print(f"Telegram send error (news): {e}")
                 return
-
-# --- Price move filter for news (REMOVED as requested) ---
 
 async def news_alerts_task():
     print("news_alerts_task started")
@@ -247,14 +249,12 @@ async def news_alerts_task():
                 async with session.get(url) as resp:
                     data = await resp.json()
                     news_batch = data.get('results', [])
-                    # Find the most recent news publish time in batch
                     if news_batch:
                         times = [datetime.fromisoformat(item.get('published_utc').replace('Z', '+00:00')) for item in news_batch if item.get('published_utc')]
                         most_recent = max(times) if times else None
                     else:
                         most_recent = None
 
-                    # On first run after 7am, just set latest_news_time and don't send any news
                     if latest_news_time is None:
                         latest_news_time = most_recent
                         await asyncio.sleep(30)
@@ -278,8 +278,6 @@ async def news_alerts_task():
                         if not await is_under_10(tickers):
                             continue
 
-                        # ----------- FORMATTED NEWS ALERT START -----------
-                        # Format tickers as bold, linked to Yahoo Finance
                         if tickers:
                             tickers_html = ", ".join([
                                 f'<a href="https://finance.yahoo.com/quote/{escape_html(t)}">{escape_html(t)}</a>'
@@ -298,12 +296,10 @@ async def news_alerts_task():
                         url_ = item.get("article_url") or item.get("url")
                         if url_:
                             msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
-                        # ----------- FORMATTED NEWS ALERT END -----------
 
                         news_seen.add(news_id)
                         await send_news_telegram_async(msg)
-                        await asyncio.sleep(3)  # Throttle to avoid hitting Telegram rate limit
-                    # After sending, update latest_news_time
+                        await asyncio.sleep(3)
                     if most_recent:
                         latest_news_time = most_recent
             if len(news_seen) > 500:
@@ -411,9 +407,8 @@ async def on_trade_event(symbol, price, size, trade_time):
     trade_candle_builders[symbol].append((price, size, trade_time))
     trade_candle_last_time[symbol] = candle_time
 
-# === INJECTED: RUG PULL DETECTION PARAMETERS ===
-RUG_PULL_DROP_PCT = -0.10  # 10% drop in one candle
-RUG_PULL_BOUNCE_PCT = 0.05 # <5% bounce in next candle
+RUG_PULL_DROP_PCT = -0.10
+RUG_PULL_BOUNCE_PCT = 0.05
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     print(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
@@ -428,20 +423,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         "start_time": start_time,
     })
 
-    # --- VWAP Calculation (INJECTED) ---
     vwap_cum_vol[symbol] += volume
     vwap_cum_pv[symbol] += close * volume
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
-    # === INJECTED: RUG PULL DETECTION ===
     candles_seq = candles[symbol]
     if not isinstance(candles_seq, (list, deque)):
         print(f"ERROR: candles[{symbol}] is {type(candles_seq)}, not list/deque: {candles_seq}")
         return
 
-    # Only check if we have at least 3 candles
     if len(candles_seq) >= 3:
-        c0, c1, c2 = candles_seq[-3:]  # c0=before drop, c1=drop, c2=after drop
+        c0, c1, c2 = candles_seq[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
         if drop_pct <= RUG_PULL_DROP_PCT:
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
@@ -454,7 +446,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
                 await send_telegram_async(rug_msg)
 
-    # === DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED FOR CONFIRMATION) ===
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
     DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
@@ -474,7 +465,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         dist_pct = dist_from_high / session_high if session_high > 0 else 0
         now = datetime.now(timezone.utc)
 
-        # --- Breakout Alert: new high on volume/price ---
         if (
             volume > VOLUME_SPIKE_MIN
             and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
@@ -484,14 +474,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and abs(close - session_high) < 1e-6
             and (now - last_volume_spike_time[symbol]).total_seconds() > 600
         ):
-            # PATCH: store pending breakout, do not alert yet
             pending_breakout_alert[symbol] = {
                 "breakout_close": close,
                 "breakout_time": start_time
             }
             last_volume_spike_time[symbol] = now
 
-        # --- Runner Warming Up Alert (confirmation logic) ---
         elif (
             volume > VOLUME_SPIKE_MIN
             and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
@@ -506,16 +494,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "spike_close": close,
                 "spike_time": start_time,
             }
-            # Do not alert yet!
-    # === END DUAL 1-MIN VOLUME SPIKE ALERT SYSTEM (UPDATED) ===
 
-    # --- PATCHED BREAKOUT CONFIRMATION LOGIC ---
     if symbol in pending_breakout_alert:
         candidate = pending_breakout_alert[symbol]
         seconds = (start_time - candidate["breakout_time"]).total_seconds()
-        MIN_CONFIRM_VOL = 10000  # Set minimum confirmation candle volume
+        MIN_CONFIRM_VOL = 10000
         if seconds == 60:
-            # Must close >= breakout close, have minimum volume, AND set new high
             if (
                 close >= candidate["breakout_close"] and
                 volume >= MIN_CONFIRM_VOL and
@@ -523,14 +507,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ):
                 msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f} (vol {volume:,})"
                 await send_telegram_async(msg)
-            # Remove the pending candidate (whether triggered or not)
             del pending_breakout_alert[symbol]
-        # If more than 1 minute has passed, discard candidate (missed window)
         elif seconds > 60:
             del pending_breakout_alert[symbol]
-    # --- END PATCHED BREAKOUT CONFIRMATION LOGIC ---
 
-    # --- Runner confirmation: check if a pending spike follows through
     if symbol in pending_runner_alert:
         candidate = pending_runner_alert[symbol]
         if (start_time - candidate["spike_time"]).total_seconds() == 60:
@@ -547,12 +527,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
 
-    # --- PATCHED 3-MINUTE SPIKE ALERT LOGIC WITH DEBUG & DOWN-BAR GUARD ---
     if len(candles_seq) == 3:
         c0, c1, c2 = candles_seq
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
 
-        # RVOL logic
         rvol_history[symbol].append(total_volume)
         if len(rvol_history[symbol]) >= 5:
             trailing_vols = list(rvol_history[symbol])[:-1]
@@ -570,10 +548,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         else:
             return
 
-        # PATCH: Add debug print so you see all the values, and guard for "down" moves
         print(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
 
-        # Only alert if all closes are strictly increasing
         if (
             c0["close"] < c1["close"] < c2["close"]
             and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
@@ -654,15 +630,12 @@ async def handle_halt_event(item):
             print(f"[HALT ALERT] Could not get price for {symbol}: {e}")
             log_halt_event(item, reason=f"price_fetch_error: {e}")
 
-    # PATCH: Remove IPO filter and always send halt alert for price <= $10
     if price is None:
         log_halt_event(item, reason="price_none")
         return
     if price > PRICE_THRESHOLD or price <= 0:
         log_halt_event(item, reason=f"price_above_threshold: {price}")
         return
-
-    # PATCH: Remove recent IPO filter for halts
 
     halt_ts = item.get("t") if "t" in item else None
     global last_halt_alert
@@ -755,12 +728,10 @@ async def trade_ws(symbol_queue):
                     await asyncio.sleep(0.2)
                 subscribed_symbols = set(symbols)
 
-                # --- NEW: Subscribe to all halts (for all US stocks) ---
                 if not halt_subscribed:
                     await ws.send(json.dumps({"action": "subscribe", "params": "H.*"}))
                     halt_subscribed = True
 
-                # --- PATCHED ws_recv WITH ERROR HANDLING ---
                 import traceback
                 async def ws_recv():
                     print("ws_recv started")
@@ -772,7 +743,6 @@ async def trade_ws(symbol_queue):
                             except Exception:
                                 print("Could not decode JSON:", message)
                                 continue
-                            # Accept only dict or list
                             if isinstance(payload, dict):
                                 payload = [payload]
                             elif isinstance(payload, list):
@@ -828,6 +798,10 @@ async def trade_ws(symbol_queue):
             print(f"Trade WebSocket error: {e}. Reconnecting soon...")
             await asyncio.sleep(5)
 
+async def send_test_alert():
+    print("Sending TEST alert to Telegram…")
+    await send_telegram_async("🚨 <b>TEST ALERT:</b> This is a test alert from your penny scanner bot.")
+
 async def main():
     print("main() started.")
     loop = asyncio.get_event_loop()
@@ -836,6 +810,7 @@ async def main():
     init_syms = await fetch_top_penny_symbols()
     print(f"Initial symbols: {init_syms[:10]}... total: {len(init_syms)}")
     await symbol_queue.put(init_syms)
+    await send_test_alert()
     await asyncio.gather(
         dynamic_symbol_manager(symbol_queue),
         trade_ws(symbol_queue),
