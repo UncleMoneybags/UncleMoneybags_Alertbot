@@ -45,7 +45,7 @@ rvol_history = defaultdict(lambda: deque(maxlen=20))
 RVOL_MIN = 3.0
 
 # ==== ML Event Logging and Scoring Functions (INJECTED) ====
-EVENT_LOG_FILE = "event_log.csv"
+EVENT_LOG_FILE = "event_log_labeled.csv"  # <-- updated to use the labeled file
 
 def log_event(event_type, symbol, price, volume, event_time, extra_features=None):
     extra_features = extra_features or {}
