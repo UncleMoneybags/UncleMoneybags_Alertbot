@@ -434,9 +434,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
     # === INJECTED: RUG PULL DETECTION ===
+    candles_seq = candles[symbol]
+    if not isinstance(candles_seq, (list, deque)):
+        print(f"ERROR: candles[{symbol}] is {type(candles_seq)}, not list/deque: {candles_seq}")
+        return
+
     # Only check if we have at least 3 candles
-    if len(candles[symbol]) >= 3:
-        c0, c1, c2 = candles[symbol][-3:]  # c0=before drop, c1=drop, c2=after drop
+    if len(candles_seq) >= 3:
+        c0, c1, c2 = candles_seq[-3:]  # c0=before drop, c1=drop, c2=after drop
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
         if drop_pct <= RUG_PULL_DROP_PCT:
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
@@ -458,13 +463,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     VOLUME_SPIKE_MULTIPLIER = 2.5
     VOLUME_SPIKE_MIN = 5000
 
-    prev_vols = [c["volume"] for c in list(candles[symbol])[:-1]]
+    prev_vols = [c["volume"] for c in list(candles_seq)[:-1]]
     if len(prev_vols) >= 2 and vwap is not None:
         avg_prev = sum(prev_vols) / len(prev_vols)
         price_move = close - open_
         price_move_pct = price_move / open_ if open_ > 0 else 0
         min_abs = DUAL_MIN_1M_PRICE_MOVE_ABS if close < 2 else DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS
-        session_high = max([c["high"] for c in candles[symbol]])
+        session_high = max([c["high"] for c in candles_seq])
         dist_from_high = session_high - close
         dist_pct = dist_from_high / session_high if session_high > 0 else 0
         now = datetime.now(timezone.utc)
@@ -543,8 +548,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             del pending_runner_alert[symbol]
 
     # --- PATCHED 3-MINUTE SPIKE ALERT LOGIC WITH DEBUG & DOWN-BAR GUARD ---
-    if len(candles[symbol]) == 3:
-        c0, c1, c2 = candles[symbol]
+    if len(candles_seq) == 3:
+        c0, c1, c2 = candles_seq
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
 
         # RVOL logic
@@ -756,45 +761,45 @@ async def trade_ws(symbol_queue):
                     halt_subscribed = True
 
                 # --- PATCHED ws_recv WITH ERROR HANDLING ---
-              import traceback
-async def ws_recv():
-    print("ws_recv started")
-    async for message in ws:
-        try:
-            print("RAW MESSAGE:", message)
-            try:
-                payload = json.loads(message)
-            except Exception:
-                print("Could not decode JSON:", message)
-                continue
-            # Accept only dict or list
-            if isinstance(payload, dict):
-                payload = [payload]
-            elif isinstance(payload, list):
-                pass
-            else:
-                print("Unexpected payload type:", type(payload), payload)
-                continue
-            for item in payload:
-                if not isinstance(item, dict):
-                    print("Unexpected item type:", type(item), item)
-                    continue
-                ev = item.get("ev")
-                if ev == "T":
-                    symbol = item.get("sym")
-                    price = float(item.get("p"))
-                    size = float(item.get("s", 0))
-                    ts = item.get("t") / 1000
-                    trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
-                    await on_trade_event(symbol, price, size, trade_time)
-                elif ev == "H":
-                    await handle_halt_event(item)
-                else:
-                    print("Unknown event type:", ev, item)
-        except Exception as e:
-            print(f"!!! ERROR processing WebSocket message: {e}")
-            print(f"Offending message: {message}")
-            traceback.print_exc()
+                import traceback
+                async def ws_recv():
+                    print("ws_recv started")
+                    async for message in ws:
+                        try:
+                            print("RAW MESSAGE:", message)
+                            try:
+                                payload = json.loads(message)
+                            except Exception:
+                                print("Could not decode JSON:", message)
+                                continue
+                            # Accept only dict or list
+                            if isinstance(payload, dict):
+                                payload = [payload]
+                            elif isinstance(payload, list):
+                                pass
+                            else:
+                                print("Unexpected payload type:", type(payload), payload)
+                                continue
+                            for item in payload:
+                                if not isinstance(item, dict):
+                                    print("Unexpected item type:", type(item), item)
+                                    continue
+                                ev = item.get("ev")
+                                if ev == "T":
+                                    symbol = item.get("sym")
+                                    price = float(item.get("p"))
+                                    size = float(item.get("s", 0))
+                                    ts = item.get("t") / 1000
+                                    trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
+                                    await on_trade_event(symbol, price, size, trade_time)
+                                elif ev == "H":
+                                    await handle_halt_event(item)
+                                else:
+                                    print("Unknown event type:", ev, item)
+                        except Exception as e:
+                            print(f"!!! ERROR processing WebSocket message: {e}")
+                            print(f"Offending message: {message}")
+                            traceback.print_exc()
 
                 async def ws_symbols():
                     print("ws_symbols started")
