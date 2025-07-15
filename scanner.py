@@ -155,7 +155,6 @@ pending_breakout_alert = {}
 HALT_LOG_FILE = "halt_event_log.csv"
 
 def log_halt_event(item, reason=None):
-    # Logs all halt events for audit/debug
     import csv, os
     row = {
         "symbol": item.get("sym"),
@@ -392,7 +391,16 @@ async def on_trade_event(symbol, price, size, trade_time):
     last_time = trade_candle_last_time.get(symbol)
     if last_time is not None and candle_time != last_time:
         trades = trade_candle_builders[symbol]
+        # PATCH: bulletproof slicing for trades
+        if not isinstance(trades, (list, deque)):
+            print(f"ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
+            if isinstance(trades, dict):
+                trades = [trades]
+                trade_candle_builders[symbol] = list(trades)
+            else:
+                trade_candle_builders[symbol] = []
         if trades:
+            trades = list(trades)
             trades.sort(key=lambda t: t[2])
             prices = [t[0] for t in trades]
             volumes = [t[1] for t in trades]
@@ -428,9 +436,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
     candles_seq = candles[symbol]
+    # PATCH: bulletproof slicing for candles
     if not isinstance(candles_seq, (list, deque)):
-        print(f"ERROR: candles[{symbol}] is {type(candles_seq)}, not list/deque: {candles_seq}")
-        return
+        print(f"ERROR: candles[{symbol}] not list/deque. Found type: {type(candles_seq)}. Value: {candles_seq}")
+        if isinstance(candles_seq, dict):
+            candles_seq = [candles_seq]
+            candles[symbol] = deque(candles_seq, maxlen=3)
+        else:
+            return
 
     if len(candles_seq) >= 3:
         c0, c1, c2 = candles_seq[-3:]
@@ -455,6 +468,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     VOLUME_SPIKE_MIN = 5000
 
     prev_vols = [c["volume"] for c in list(candles_seq)[:-1]]
+    # PATCH: bulletproof prev_vols
+    if not isinstance(prev_vols, (list, deque)):
+        prev_vols = list(prev_vols)
     if len(prev_vols) >= 2 and vwap is not None:
         avg_prev = sum(prev_vols) / len(prev_vols)
         price_move = close - open_
@@ -532,8 +548,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
 
         rvol_history[symbol].append(total_volume)
-        if len(rvol_history[symbol]) >= 5:
-            trailing_vols = list(rvol_history[symbol])[:-1]
+        rvol_hist_seq = rvol_history[symbol]
+        if not isinstance(rvol_hist_seq, (list, deque)):
+            rvol_hist_seq = list(rvol_hist_seq)
+        if len(rvol_hist_seq) >= 5:
+            trailing_vols = list(rvol_hist_seq)[:-1]
             if trailing_vols:
                 avg_trailing = sum(trailing_vols) / len(trailing_vols)
                 if avg_trailing > 0:
