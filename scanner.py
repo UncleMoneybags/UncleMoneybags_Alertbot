@@ -755,22 +755,40 @@ async def trade_ws(symbol_queue):
                     await ws.send(json.dumps({"action": "subscribe", "params": "H.*"}))
                     halt_subscribed = True
 
+                # --- PATCHED ws_recv WITH ERROR HANDLING ---
+                import traceback
                 async def ws_recv():
                     print("ws_recv started")
                     async for message in ws:
-                        payload = json.loads(message)
-                        if not isinstance(payload, list):
-                            payload = [payload]
-                        for item in payload:
-                            if item.get("ev") == "T":
-                                symbol = item.get("sym")
-                                price = float(item.get("p"))
-                                size = float(item.get("s", 0))
-                                ts = item.get("t") / 1000
-                                trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
-                                await on_trade_event(symbol, price, size, trade_time)
-                            elif item.get("ev") == "H":
-                                await handle_halt_event(item)
+                        try:
+                            print("RAW MESSAGE:", message)
+                            payload = json.loads(message)
+                            # Safely convert payload to a list for iteration
+                            if isinstance(payload, dict):
+                                payload = [payload]
+                            elif not isinstance(payload, list):
+                                print("Unexpected payload type:", type(payload), payload)
+                                continue
+                            for item in payload:
+                                if not isinstance(item, dict):
+                                    print("Unexpected item type:", type(item), item)
+                                    continue
+                                ev = item.get("ev")
+                                if ev == "T":
+                                    symbol = item.get("sym")
+                                    price = float(item.get("p"))
+                                    size = float(item.get("s", 0))
+                                    ts = item.get("t") / 1000
+                                    trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
+                                    await on_trade_event(symbol, price, size, trade_time)
+                                elif ev == "H":
+                                    await handle_halt_event(item)
+                                else:
+                                    print("Unknown event type:", ev, item)
+                        except Exception as e:
+                            print(f"!!! ERROR processing WebSocket message: {e}")
+                            print(f"Offending message: {message}")
+                            traceback.print_exc()
 
                 async def ws_symbols():
                     print("ws_symbols started")
