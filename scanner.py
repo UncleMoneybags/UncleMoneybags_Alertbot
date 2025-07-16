@@ -154,6 +154,9 @@ pending_breakout_alert = {}
 # --- PATCH: Log all halt events for debugging ---
 HALT_LOG_FILE = "halt_event_log.csv"
 
+# --- PATCH: Track tickers that previously triggered spike/runner/breakout alert ---
+alerted_symbols = set()
+
 def log_halt_event(item, reason=None):
     import csv, os
     row = {
@@ -442,20 +445,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     candles_seq = candles[symbol]
 
-    # --- No need to check type again, it's always a deque now ---
+    # --- RUG PULL PATCH -- Only alert if stock already alerted as spike/runner/breakout ---
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
         if drop_pct <= RUG_PULL_DROP_PCT:
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
             if bounce_pct < RUG_PULL_BOUNCE_PCT:
-                rug_msg = (
-                    f"⚠️ {symbol} rug pull warning: "
-                    f"down ${abs(c1['close'] - c0['close']):.2f} ({abs(drop_pct)*100:.1f}%) "
-                    f"and failed to bounce more than 5% next candle. "
-                    f"Now ${c2['close']:.2f}."
-                )
-                await send_telegram_async(rug_msg)
+                if symbol in alerted_symbols:  # Only send alert if previously alerted
+                    rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
+                    await send_telegram_async(rug_msg)
 
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
@@ -518,6 +517,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ):
                 msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f} (vol {volume:,})"
                 await send_telegram_async(msg)
+                alerted_symbols.add(symbol)  # Add symbol to alerted set
             del pending_breakout_alert[symbol]
         elif seconds > 60:
             del pending_breakout_alert[symbol]
@@ -531,9 +531,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if symbol_day not in runner_alerted_today:
                     runner_alerted_today.add(symbol_day)
                     msg = f"👀 {symbol} runner warming up: ${close:.2f}"
+                    await send_telegram_async(msg)
+                    alerted_symbols.add(symbol)  # Add symbol to alerted set
                 else:
                     msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
-                await send_telegram_async(msg)
+                    await send_telegram_async(msg)
+                    alerted_symbols.add(symbol)  # Add symbol to alerted set
             del pending_runner_alert[symbol]
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
@@ -605,6 +608,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"<b>Confidence: {conf}/10</b>"
             )
             await send_telegram_async(msg)
+            alerted_symbols.add(symbol)  # Add symbol to alerted set
 
             log_event(
                 event_type="spike",
