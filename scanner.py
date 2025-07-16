@@ -625,6 +625,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
                 )
 
+# ----------- INJECTED: FULL HALT/RESUME HANDLING -----------
 async def handle_halt_event(item):
     print(f"handle_halt_event called: {item}")
     log_halt_event(item, reason="received")  # Log every event, for audit
@@ -634,6 +635,7 @@ async def handle_halt_event(item):
         log_halt_event(item, reason="not_equity_symbol")
         return
 
+    status = str(item.get("status", "")).lower()
     price = None
     if "p" in item and item["p"] is not None:
         price = float(item["p"])
@@ -659,28 +661,40 @@ async def handle_halt_event(item):
     halt_ts = item.get("t") if "t" in item else None
     global last_halt_alert
     if halt_ts is not None:
-        if symbol in last_halt_alert and last_halt_alert[symbol] == halt_ts:
+        if symbol in last_halt_alert and last_halt_alert[symbol] == halt_ts and status != "resumed":
             log_halt_event(item, reason="duplicate_halt")
             return
         last_halt_alert[symbol] = halt_ts
 
-    msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
-    await send_telegram_async(msg)
-    log_halt_event(item, reason="alert_sent")
+    # Send alerts for halt and resume events
+    if status == "halted" or not status:
+        msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
+        await send_telegram_async(msg)
+        log_halt_event(item, reason="alert_sent_halted")
+        event_type = "halt"
+    elif status == "resumed":
+        msg = f"🟢 {escape_html(symbol)} (${price:.2f}) resumed trading!"
+        await send_telegram_async(msg)
+        log_halt_event(item, reason="alert_sent_resumed")
+        event_type = "resume"
+    else:
+        # Unknown status, skip
+        return
 
     log_event(
-        event_type="halt",
+        event_type=event_type,
         symbol=symbol,
         price=price,
         volume=None,
         event_time=datetime.now(timezone.utc),
         extra_features={"rvol": None, "prepost": 0}
     )
-    ml_prob = score_event_ml("halt", symbol, price, 0, 1.0, 0)
+    ml_prob = score_event_ml(event_type, symbol, price, 0, 1.0, 0)
     if ml_prob > 0.7:
         await send_telegram_async(
-            f"🔥 <b>HIGH POTENTIAL HALT</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+            f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
         )
+# ----------- END INJECTED -----------
 
 async def send_scheduled_alerts():
     print("send_scheduled_alerts started")
@@ -817,9 +831,7 @@ async def trade_ws(symbol_queue):
             print(f"Trade WebSocket error: {e}. Reconnecting soon...")
             await asyncio.sleep(5)
 
-async def send_test_alert():
-    print("Sending TEST alert to Telegram…")
-    await send_telegram_async("🚨 <b>TEST ALERT:</b> This is a test alert from your penny scanner bot.")
+# (TEST ALERT REMOVED HERE)
 
 async def main():
     print("main() started.")
@@ -829,7 +841,7 @@ async def main():
     init_syms = await fetch_top_penny_symbols()
     print(f"Initial symbols: {init_syms[:10]}... total: {len(init_syms)}")
     await symbol_queue.put(init_syms)
-    await send_test_alert()
+    # await send_test_alert()  # <--- REMOVED THIS LINE
     await asyncio.gather(
         dynamic_symbol_manager(symbol_queue),
         trade_ws(symbol_queue),
