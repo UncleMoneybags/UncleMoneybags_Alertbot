@@ -27,7 +27,7 @@ PRICE_THRESHOLD = 10.00
 MAX_SYMBOLS = 400
 SCREENER_REFRESH_SEC = 60
 MIN_ALERT_MOVE = 0.15
-MIN_3MIN_VOLUME = 10000
+MIN_3MIN_VOLUME = 5000  # <--- changed from 10000 to 5000
 MIN_PER_CANDLE_VOL = 1000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
@@ -42,7 +42,7 @@ vwap_cum_pv = defaultdict(float)
 
 # Relative Volume config
 rvol_history = defaultdict(lambda: deque(maxlen=20))
-RVOL_MIN = 3.0
+RVOL_MIN = 2.0  # <--- changed from 3.0 to 2.0
 
 # ==== ML Event Logging and Scoring Functions (INJECTED) ====
 EVENT_LOG_FILE = "event_log.csv"
