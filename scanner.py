@@ -389,16 +389,15 @@ async def on_trade_event(symbol, price, size, trade_time):
     print(f"on_trade_event: {symbol}, price: {price}, size: {size}")
     candle_time = trade_time.replace(second=0, microsecond=0)
     last_time = trade_candle_last_time.get(symbol)
+    trades = trade_candle_builders[symbol]
+
+    # --- Fix: always ensure trades is a list before slicing ---
+    if not isinstance(trades, (list, deque)):
+        print(f"ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
+        trades = [trades]
+        trade_candle_builders[symbol] = trades
+
     if last_time is not None and candle_time != last_time:
-        trades = trade_candle_builders[symbol]
-        # PATCH: bulletproof slicing for trades
-        if not isinstance(trades, (list, deque)):
-            print(f"ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
-            if isinstance(trades, dict):
-                trades = [trades]
-                trade_candle_builders[symbol] = list(trades)
-            else:
-                trade_candle_builders[symbol] = []
         if trades:
             trades = list(trades)
             trades.sort(key=lambda t: t[2])
@@ -422,6 +421,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     print(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
         return
+
+    # --- Fix: always ensure candles[symbol] is a deque before slicing ---
+    if not isinstance(candles[symbol], deque):
+        print(f"ERROR: candles[{symbol}] not deque. Found type: {type(candles[symbol])}. Value: {candles[symbol]}")
+        candles[symbol] = deque([candles[symbol]], maxlen=3)
+
     candles[symbol].append({
         "open": open_,
         "high": high,
@@ -436,17 +441,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
 
     candles_seq = candles[symbol]
-    # PATCH: bulletproof slicing for candles
-    if not isinstance(candles_seq, (list, deque)):
-        print(f"ERROR: candles[{symbol}] not list/deque. Found type: {type(candles_seq)}. Value: {candles_seq}")
-        if isinstance(candles_seq, dict):
-            candles_seq = [candles_seq]
-            candles[symbol] = deque(candles_seq, maxlen=3)
-        else:
-            return
 
+    # --- No need to check type again, it's always a deque now ---
     if len(candles_seq) >= 3:
-        c0, c1, c2 = candles_seq[-3:]
+        c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
         if drop_pct <= RUG_PULL_DROP_PCT:
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
@@ -468,9 +466,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     VOLUME_SPIKE_MIN = 5000
 
     prev_vols = [c["volume"] for c in list(candles_seq)[:-1]]
-    # PATCH: bulletproof prev_vols
-    if not isinstance(prev_vols, (list, deque)):
-        prev_vols = list(prev_vols)
     if len(prev_vols) >= 2 and vwap is not None:
         avg_prev = sum(prev_vols) / len(prev_vols)
         price_move = close - open_
@@ -544,7 +539,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             del pending_runner_alert[symbol]
 
     if len(candles_seq) == 3:
-        c0, c1, c2 = candles_seq
+        c0, c1, c2 = list(candles_seq)
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
 
         rvol_history[symbol].append(total_volume)
