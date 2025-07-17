@@ -1,39 +1,3 @@
-print("scanner.py is running!!! --- If you see this, your file is found and started.")
-
-import asyncio
-import websockets
-import aiohttp
-import json
-import html
-import re
-from collections import deque, defaultdict
-from datetime import datetime, time, timezone, timedelta
-import pytz
-import signal
-
-# ==== ML & Logging Imports (INJECTED) ====
-import csv
-import os
-import joblib
-import numpy as np
-
-# ==== PATCH: Yahoo Finance Imports for Float Filtering ====
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    print("WARNING: yfinance not installed. Run 'pip install yfinance' for float filtering.")
-    YFINANCE_AVAILABLE = False
-
-print("Imports completed successfully.")
-
-# --- CONFIG ---
-POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
-TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
-TELEGRAM_CHAT_ID = "-1002266463234"
-PRICE_THRESHOLD = 10.00
-MAX_SYMBOLS = 400
-SCREENER_REFRESH_SEC = 60
 MIN_ALERT_MOVE = 0.15
 MIN_3MIN_VOLUME = 5000
 MIN_PER_CANDLE_VOL = 1000
@@ -906,3 +870,4 @@ if __name__ == "__main__":
         print(f"Bot stopped gracefully. Reason: {e}")
     except Exception as e:
         print(f"Top-level exception: {e}")
+
