@@ -17,6 +17,14 @@ import os
 import joblib
 import numpy as np
 
+# ==== PATCH: Yahoo Finance Imports for Float Filtering ====
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    print("WARNING: yfinance not installed. Run 'pip install yfinance' for float filtering.")
+    YFINANCE_AVAILABLE = False
+
 print("Imports completed successfully.")
 
 # --- CONFIG ---
@@ -31,6 +39,10 @@ MIN_3MIN_VOLUME = 5000
 MIN_PER_CANDLE_VOL = 1000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
+
+# PATCH: Float filter config for both screener and news
+MIN_FLOAT_SHARES = 1_000_000
+MAX_FLOAT_SHARES = 10_000_000
 
 vwap_cum_vol = defaultdict(float)
 vwap_cum_pv = defaultdict(float)
@@ -230,6 +242,7 @@ async def send_news_telegram_async(message):
                 print(f"[DEBUG] Telegram send error (news): {e}")
                 return
 
+# PATCHED: News alerts only for tickers with float in range, and <small> -> <i>
 async def news_alerts_task():
     print("news_alerts_task started")
     global news_seen, latest_news_time
@@ -266,6 +279,25 @@ async def news_alerts_task():
                         if not await is_under_20(tickers):
                             continue
 
+                        # PATCH: Yahoo Finance float filter for news
+                        float_filter_pass = True
+                        if YFINANCE_AVAILABLE and tickers:
+                            for t in tickers:
+                                try:
+                                    info = yf.Ticker(t).info
+                                    float_shares = info.get('floatShares', None)
+                                    print(f"[DEBUG] {t}: float={float_shares}")
+                                    if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
+                                        float_filter_pass = False
+                                        break
+                                except Exception as e:
+                                    print(f"[DEBUG] Yahoo float error for {t}: {e}")
+                                    float_filter_pass = False
+                                    break
+                        if not float_filter_pass:
+                            print(f"[DEBUG] Skipping news for ticker due to float filter: {tickers}")
+                            continue
+
                         if tickers:
                             tickers_html = ", ".join([
                                 f'<a href="https://finance.yahoo.com/quote/{escape_html(t)}">{escape_html(t)}</a>'
@@ -280,7 +312,8 @@ async def news_alerts_task():
 
                         msg = f"📰 {tickers_str}\n{headline_clean}"
                         if summary_clean:
-                            msg += f"\n\n<small>{summary_clean}</small>"
+                            # PATCH: Use <i> instead of <small> for Telegram compatibility
+                            msg += f"\n\n<i>{summary_clean}</i>"
                         url_ = item.get("article_url") or item.get("url")
                         if url_:
                             msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
@@ -322,6 +355,7 @@ async def is_recent_ipo(ticker):
             print(f"[DEBUG] IPO check failed for {ticker}: {e}")
     return False
 
+# PATCHED: Screener only returns tickers with float in range
 async def fetch_top_penny_symbols():
     print("fetch_top_penny_symbols called")
     penny_symbols = []
@@ -350,6 +384,20 @@ async def fetch_top_penny_symbols():
                         price = day["c"]
                     volume = day.get("v", 0)
                     if price is not None and 0 < price <= PRICE_THRESHOLD:
+                        # PATCH: Yahoo Finance float filter for screener
+                        float_filter_pass = True
+                        if YFINANCE_AVAILABLE:
+                            try:
+                                info = yf.Ticker(ticker).info
+                                float_shares = info.get('floatShares', None)
+                                print(f"[DEBUG] {ticker}: float={float_shares}")
+                                if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
+                                    float_filter_pass = False
+                            except Exception as e:
+                                print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
+                                float_filter_pass = False
+                        if not float_filter_pass:
+                            continue
                         penny_symbols.append(ticker)
                         if len(penny_symbols) >= MAX_SYMBOLS:
                             break
