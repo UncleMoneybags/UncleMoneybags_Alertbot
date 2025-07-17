@@ -146,6 +146,10 @@ alerted_symbols = set()
 below_vwap_streak = defaultdict(int)
 vwap_reclaimed_once = defaultdict(bool)
 
+# --- DIP PLAY tracking dictionaries ---
+dip_play_seen = set()
+recent_high = defaultdict(float)
+
 def log_halt_event(item, reason=None):
     import csv, os
     row = {
@@ -427,18 +431,39 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     # === VWAP RECLAIM ALERT (Streak-based, fires only once per streak) ===
     if vwap is not None:
-        # If below VWAP, increment streak and reset reclaim flag
         if close < vwap:
             below_vwap_streak[symbol] += 1
             vwap_reclaimed_once[symbol] = False
         else:
-            # If we've had 3+ in a row below VWAP, and now get a green candle above VWAP, and not already reclaimed
             if below_vwap_streak[symbol] >= 3 and close > open_ and not vwap_reclaimed_once[symbol]:
                 msg = f"📈 {escape_html(symbol)} VWAP RECLAIM — Now ${close:.2f}"
                 await send_telegram_async(msg)
                 vwap_reclaimed_once[symbol] = True
-            # Reset streak on close above VWAP (regardless of candle color)
             below_vwap_streak[symbol] = 0
+
+    # === DIP PLAY ALERT (Chart Down Emoji) ===
+    MIN_DIP_PCT = 0.15  # 15%
+    DIP_LOOKBACK = 20   # candles to look back for high
+
+    if len(candles_seq) >= DIP_LOOKBACK:
+        highs = [c["high"] for c in list(candles_seq)[-DIP_LOOKBACK:]]
+        rhigh = max(highs)
+        recent_high[symbol] = rhigh
+
+    if recent_high[symbol] > 0:
+        dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
+        if dip_pct >= MIN_DIP_PCT and symbol not in dip_play_seen:
+            if len(candles_seq) >= 4:
+                c1, c2, c3, c4 = list(candles_seq)[-4:]
+                higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"] and c4["low"] > c3["low"]
+                rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"] and c4["volume"] > c3["volume"]
+                if higher_lows and rising_volume:
+                    msg = (
+                        f"📉 {escape_html(symbol)} Dip Play: Dropped {dip_pct*100:.1f}% to ${close:.2f}, "
+                        f"3 higher lows with rising volume!"
+                    )
+                    await send_telegram_async(msg)
+                    dip_play_seen.add(symbol)
 
     # ... (rest of your original on_new_candle logic unchanged)
     # [spike, runner, breakout, rvol, etc.]
