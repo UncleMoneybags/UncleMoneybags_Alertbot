@@ -32,13 +32,6 @@ MIN_PER_CANDLE_VOL = 1000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
 
-# --- INJECTED CONFIGS ---
-MIN_SPIKE_CONFIDENCE = 5
-MIN_VWAP_PRICE = 1.00
-MIN_VWAP_VOLUME = 50000
-MIN_VWAP_PCT_ABOVE_VWAP = 0.01  # 1%
-vwap_alerted_symbols = set()  # Clear this at session start/pre-market if needed
-
 vwap_cum_vol = defaultdict(float)
 vwap_cum_pv = defaultdict(float)
 
@@ -436,31 +429,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     candles_seq = candles[symbol]
 
-    # === VWAP RECLAIM ALERT (Streak-based, fires only once per streak) ===
-    # --- INJECTED VWAP RECLAIM LOGIC ---
-    if vwap is not None:
-        if close < vwap:
-            below_vwap_streak[symbol] += 1
-            vwap_reclaimed_once[symbol] = False
-        else:
-            if (
-                below_vwap_streak[symbol] >= 3 and
-                close > open_ and
-                not vwap_reclaimed_once[symbol] and
-                close >= MIN_VWAP_PRICE and
-                volume >= MIN_VWAP_VOLUME and
-                ((close - vwap) / vwap) >= MIN_VWAP_PCT_ABOVE_VWAP and
-                symbol not in vwap_alerted_symbols
-            ):
-                msg = f"📈 {escape_html(symbol)} VWAP RECLAIM — Now ${close:.2f}"
-                await send_telegram_async(msg)
-                vwap_reclaimed_once[symbol] = True
-                vwap_alerted_symbols.add(symbol)
-            else:
-                print(f"[DEBUG] VWAP reclaim alert skipped for {symbol}:"
-                      f" streak={below_vwap_streak[symbol]}, close={close}, vwap={vwap},"
-                      f" volume={volume}, pct_above_vwap={((close - vwap) / vwap):.3f}")
-            below_vwap_streak[symbol] = 0
+    # === VWAP RECLAIM ALERT REMOVED ===
 
     # === DIP PLAY ALERT (Chart Down Emoji) ===
     MIN_DIP_PCT = 0.15  # 15%
@@ -649,12 +618,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"Now ${c2['close']:.2f}. "
                 f"<b>Confidence: {conf}/10</b>"
             )
-            # --- INJECTED SPIKE CONFIDENCE FILTER ---
-            if conf >= MIN_SPIKE_CONFIDENCE:
-                await send_telegram_async(msg)
-                alerted_symbols.add(symbol)
-            else:
-                print(f"[DEBUG] Alert for {symbol} skipped: confidence {conf} < {MIN_SPIKE_CONFIDENCE}")
+            await send_telegram_async(msg)
+            alerted_symbols.add(symbol)
 
             log_event(
                 event_type="spike",
