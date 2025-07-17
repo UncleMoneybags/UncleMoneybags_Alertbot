@@ -41,7 +41,7 @@ MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
 
 # PATCH: Float filter config for both screener and news
-MIN_FLOAT_SHARES = 1_000_000
+MIN_FLOAT_SHARES = 500_000
 MAX_FLOAT_SHARES = 10_000_000
 
 vwap_cum_vol = defaultdict(float)
