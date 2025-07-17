@@ -142,6 +142,10 @@ HALT_LOG_FILE = "halt_event_log.csv"
 
 alerted_symbols = set()
 
+# --- VWAP Streak tracking dictionaries ---
+below_vwap_streak = defaultdict(int)
+vwap_reclaimed_once = defaultdict(bool)
+
 def log_halt_event(item, reason=None):
     import csv, os
     row = {
@@ -421,6 +425,23 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     candles_seq = candles[symbol]
 
+    # === VWAP RECLAIM ALERT (Streak-based, fires only once per streak) ===
+    if vwap is not None:
+        # If below VWAP, increment streak and reset reclaim flag
+        if close < vwap:
+            below_vwap_streak[symbol] += 1
+            vwap_reclaimed_once[symbol] = False
+        else:
+            # If we've had 3+ in a row below VWAP, and now get a green candle above VWAP, and not already reclaimed
+            if below_vwap_streak[symbol] >= 3 and close > open_ and not vwap_reclaimed_once[symbol]:
+                msg = f"📈 {escape_html(symbol)} VWAP RECLAIM — Now ${close:.2f}"
+                await send_telegram_async(msg)
+                vwap_reclaimed_once[symbol] = True
+            # Reset streak on close above VWAP (regardless of candle color)
+            below_vwap_streak[symbol] = 0
+
+    # ... (rest of your original on_new_candle logic unchanged)
+    # [spike, runner, breakout, rvol, etc.]
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
