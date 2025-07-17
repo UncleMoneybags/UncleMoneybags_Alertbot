@@ -27,24 +27,17 @@ PRICE_THRESHOLD = 10.00
 MAX_SYMBOLS = 400
 SCREENER_REFRESH_SEC = 60
 MIN_ALERT_MOVE = 0.15
-MIN_3MIN_VOLUME = 5000  # <--- changed from 10000 to 5000
+MIN_3MIN_VOLUME = 5000
 MIN_PER_CANDLE_VOL = 1000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
 
-# --- 1m volume spike config (NEW for less noise) ---
-MIN_1M_PRICE_MOVE_PCT = 0.02   # 2%
-MIN_1M_PRICE_MOVE_ABS = 0.05   # $0.05
-
-# For running VWAP calculation (INJECTED)
 vwap_cum_vol = defaultdict(float)
 vwap_cum_pv = defaultdict(float)
 
-# Relative Volume config
 rvol_history = defaultdict(lambda: deque(maxlen=20))
-RVOL_MIN = 2.0  # <--- changed from 3.0 to 2.0
+RVOL_MIN = 2.0
 
-# ==== ML Event Logging and Scoring Functions (INJECTED) ====
 EVENT_LOG_FILE = "event_log.csv"
 
 def log_event(event_type, symbol, price, volume, event_time, extra_features=None):
@@ -81,7 +74,6 @@ def score_event_ml(event_type, symbol, price, volume, rvol, prepost):
     prob = runner_clf.predict_proba(X)[0,1]
     return prob
 
-# --- News Keyword Filter ---
 KEYWORDS = [
     "offering", "FDA", "approval", "acquisition", "merger", "bankruptcy", "delisting", "reverse split", "split",
     "halt", "investigation", "lawsuit", "earnings", "guidance", "clinical", "phase 1", "phase 2", "phase 3",
@@ -111,7 +103,7 @@ def is_news_alert_time():
     return start <= now_ny.time() <= end
 
 async def send_telegram_async(message):
-    print(f"send_telegram_async called. Message: {message}")
+    print(f"[DEBUG] send_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -123,11 +115,11 @@ async def send_telegram_async(message):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=payload, timeout=10) as resp:
                 result_text = await resp.text()
-                print(f"Telegram API status: {resp.status}, response: {result_text}")
+                print(f"[DEBUG] Telegram API status: {resp.status}, response: {result_text}")
                 if resp.status != 200:
-                    print("Telegram send error:", result_text)
+                    print("[DEBUG] Telegram send error:", result_text)
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"[DEBUG] Telegram send error: {e}")
 
 def escape_html(s):
     return html.escape(s or "")
@@ -138,23 +130,16 @@ trade_candle_last_time = {}
 last_alerted_price = {}
 last_halt_alert = {}
 news_seen = set()
-latest_news_time = None  # For live news only
+latest_news_time = None
 
-# 💥 1-minute volume spike state
 last_volume_spike_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
-# 👀 Dual alert state (for runner warming up)
 last_runner_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
-# 🏃 Track runner alerts per symbol per day
 runner_alerted_today = set()
 
-# --- PATCH: pending runner confirmation state ---
 pending_runner_alert = {}
-# --- PATCH: pending breakout confirmation state ---
 pending_breakout_alert = {}
-# --- PATCH: Log all halt events for debugging ---
 HALT_LOG_FILE = "halt_event_log.csv"
 
-# --- PATCH: Track tickers that previously triggered spike/runner/breakout alert ---
 alerted_symbols = set()
 
 def log_halt_event(item, reason=None):
@@ -187,8 +172,8 @@ def bold_keywords(text, keywords):
         text = regex.sub(replacer, text)
     return text
 
-async def is_under_10(tickers):
-    print(f"is_under_10 called for tickers: {tickers}")
+async def is_under_20(tickers):
+    print(f"[DEBUG] is_under_20 called for tickers: {tickers}")
     for ticker in tickers:
         url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
         try:
@@ -202,15 +187,15 @@ async def is_under_10(tickers):
                         price = last_trade["p"]
                     elif day and day.get("c", 0) > 0:
                         price = day["c"]
-                    if price is not None and 0 < price <= 10.00:
-                        print(f"Ticker {ticker} is under $10: {price}")
+                    print(f"[DEBUG] Ticker {ticker} price: {price}")
+                    if price is not None and 0 < price <= 20.00:
                         return True
         except Exception as e:
-            print(f"Price check failed for {ticker}: {e}")
+            print(f"[DEBUG] Price check failed for {ticker}: {e}")
     return False
 
 async def send_news_telegram_async(message):
-    print(f"send_news_telegram_async called. Message: {message}")
+    print(f"[DEBUG] send_news_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -223,18 +208,18 @@ async def send_news_telegram_async(message):
             try:
                 async with session.post(url, data=payload, timeout=10) as resp:
                     result_text = await resp.text()
-                    print(f"Telegram API status (news): {resp.status}, response: {result_text}")
+                    print(f"[DEBUG] Telegram API status (news): {resp.status}, response: {result_text}")
                     if resp.status == 429:
                         data = await resp.json()
                         retry = data.get("parameters", {}).get("retry_after", 30)
-                        print(f"Rate limited. Waiting {retry} seconds before retrying...")
+                        print(f"[DEBUG] Rate limited. Waiting {retry} seconds before retrying...")
                         await asyncio.sleep(retry)
                         continue
                     if resp.status != 200:
-                        print("Telegram send error (news):", result_text)
+                        print("[DEBUG] Telegram send error (news):", result_text)
                     return
             except Exception as e:
-                print(f"Telegram send error (news): {e}")
+                print(f"[DEBUG] Telegram send error (news): {e}")
                 return
 
 async def news_alerts_task():
@@ -263,21 +248,14 @@ async def news_alerts_task():
                         continue
 
                     for item in sorted(news_batch, key=lambda x: x.get('published_utc')):
-                        ntime = item.get('published_utc')
-                        if not ntime:
-                            continue
-                        ntime_dt = datetime.fromisoformat(ntime.replace('Z', '+00:00'))
-                        if ntime_dt <= latest_news_time:
-                            continue
-                        news_id = item['id']
-                        if news_id in news_seen:
-                            continue
                         headline = item.get('title', '')
                         summary = item.get('description', '')
                         tickers = item.get('tickers', [])
+                        print(f"[DEBUG] News headline: {headline} | Summary: {summary} | Tickers: {tickers}")
+
                         if not news_matches_keywords(headline, summary):
                             continue
-                        if not await is_under_10(tickers):
+                        if not await is_under_20(tickers):
                             continue
 
                         if tickers:
@@ -299,7 +277,7 @@ async def news_alerts_task():
                         if url_:
                             msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
 
-                        news_seen.add(news_id)
+                        news_seen.add(item['id'])
                         await send_news_telegram_async(msg)
                         await asyncio.sleep(3)
                     if most_recent:
@@ -307,7 +285,7 @@ async def news_alerts_task():
             if len(news_seen) > 500:
                 news_seen = set(list(news_seen)[-500:])
         except Exception as e:
-            print(f"News fetch error: {e}")
+            print(f"[DEBUG] News fetch error: {e}")
         await asyncio.sleep(30)
 
 def is_equity_symbol(ticker):
@@ -333,7 +311,7 @@ async def is_recent_ipo(ticker):
                         print(f"{ticker} is a recent IPO ({days_since_ipo} days).")
                     return days_since_ipo < MIN_IPO_DAYS
         except Exception as e:
-            print(f"IPO check failed for {ticker}: {e}")
+            print(f"[DEBUG] IPO check failed for {ticker}: {e}")
     return False
 
 async def fetch_top_penny_symbols():
@@ -345,7 +323,7 @@ async def fetch_top_penny_symbols():
             async with session.get(url) as resp:
                 data = await resp.json()
                 if "tickers" not in data:
-                    print("Tickers snapshot API response:", data)
+                    print("[DEBUG] Tickers snapshot API response:", data)
                     return []
                 for stock in data.get("tickers", []):
                     ticker = stock.get("ticker")
@@ -368,7 +346,7 @@ async def fetch_top_penny_symbols():
                         if len(penny_symbols) >= MAX_SYMBOLS:
                             break
         except Exception as e:
-            print("Tickers snapshot fetch error:", e)
+            print("[DEBUG] Tickers snapshot fetch error:", e)
     print(f"fetch_top_penny_symbols: found {len(penny_symbols)} symbols")
     return penny_symbols
 
@@ -394,9 +372,8 @@ async def on_trade_event(symbol, price, size, trade_time):
     last_time = trade_candle_last_time.get(symbol)
     trades = trade_candle_builders[symbol]
 
-    # --- Fix: always ensure trades is a list before slicing ---
     if not isinstance(trades, (list, deque)):
-        print(f"ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
+        print(f"[DEBUG] ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
         trades = [trades]
         trade_candle_builders[symbol] = trades
 
@@ -425,9 +402,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
         return
 
-    # --- Fix: always ensure candles[symbol] is a deque before slicing ---
     if not isinstance(candles[symbol], deque):
-        print(f"ERROR: candles[{symbol}] not deque. Found type: {type(candles[symbol])}. Value: {candles[symbol]}")
+        print(f"[DEBUG] ERROR: candles[{symbol}] not deque. Found type: {type(candles[symbol])}. Value: {candles[symbol]}")
         candles[symbol] = deque([candles[symbol]], maxlen=3)
 
     candles[symbol].append({
@@ -445,14 +421,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     candles_seq = candles[symbol]
 
-    # --- RUG PULL PATCH -- Only alert if stock already alerted as spike/runner/breakout ---
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
         if drop_pct <= RUG_PULL_DROP_PCT:
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
             if bounce_pct < RUG_PULL_BOUNCE_PCT:
-                if symbol in alerted_symbols:  # Only send alert if previously alerted
+                if symbol in alerted_symbols:
                     rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
                     await send_telegram_async(rug_msg)
 
@@ -517,7 +492,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ):
                 msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f} (vol {volume:,})"
                 await send_telegram_async(msg)
-                alerted_symbols.add(symbol)  # Add symbol to alerted set
+                alerted_symbols.add(symbol)
             del pending_breakout_alert[symbol]
         elif seconds > 60:
             del pending_breakout_alert[symbol]
@@ -532,11 +507,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     runner_alerted_today.add(symbol_day)
                     msg = f"👀 {symbol} runner warming up: ${close:.2f}"
                     await send_telegram_async(msg)
-                    alerted_symbols.add(symbol)  # Add symbol to alerted set
+                    alerted_symbols.add(symbol)
                 else:
                     msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
                     await send_telegram_async(msg)
-                    alerted_symbols.add(symbol)  # Add symbol to alerted set
+                    alerted_symbols.add(symbol)
             del pending_runner_alert[symbol]
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
@@ -608,7 +583,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"<b>Confidence: {conf}/10</b>"
             )
             await send_telegram_async(msg)
-            alerted_symbols.add(symbol)  # Add symbol to alerted set
+            alerted_symbols.add(symbol)
 
             log_event(
                 event_type="spike",
@@ -624,10 +599,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
                 )
 
-# ----------- INJECTED: FULL HALT/RESUME HANDLING -----------
 async def handle_halt_event(item):
-    print(f"handle_halt_event called: {item}")
-    log_halt_event(item, reason="received")  # Log every event, for audit
+    print(f"[DEBUG] Halt event received: {item}")
+    log_halt_event(item, reason="received")
 
     symbol = item.get("sym")
     if not symbol or not is_equity_symbol(symbol):
@@ -647,13 +621,11 @@ async def handle_halt_event(item):
                     snap = data.get("ticker", {})
                     price = snap.get("lastTrade", {}).get("p") or snap.get("day", {}).get("c")
         except Exception as e:
-            print(f"[HALT ALERT] Could not get price for {symbol}: {e}")
+            print(f"[DEBUG] [HALT ALERT] Could not get price for {symbol}: {e}")
             log_halt_event(item, reason=f"price_fetch_error: {e}")
 
-    if price is None:
-        log_halt_event(item, reason="price_none")
-        return
-    if price > PRICE_THRESHOLD or price <= 0:
+    # PATCH: Allow halt alerts for price up to $20 (previously $10)
+    if price is None or price > 20.00 or price <= 0:
         log_halt_event(item, reason=f"price_above_threshold: {price}")
         return
 
@@ -665,7 +637,6 @@ async def handle_halt_event(item):
             return
         last_halt_alert[symbol] = halt_ts
 
-    # Send alerts for halt and resume events
     if status == "halted" or not status:
         msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
         await send_telegram_async(msg)
@@ -677,7 +648,6 @@ async def handle_halt_event(item):
         log_halt_event(item, reason="alert_sent_resumed")
         event_type = "resume"
     else:
-        # Unknown status, skip
         return
 
     log_event(
@@ -693,7 +663,6 @@ async def handle_halt_event(item):
         await send_telegram_async(
             f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
         )
-# ----------- END INJECTED -----------
 
 async def send_scheduled_alerts():
     print("send_scheduled_alerts started")
@@ -769,22 +738,22 @@ async def trade_ws(symbol_queue):
                     print("ws_recv started")
                     async for message in ws:
                         try:
-                            print("RAW MESSAGE:", message)
+                            print("[DEBUG] RAW MESSAGE:", message)
                             try:
                                 payload = json.loads(message)
                             except Exception:
-                                print("Could not decode JSON:", message)
+                                print("[DEBUG] Could not decode JSON:", message)
                                 continue
                             if isinstance(payload, dict):
                                 payload = [payload]
                             elif isinstance(payload, list):
                                 pass
                             else:
-                                print("Unexpected payload type:", type(payload), payload)
+                                print("[DEBUG] Unexpected payload type:", type(payload), payload)
                                 continue
                             for item in payload:
                                 if not isinstance(item, dict):
-                                    print("Unexpected item type:", type(item), item)
+                                    print("[DEBUG] Unexpected item type:", type(item), item)
                                     continue
                                 ev = item.get("ev")
                                 if ev == "T":
@@ -797,10 +766,10 @@ async def trade_ws(symbol_queue):
                                 elif ev == "H":
                                     await handle_halt_event(item)
                                 else:
-                                    print("Unknown event type:", ev, item)
+                                    print("[DEBUG] Unknown event type:", ev, item)
                         except Exception as e:
-                            print(f"!!! ERROR processing WebSocket message: {e}")
-                            print(f"Offending message: {message}")
+                            print(f"[DEBUG] !!! ERROR processing WebSocket message: {e}")
+                            print(f"[DEBUG] Offending message: {message}")
                             traceback.print_exc()
 
                 async def ws_symbols():
@@ -827,10 +796,8 @@ async def trade_ws(symbol_queue):
 
                 await asyncio.gather(ws_recv(), ws_symbols())
         except Exception as e:
-            print(f"Trade WebSocket error: {e}. Reconnecting soon...")
+            print(f"[DEBUG] Trade WebSocket error: {e}. Reconnecting soon...")
             await asyncio.sleep(5)
-
-# (TEST ALERT REMOVED HERE)
 
 async def main():
     print("main() started.")
@@ -840,7 +807,6 @@ async def main():
     init_syms = await fetch_top_penny_symbols()
     print(f"Initial symbols: {init_syms[:10]}... total: {len(init_syms)}")
     await symbol_queue.put(init_syms)
-    # await send_test_alert()  # <--- REMOVED THIS LINE
     await asyncio.gather(
         dynamic_symbol_manager(symbol_queue),
         trade_ws(symbol_queue),
