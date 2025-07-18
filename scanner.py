@@ -1,5 +1,4 @@
-print("scanner.py is running!!! --- If you see this, your file is found and started.")
-
+import logging
 import asyncio
 import websockets
 import aiohttp
@@ -17,15 +16,38 @@ import os
 import joblib
 import numpy as np
 
+# ==== NEWS SEEN PERSISTENCE ====
+NEWS_SEEN_FILE = "news_seen.txt"
+
+def load_news_seen():
+    try:
+        with open(NEWS_SEEN_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
+def save_news_id(news_id):
+    with open(NEWS_SEEN_FILE, "a") as f:
+        f.write(news_id + "\n")
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s:%(name)s:%(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("scanner")
+
 # ==== PATCH: Yahoo Finance Imports for Float Filtering ====
 try:
     import yfinance as yf
     YFINANCE_AVAILABLE = True
 except ImportError:
-    print("WARNING: yfinance not installed. Run 'pip install yfinance' for float filtering.")
+    logger.warning("yfinance not installed. Run 'pip install yfinance' for float filtering.")
     YFINANCE_AVAILABLE = False
 
-print("Imports completed successfully.")
+logger.info("scanner.py is running!!! --- If you see this, your file is found and started.")
+logger.info("Imports completed successfully.")
 
 # --- CONFIG ---
 POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
@@ -72,9 +94,9 @@ def log_event(event_type, symbol, price, volume, event_time, extra_features=None
 
 try:
     runner_clf = joblib.load("runner_model.joblib")
-    print("Loaded ML runner model.")
+    logger.info("Loaded ML runner model.")
 except Exception as e:
-    print("WARNING: Could not load runner model:", e)
+    logger.warning(f"Could not load runner model: {e}")
     runner_clf = None
 
 def score_event_ml(event_type, symbol, price, volume, rvol, prepost):
@@ -115,7 +137,7 @@ def is_news_alert_time():
     return start <= now_ny.time() <= end
 
 async def send_telegram_async(message):
-    print(f"[DEBUG] send_telegram_async called. Message: {message}")
+    logger.debug(f"[DEBUG] send_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -127,11 +149,11 @@ async def send_telegram_async(message):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=payload, timeout=10) as resp:
                 result_text = await resp.text()
-                print(f"[DEBUG] Telegram API status: {resp.status}, response: {result_text}")
+                logger.debug(f"[DEBUG] Telegram API status: {resp.status}, response: {result_text}")
                 if resp.status != 200:
-                    print("[DEBUG] Telegram send error:", result_text)
+                    logger.error(f"[DEBUG] Telegram send error: {result_text}")
     except Exception as e:
-        print(f"[DEBUG] Telegram send error: {e}")
+        logger.error(f"[DEBUG] Telegram send error: {e}")
 
 def escape_html(s):
     return html.escape(s or "")
@@ -141,7 +163,7 @@ trade_candle_builders = defaultdict(list)
 trade_candle_last_time = {}
 last_alerted_price = {}
 last_halt_alert = {}
-news_seen = set()
+news_seen = load_news_seen()  # PATCH: Persist news_seen
 latest_news_time = None
 
 last_volume_spike_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
@@ -193,7 +215,7 @@ def bold_keywords(text, keywords):
     return text
 
 async def is_under_20(tickers):
-    print(f"[DEBUG] is_under_20 called for tickers: {tickers}")
+    logger.debug(f"[DEBUG] is_under_20 called for tickers: {tickers}")
     for ticker in tickers:
         url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
         try:
@@ -207,15 +229,15 @@ async def is_under_20(tickers):
                         price = last_trade["p"]
                     elif day and day.get("c", 0) > 0:
                         price = day["c"]
-                    print(f"[DEBUG] Ticker {ticker} price: {price}")
+                    logger.debug(f"[DEBUG] Ticker {ticker} price: {price}")
                     if price is not None and 0 < price <= 20.00:
                         return True
         except Exception as e:
-            print(f"[DEBUG] Price check failed for {ticker}: {e}")
+            logger.error(f"[DEBUG] Price check failed for {ticker}: {e}")
     return False
 
 async def send_news_telegram_async(message):
-    print(f"[DEBUG] send_news_telegram_async called. Message: {message}")
+    logger.debug(f"[DEBUG] send_news_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -228,27 +250,27 @@ async def send_news_telegram_async(message):
             try:
                 async with session.post(url, data=payload, timeout=10) as resp:
                     result_text = await resp.text()
-                    print(f"[DEBUG] Telegram API status (news): {resp.status}, response: {result_text}")
+                    logger.debug(f"[DEBUG] Telegram API status (news): {resp.status}, response: {result_text}")
                     if resp.status == 429:
                         data = await resp.json()
                         retry = data.get("parameters", {}).get("retry_after", 30)
-                        print(f"[DEBUG] Rate limited. Waiting {retry} seconds before retrying...")
+                        logger.warning(f"[DEBUG] Rate limited. Waiting {retry} seconds before retrying...")
                         await asyncio.sleep(retry)
                         continue
                     if resp.status != 200:
-                        print("[DEBUG] Telegram send error (news):", result_text)
+                        logger.error(f"[DEBUG] Telegram send error (news): {result_text}")
                     return
             except Exception as e:
-                print(f"[DEBUG] Telegram send error (news): {e}")
+                logger.error(f"[DEBUG] Telegram send error (news): {e}")
                 return
 
 # PATCHED: News alerts only for tickers with float in range, and <small> -> <i>
 async def news_alerts_task():
-    print("news_alerts_task started")
+    logger.info("news_alerts_task started")
     global news_seen, latest_news_time
     url = f"https://api.polygon.io/v2/reference/news?apiKey={POLYGON_API_KEY}&limit=50"
     while True:
-        print("news_alerts_task loop")
+        logger.debug("news_alerts_task loop")
         if not is_news_alert_time():
             await asyncio.sleep(30)
             continue
@@ -275,7 +297,7 @@ async def news_alerts_task():
                         headline = item.get('title', '')
                         summary = item.get('description', '')
                         tickers = item.get('tickers', [])
-                        print(f"[DEBUG] News headline: {headline} | Summary: {summary} | Tickers: {tickers}")
+                        logger.debug(f"[DEBUG] News headline: {headline} | Summary: {summary} | Tickers: {tickers}")
 
                         if not news_matches_keywords(headline, summary):
                             continue
@@ -289,16 +311,16 @@ async def news_alerts_task():
                                 try:
                                     info = yf.Ticker(t).info
                                     float_shares = info.get('floatShares', None)
-                                    print(f"[DEBUG] {t}: float={float_shares}")
+                                    logger.debug(f"[DEBUG] {t}: float={float_shares}")
                                     if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
                                         float_filter_pass = False
                                         break
                                 except Exception as e:
-                                    print(f"[DEBUG] Yahoo float error for {t}: {e}")
+                                    logger.error(f"[DEBUG] Yahoo float error for {t}: {e}")
                                     float_filter_pass = False
                                     break
                         if not float_filter_pass:
-                            print(f"[DEBUG] Skipping news for ticker due to float filter: {tickers}")
+                            logger.debug(f"[DEBUG] Skipping news for ticker due to float filter: {tickers}")
                             continue
 
                         if tickers:
@@ -324,6 +346,7 @@ async def news_alerts_task():
                             msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
 
                         news_seen.add(item['id'])
+                        save_news_id(item['id'])  # PATCH: Save news ID to file
                         await send_news_telegram_async(msg)
                         await asyncio.sleep(3)
                     if most_recent:
@@ -331,7 +354,7 @@ async def news_alerts_task():
             if len(news_seen) > 500:
                 news_seen = set(list(news_seen)[-500:])
         except Exception as e:
-            print(f"[DEBUG] News fetch error: {e}")
+            logger.error(f"[DEBUG] News fetch error: {e}")
         await asyncio.sleep(30)
 
 def is_equity_symbol(ticker):
@@ -354,15 +377,15 @@ async def is_recent_ipo(ticker):
                     list_date = datetime.strptime(list_date_str, "%Y-%m-%d").date()
                     days_since_ipo = (datetime.utcnow().date() - list_date).days
                     if days_since_ipo < MIN_IPO_DAYS:
-                        print(f"{ticker} is a recent IPO ({days_since_ipo} days).")
+                        logger.info(f"{ticker} is a recent IPO ({days_since_ipo} days).")
                     return days_since_ipo < MIN_IPO_DAYS
         except Exception as e:
-            print(f"[DEBUG] IPO check failed for {ticker}: {e}")
+            logger.error(f"[DEBUG] IPO check failed for {ticker}: {e}")
     return False
 
 # PATCHED: Screener only returns tickers with float in range
 async def fetch_top_penny_symbols():
-    print("fetch_top_penny_symbols called")
+    logger.info("fetch_top_penny_symbols called")
     penny_symbols = []
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}&limit=1000"
     async with aiohttp.ClientSession() as session:
@@ -370,7 +393,7 @@ async def fetch_top_penny_symbols():
             async with session.get(url) as resp:
                 data = await resp.json()
                 if "tickers" not in data:
-                    print("[DEBUG] Tickers snapshot API response:", data)
+                    logger.debug(f"[DEBUG] Tickers snapshot API response: {data}")
                     return []
                 for stock in data.get("tickers", []):
                     ticker = stock.get("ticker")
@@ -395,11 +418,11 @@ async def fetch_top_penny_symbols():
                             try:
                                 info = yf.Ticker(ticker).info
                                 float_shares = info.get('floatShares', None)
-                                print(f"[DEBUG] {ticker}: float={float_shares}")
+                                logger.debug(f"[DEBUG] {ticker}: float={float_shares}")
                                 if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
                                     float_filter_pass = False
                             except Exception as e:
-                                print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
+                                logger.error(f"[DEBUG] Yahoo float error for {ticker}: {e}")
                                 float_filter_pass = False
                         if not float_filter_pass:
                             continue
@@ -407,34 +430,34 @@ async def fetch_top_penny_symbols():
                         if len(penny_symbols) >= MAX_SYMBOLS:
                             break
         except Exception as e:
-            print("[DEBUG] Tickers snapshot fetch error:", e)
-    print(f"fetch_top_penny_symbols: found {len(penny_symbols)} symbols")
+            logger.error(f"[DEBUG] Tickers snapshot fetch error: {e}")
+    logger.info(f"fetch_top_penny_symbols: found {len(penny_symbols)} symbols")
     return penny_symbols
 
 current_symbols = set()
 
 async def dynamic_symbol_manager(symbol_queue):
-    print("dynamic_symbol_manager started")
+    logger.info("dynamic_symbol_manager started")
     global current_symbols
     while True:
-        print("dynamic_symbol_manager loop")
+        logger.debug("dynamic_symbol_manager loop")
         if is_market_scan_time():
             symbols = await fetch_top_penny_symbols()
             if symbols:
                 if set(symbols) != current_symbols:
-                    print(f"dynamic_symbol_manager: updating symbol_queue with {len(symbols)} symbols")
+                    logger.info(f"dynamic_symbol_manager: updating symbol_queue with {len(symbols)} symbols")
                     await symbol_queue.put(symbols)
                     current_symbols = set(symbols)
         await asyncio.sleep(SCREENER_REFRESH_SEC)
 
 async def on_trade_event(symbol, price, size, trade_time):
-    print(f"on_trade_event: {symbol}, price: {price}, size: {size}")
+    logger.debug(f"on_trade_event: {symbol}, price: {price}, size: {size}")
     candle_time = trade_time.replace(second=0, microsecond=0)
     last_time = trade_candle_last_time.get(symbol)
     trades = trade_candle_builders[symbol]
 
     if not isinstance(trades, (list, deque)):
-        print(f"[DEBUG] ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
+        logger.error(f"[DEBUG] ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
         trades = [trades]
         trade_candle_builders[symbol] = trades
 
@@ -459,12 +482,12 @@ RUG_PULL_DROP_PCT = -0.10
 RUG_PULL_BOUNCE_PCT = 0.05
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
-    print(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
+    logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
     if not is_market_scan_time() or close > PRICE_THRESHOLD:
         return
 
     if not isinstance(candles[symbol], deque):
-        print(f"[DEBUG] ERROR: candles[{symbol}] not deque. Found type: {type(candles[symbol])}. Value: {candles[symbol]}")
+        logger.error(f"[DEBUG] ERROR: candles[{symbol}] not deque. Found type: {type(candles[symbol])}. Value: {candles[symbol]}")
         candles[symbol] = deque([candles[symbol]], maxlen=3)
 
     candles[symbol].append({
@@ -619,7 +642,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 avg_trailing = sum(trailing_vols) / len(trailing_vols)
                 if avg_trailing > 0:
                     rvol = total_volume / avg_trailing
-                    print(f"{symbol} RVOL: {rvol}")
+                    logger.info(f"{symbol} RVOL: {rvol}")
                     if rvol < RVOL_MIN:
                         return
                 else:
@@ -629,7 +652,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         else:
             return
 
-        print(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
+        logger.debug(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
 
         if (
             c0["close"] < c1["close"] < c2["close"]
@@ -689,7 +712,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
 
 async def handle_halt_event(item):
-    print(f"[DEBUG] Halt event received: {item}")
+    logger.debug(f"[DEBUG] Halt event received: {item}")
     log_halt_event(item, reason="received")
 
     symbol = item.get("sym")
@@ -710,7 +733,7 @@ async def handle_halt_event(item):
                     snap = data.get("ticker", {})
                     price = snap.get("lastTrade", {}).get("p") or snap.get("day", {}).get("c")
         except Exception as e:
-            print(f"[DEBUG] [HALT ALERT] Could not get price for {symbol}: {e}")
+            logger.error(f"[DEBUG] [HALT ALERT] Could not get price for {symbol}: {e}")
             log_halt_event(item, reason=f"price_fetch_error: {e}")
 
     # PATCH: Allow halt alerts for price up to $20 (previously $10)
@@ -754,12 +777,12 @@ async def handle_halt_event(item):
         )
 
 async def send_scheduled_alerts():
-    print("send_scheduled_alerts started")
+    logger.info("send_scheduled_alerts started")
     sent_open_msg = False
     sent_close_msg = False
     sent_ebook_msg = False
     while True:
-        print("send_scheduled_alerts loop")
+        logger.debug("send_scheduled_alerts loop")
         now_utc = datetime.now(pytz.UTC)
         ny = pytz.timezone("America/New_York")
         now_ny = now_utc.astimezone(ny)
@@ -785,23 +808,23 @@ async def send_scheduled_alerts():
         await asyncio.sleep(30)
 
 def setup_signal_handlers(loop):
-    print("setup_signal_handlers called")
+    logger.info("setup_signal_handlers called")
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
 
 async def shutdown(loop, sig):
-    print(f"Received exit signal {sig.name}...")
+    logger.info(f"Received exit signal {sig.name}...")
     tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
     [task.cancel() for task in tasks]
     await asyncio.gather(*tasks, return_exceptions=True)
     loop.stop()
 
 async def trade_ws(symbol_queue):
-    print("trade_ws started")
+    logger.info("trade_ws started")
     subscribed_symbols = set()
     halt_subscribed = False
     while True:
-        print("trade_ws loop")
+        logger.debug("trade_ws loop")
         try:
             uri = "wss://socket.polygon.io/stocks"
             async with websockets.connect(uri, ping_interval=30, ping_timeout=10) as ws:
@@ -824,25 +847,25 @@ async def trade_ws(symbol_queue):
 
                 import traceback
                 async def ws_recv():
-                    print("ws_recv started")
+                    logger.debug("ws_recv started")
                     async for message in ws:
                         try:
-                            print("[DEBUG] RAW MESSAGE:", message)
+                            logger.debug(f"[DEBUG] RAW MESSAGE: {message}")
                             try:
                                 payload = json.loads(message)
                             except Exception:
-                                print("[DEBUG] Could not decode JSON:", message)
+                                logger.error(f"[DEBUG] Could not decode JSON: {message}")
                                 continue
                             if isinstance(payload, dict):
                                 payload = [payload]
                             elif isinstance(payload, list):
                                 pass
                             else:
-                                print("[DEBUG] Unexpected payload type:", type(payload), payload)
+                                logger.error(f"[DEBUG] Unexpected payload type: {type(payload)} {payload}")
                                 continue
                             for item in payload:
                                 if not isinstance(item, dict):
-                                    print("[DEBUG] Unexpected item type:", type(item), item)
+                                    logger.error(f"[DEBUG] Unexpected item type: {type(item)} {item}")
                                     continue
                                 ev = item.get("ev")
                                 if ev == "T":
@@ -855,14 +878,14 @@ async def trade_ws(symbol_queue):
                                 elif ev == "H":
                                     await handle_halt_event(item)
                                 else:
-                                    print("[DEBUG] Unknown event type:", ev, item)
+                                    logger.debug(f"[DEBUG] Unknown event type: {ev} {item}")
                         except Exception as e:
-                            print(f"[DEBUG] !!! ERROR processing WebSocket message: {e}")
-                            print(f"[DEBUG] Offending message: {message}")
+                            logger.error(f"[DEBUG] !!! ERROR processing WebSocket message: {e}")
+                            logger.error(f"[DEBUG] Offending message: {message}")
                             traceback.print_exc()
 
                 async def ws_symbols():
-                    print("ws_symbols started")
+                    logger.debug("ws_symbols started")
                     while True:
                         new_symbols = await symbol_queue.get()
                         to_unsubscribe = [s for s in subscribed_symbols if s not in new_symbols]
@@ -885,16 +908,16 @@ async def trade_ws(symbol_queue):
 
                 await asyncio.gather(ws_recv(), ws_symbols())
         except Exception as e:
-            print(f"[DEBUG] Trade WebSocket error: {e}. Reconnecting soon...")
+            logger.error(f"[DEBUG] Trade WebSocket error: {e}. Reconnecting soon...")
             await asyncio.sleep(5)
 
 async def main():
-    print("main() started.")
+    logger.info("main() started.")
     loop = asyncio.get_event_loop()
     setup_signal_handlers(loop)
     symbol_queue = asyncio.Queue()
     init_syms = await fetch_top_penny_symbols()
-    print(f"Initial symbols: {init_syms[:10]}... total: {len(init_syms)}")
+    logger.info(f"Initial symbols: {init_syms[:10]}... total: {len(init_syms)}")
     await symbol_queue.put(init_syms)
     await asyncio.gather(
         dynamic_symbol_manager(symbol_queue),
@@ -904,10 +927,10 @@ async def main():
     )
 
 if __name__ == "__main__":
-    print("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for price-moving stocks UP 5%+)...")
+    logger.info("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for price-moving stocks UP 5%+)...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
-        print(f"Bot stopped gracefully. Reason: {e}")
+        logger.info(f"Bot stopped gracefully. Reason: {e}")
     except Exception as e:
-        print(f"Top-level exception: {e}")
+        logger.error(f"Top-level exception: {e}")
