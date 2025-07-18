@@ -1,28 +1,26 @@
 import pandas as pd
 
-# Load your event log
+# Load event log (ensure sorted by symbol, then by time if available)
 df = pd.read_csv("event_log_labeled.csv")
 
-# Reset is_runner labels
+# Parameters
+PCT_THRESHOLD = 0.20  # 20% gain
+LOOKAHEAD_ROWS = 10   # How many rows to look ahead for a "runner"
+
+# Reset is_runner if you want to overwrite previous labels
 df['is_runner'] = 0
 
-# For each symbol, process in order to label runners:
-for symbol in df['symbol'].unique():
-    symbol_df = df[df['symbol'] == symbol].copy()
-    prev_price = None
-    prev_size = None
-    for idx in symbol_df.index:
-        price = df.loc[idx, 'price']
-        size = df.loc[idx, 'size']
-        if prev_price is not None and prev_size is not None:
-            # Calculate percent change from previous price for this symbol
-            price_pct_up = (price - prev_price) / prev_price if prev_price > 0 else 0
-            size_increasing = size >= prev_size
-            if price_pct_up >= 0.20 and size_increasing:
-                df.loc[idx, 'is_runner'] = 1
-        prev_price = price
-        prev_size = size
+# For each event, look ahead for a runner within LOOKAHEAD_ROWS for the same symbol
+for idx, row in df.iterrows():
+    symbol = row['symbol']
+    price = row['price']
 
-# Save the labeled file
+    # Find all future rows for the same symbol within the lookahead window
+    future_rows = df[(df.index > idx) & (df.index <= idx + LOOKAHEAD_ROWS) & (df['symbol'] == symbol)]
+    if not future_rows.empty:
+        max_future_price = future_rows['price'].max()
+        if max_future_price >= price * (1 + PCT_THRESHOLD):
+            df.at[idx, 'is_runner'] = 1
+
 df.to_csv("event_log_labeled.csv", index=False)
 print("Labeling complete. Check event_log_labeled.csv.")
