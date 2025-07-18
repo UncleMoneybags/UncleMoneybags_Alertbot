@@ -1,3 +1,39 @@
+print("scanner.py is running!!! --- If you see this, your file is found and started.")
+
+import asyncio
+import websockets
+import aiohttp
+import json
+import html
+import re
+from collections import deque, defaultdict
+from datetime import datetime, time, timezone, timedelta
+import pytz
+import signal
+
+# ==== ML & Logging Imports (INJECTED) ====
+import csv
+import os
+import joblib
+import numpy as np
+
+# ==== PATCH: Yahoo Finance Imports for Float Filtering ====
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    print("WARNING: yfinance not installed. Run 'pip install yfinance' for float filtering.")
+    YFINANCE_AVAILABLE = False
+
+print("Imports completed successfully.")
+
+# --- CONFIG ---
+POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
+TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
+TELEGRAM_CHAT_ID = "-1002266463234"
+PRICE_THRESHOLD = 10.00
+MAX_SYMBOLS = 400
+SCREENER_REFRESH_SEC = 60
 MIN_ALERT_MOVE = 0.15
 MIN_3MIN_VOLUME = 5000
 MIN_PER_CANDLE_VOL = 1000
@@ -233,6 +269,9 @@ async def news_alerts_task():
                         continue
 
                     for item in sorted(news_batch, key=lambda x: x.get('published_utc')):
+                        if item['id'] in news_seen:
+                            continue
+
                         headline = item.get('title', '')
                         summary = item.get('description', '')
                         tickers = item.get('tickers', [])
@@ -273,11 +312,13 @@ async def news_alerts_task():
 
                         headline_clean = escape_html(headline)
                         summary_clean = escape_html(summary)
+                        headline_bold = f"<b>{bold_keywords(headline_clean, KEYWORDS)}</b>"
+                        summary_it = f"<i>{bold_keywords(summary_clean, KEYWORDS)}</i>" if summary_clean else ""
 
-                        msg = f"📰 {tickers_str}\n{headline_clean}"
-                        if summary_clean:
-                            # PATCH: Use <i> instead of <small> for Telegram compatibility
-                            msg += f"\n\n<i>{summary_clean}</i>"
+                        msg = f"📰 {tickers_str}\n{headline_bold}"
+                        if summary_it:
+                            msg += f"\n\n{summary_it}"
+
                         url_ = item.get("article_url") or item.get("url")
                         if url_:
                             msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
@@ -870,4 +911,3 @@ if __name__ == "__main__":
         print(f"Bot stopped gracefully. Reason: {e}")
     except Exception as e:
         print(f"Top-level exception: {e}")
-
