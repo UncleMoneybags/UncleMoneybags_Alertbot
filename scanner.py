@@ -1,4 +1,11 @@
-print("scanner.py is running!!! --- If you see this, your file is found and started.")
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+logging.info("scanner.py is running! If you see this, your file is found and started.")
 
 import asyncio
 import websockets
