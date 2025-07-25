@@ -9,6 +9,7 @@ from collections import deque, defaultdict
 from datetime import datetime, time, timezone, timedelta
 import pytz
 import signal
+import pickle  # For persistent float cache
 
 # ==== ML & Logging Imports (INJECTED) ====
 import csv
@@ -163,7 +164,7 @@ trade_candle_builders = defaultdict(list)
 trade_candle_last_time = {}
 last_alerted_price = {}
 last_halt_alert = {}
-news_seen = load_news_seen()  # PATCH: Persist news_seen
+news_seen = load_news_seen()
 latest_news_time = None
 
 last_volume_spike_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
@@ -175,17 +176,51 @@ pending_breakout_alert = {}
 HALT_LOG_FILE = "halt_event_log.csv"
 
 alerted_symbols = set()
-
-# --- VWAP Streak tracking dictionaries ---
 below_vwap_streak = defaultdict(int)
 vwap_reclaimed_once = defaultdict(bool)
-
-# --- DIP PLAY tracking dictionaries ---
 dip_play_seen = set()
 recent_high = defaultdict(float)
 
+# ==== FLOAT CACHE ====
+FLOAT_CACHE_FILE = "float_cache.pkl"
+float_cache = {}
+
+def load_float_cache():
+    global float_cache
+    try:
+        with open(FLOAT_CACHE_FILE, "rb") as f:
+            float_cache = pickle.load(f)
+    except Exception:
+        float_cache = {}
+
+def save_float_cache():
+    try:
+        with open(FLOAT_CACHE_FILE, "wb") as f:
+            pickle.dump(float_cache, f)
+    except Exception as e:
+        logger.error(f"Failed to save float cache: {e}")
+
+load_float_cache()
+
+def get_float_shares(ticker):
+    if ticker in float_cache:
+        return float_cache[ticker]
+    if YFINANCE_AVAILABLE:
+        try:
+            info = yf.Ticker(ticker).info
+            float_shares = info.get('floatShares', None)
+            float_cache[ticker] = float_shares
+            save_float_cache()
+            return float_shares
+        except Exception as e:
+            logger.error(f"[DEBUG] Yahoo float error for {ticker}: {e}")
+            return None
+    return None
+
+import atexit
+atexit.register(save_float_cache)
+
 def log_halt_event(item, reason=None):
-    import csv, os
     row = {
         "symbol": item.get("sym"),
         "event_time": item.get("t"),
@@ -264,7 +299,6 @@ async def send_news_telegram_async(message):
                 logger.error(f"[DEBUG] Telegram send error (news): {e}")
                 return
 
-# PATCHED: News alerts only for tickers with float in range, and <small> -> <i>
 async def news_alerts_task():
     logger.info("news_alerts_task started")
     global news_seen, latest_news_time
@@ -304,19 +338,12 @@ async def news_alerts_task():
                         if not await is_under_20(tickers):
                             continue
 
-                        # PATCH: Yahoo Finance float filter for news
                         float_filter_pass = True
                         if YFINANCE_AVAILABLE and tickers:
                             for t in tickers:
-                                try:
-                                    info = yf.Ticker(t).info
-                                    float_shares = info.get('floatShares', None)
-                                    logger.debug(f"[DEBUG] {t}: float={float_shares}")
-                                    if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
-                                        float_filter_pass = False
-                                        break
-                                except Exception as e:
-                                    logger.error(f"[DEBUG] Yahoo float error for {t}: {e}")
+                                float_shares = get_float_shares(t)
+                                logger.debug(f"[DEBUG] {t}: float={float_shares}")
+                                if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
                                     float_filter_pass = False
                                     break
                         if not float_filter_pass:
@@ -346,7 +373,7 @@ async def news_alerts_task():
                             msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
 
                         news_seen.add(item['id'])
-                        save_news_id(item['id'])  # PATCH: Save news ID to file
+                        save_news_id(item['id'])
                         await send_news_telegram_async(msg)
                         await asyncio.sleep(3)
                     if most_recent:
@@ -383,7 +410,6 @@ async def is_recent_ipo(ticker):
             logger.error(f"[DEBUG] IPO check failed for {ticker}: {e}")
     return False
 
-# PATCHED: Screener only returns tickers with float in range
 async def fetch_top_penny_symbols():
     logger.info("fetch_top_penny_symbols called")
     penny_symbols = []
@@ -412,19 +438,9 @@ async def fetch_top_penny_symbols():
                         price = day["c"]
                     volume = day.get("v", 0)
                     if price is not None and 0 < price <= PRICE_THRESHOLD:
-                        # PATCH: Yahoo Finance float filter for screener
-                        float_filter_pass = True
-                        if YFINANCE_AVAILABLE:
-                            try:
-                                info = yf.Ticker(ticker).info
-                                float_shares = info.get('floatShares', None)
-                                logger.debug(f"[DEBUG] {ticker}: float={float_shares}")
-                                if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
-                                    float_filter_pass = False
-                            except Exception as e:
-                                logger.error(f"[DEBUG] Yahoo float error for {ticker}: {e}")
-                                float_filter_pass = False
-                        if not float_filter_pass:
+                        float_shares = get_float_shares(ticker)
+                        logger.debug(f"[DEBUG] {ticker}: float={float_shares}")
+                        if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
                             continue
                         penny_symbols.append(ticker)
                         if len(penny_symbols) >= MAX_SYMBOLS:
@@ -483,7 +499,7 @@ RUG_PULL_BOUNCE_PCT = 0.05
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
-    if not is_market_scan_time() or close > 20.00:  # PATCH: allow up to $20 for dip play
+    if not is_market_scan_time() or close > 20.00:
         return
 
     if not isinstance(candles[symbol], deque):
@@ -505,9 +521,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     candles_seq = candles[symbol]
 
-    # --- PATCH: Loosened Dip Play Criteria (10% drop, 2 higher lows/volumes, ≤ $20) ---
-    MIN_DIP_PCT = 0.10  # 10% drop
-    DIP_LOOKBACK = 10   # Look back 10 candles for high
+    MIN_DIP_PCT = 0.10
+    DIP_LOOKBACK = 10
 
     if len(candles_seq) >= DIP_LOOKBACK:
         highs = [c["high"] for c in list(candles_seq)[-DIP_LOOKBACK:]]
@@ -530,8 +545,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     await send_telegram_async(msg)
                     dip_play_seen.add(symbol)
 
-    # ... (rest of your original on_new_candle logic unchanged)
-    # [spike, runner, breakout, rvol, etc.]
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
@@ -688,9 +701,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 conf += 1
             conf = min(conf, 10)
 
-            # Only send alerts when confidence is 5 or higher
             if conf < 5:
-                return  # Skip low-confidence alerts
+                return
 
             msg = (
                 f"{emoji} {escape_html(symbol)} up ${move:.2f} ({pct_move*100:.1f}%) in 3 minutes.\n"
