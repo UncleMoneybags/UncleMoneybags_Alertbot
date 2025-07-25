@@ -788,7 +788,6 @@ async def fetch_top_premarket_gainers():
                     symbol = stock.get("ticker")
                     premarket = stock.get("preMarket", {})
                     premarket_price = premarket.get("p", None)
-                    premarket_change = premarket.get("c", None)
                     premarket_change_perc = premarket.get("cp", None)
                     premarket_volume = premarket.get("v", None)
                     if premarket_price and premarket_change_perc and premarket_volume:
@@ -971,7 +970,7 @@ async def main():
     )
 
 if __name__ == "__main__":
-    logger.info("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for pr[...]
+    logger.info("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for pre-market gainers etc).")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
