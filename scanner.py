@@ -688,6 +688,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 conf += 1
             conf = min(conf, 10)
 
+            # Only send alerts when confidence is 5 or higher
+            if conf < 5:
+                return  # Skip low-confidence alerts
+
             msg = (
                 f"{emoji} {escape_html(symbol)} up ${move:.2f} ({pct_move*100:.1f}%) in 3 minutes.\n"
                 f"Now ${c2['close']:.2f}. "
