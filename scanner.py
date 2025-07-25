@@ -776,6 +776,36 @@ async def handle_halt_event(item):
             f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
         )
 
+# ===== PATCH: Fetch Top 10 Pre-Market Gainers =====
+async def fetch_top_premarket_gainers():
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_API_KEY}&limit=25"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                gainers = []
+                for stock in data.get("tickers", []):
+                    symbol = stock.get("ticker")
+                    premarket = stock.get("preMarket", {})
+                    premarket_price = premarket.get("p", None)
+                    premarket_change = premarket.get("c", None)
+                    premarket_change_perc = premarket.get("cp", None)
+                    premarket_volume = premarket.get("v", None)
+                    if premarket_price and premarket_change_perc and premarket_volume:
+                        gainers.append({
+                            "symbol": symbol,
+                            "premarket_price": premarket_price,
+                            "premarket_change": premarket_change_perc,
+                            "volume": premarket_volume
+                        })
+                # Sort by premarket_change desc and take top 10
+                top_10 = sorted(gainers, key=lambda x: x["premarket_change"], reverse=True)[:10]
+                return top_10
+    except Exception as e:
+        logger.error(f"Failed to fetch premarket gainers: {e}")
+    return []
+
+# ===== PATCH: Enhanced Scheduled Alerts =====
 async def send_scheduled_alerts():
     logger.info("send_scheduled_alerts started")
     sent_open_msg = False
@@ -789,7 +819,21 @@ async def send_scheduled_alerts():
         weekday = now_ny.weekday()
         if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
             if not sent_open_msg:
-                await send_telegram_async("Market opens in 5 mins...secure the damn bag!")
+                # Fetch top pre-market gainers
+                gainers = await fetch_top_premarket_gainers()
+                if gainers:
+                    gainers_msg = "\n".join([
+                        f"{idx+1}. <b>{g['symbol']}</b> ${g['premarket_price']:.2f}  {g['premarket_change']:+.2f}%  Vol: {g['volume']:,}"
+                        for idx, g in enumerate(gainers)
+                    ])
+                    alert_msg = (
+                        "Market opens in 5 mins...secure the damn bag!\n\n"
+                        "<b>Top 10 Pre-Market Gainers:</b>\n"
+                        f"{gainers_msg}"
+                    )
+                else:
+                    alert_msg = "Market opens in 5 mins...secure the damn bag!\n\n(Pre-market gainer data unavailable.)"
+                await send_telegram_async(alert_msg)
                 sent_open_msg = True
         else:
             sent_open_msg = False
@@ -927,7 +971,7 @@ async def main():
     )
 
 if __name__ == "__main__":
-    logger.info("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for price-moving stocks UP 5%+)...")
+    logger.info("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for pr[...]
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
