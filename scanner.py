@@ -483,7 +483,7 @@ RUG_PULL_BOUNCE_PCT = 0.05
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
-    if not is_market_scan_time() or close > PRICE_THRESHOLD:
+    if not is_market_scan_time() or close > 20.00:  # PATCH: allow up to $20 for dip play
         return
 
     if not isinstance(candles[symbol], deque):
@@ -505,11 +505,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     candles_seq = candles[symbol]
 
-    # === VWAP RECLAIM ALERT REMOVED ===
-
-    # === DIP PLAY ALERT (Chart Down Emoji) ===
-    MIN_DIP_PCT = 0.15  # 15%
-    DIP_LOOKBACK = 20   # candles to look back for high
+    # --- PATCH: Loosened Dip Play Criteria (10% drop, 2 higher lows/volumes, ≤ $20) ---
+    MIN_DIP_PCT = 0.10  # 10% drop
+    DIP_LOOKBACK = 10   # Look back 10 candles for high
 
     if len(candles_seq) >= DIP_LOOKBACK:
         highs = [c["high"] for c in list(candles_seq)[-DIP_LOOKBACK:]]
@@ -518,15 +516,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     if recent_high[symbol] > 0:
         dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
-        if dip_pct >= MIN_DIP_PCT and symbol not in dip_play_seen:
-            if len(candles_seq) >= 4:
-                c1, c2, c3, c4 = list(candles_seq)[-4:]
-                higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"] and c4["low"] > c3["low"]
-                rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"] and c4["volume"] > c3["volume"]
+        if dip_pct >= MIN_DIP_PCT and symbol not in dip_play_seen and close <= 20.00:
+            if len(candles_seq) >= 3:
+                c1, c2, c3 = list(candles_seq)[-3:]
+                higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
+                rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
+                logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
                 if higher_lows and rising_volume:
                     msg = (
                         f"📉 {escape_html(symbol)} Dip Play: Dropped {dip_pct*100:.1f}% to ${close:.2f}, "
-                        f"3 higher lows with rising volume!"
+                        f"2 higher lows with rising volume!"
                     )
                     await send_telegram_async(msg)
                     dip_play_seen.add(symbol)
@@ -712,7 +711,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
 
 async def handle_halt_event(item):
-    logger.debug(f"[DEBUG] Halt event received: {item}")
+    logger.info(f"[HALT DEBUG] Received halt event: {item}")
     log_halt_event(item, reason="received")
 
     symbol = item.get("sym")
@@ -736,7 +735,7 @@ async def handle_halt_event(item):
             logger.error(f"[DEBUG] [HALT ALERT] Could not get price for {symbol}: {e}")
             log_halt_event(item, reason=f"price_fetch_error: {e}")
 
-    # PATCH: Allow halt alerts for price up to $20 (previously $10)
+    # PATCH: REQUIRED! Only alert for $20-and-under
     if price is None or price > 20.00 or price <= 0:
         log_halt_event(item, reason=f"price_above_threshold: {price}")
         return
