@@ -16,6 +16,8 @@ import joblib
 import numpy as np
 import atexit
 import sys  # for platform check
+import requests
+from bs4 import BeautifulSoup
 
 float_cache = {}
 
