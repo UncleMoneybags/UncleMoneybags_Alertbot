@@ -12,7 +12,13 @@ import signal
 import pickle
 import csv
 import os
+<<<<<<< HEAD
 import joblib
+import numpy as np
+import atexit
+
+=======
+import joblib      # <-- already here!
 import numpy as np
 import atexit
 
