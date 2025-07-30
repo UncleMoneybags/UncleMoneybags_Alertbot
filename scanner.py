@@ -606,22 +606,22 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "spike_time": start_time,
             }
 
-    if symbol in pending_breakout_alert:
-        candidate = pending_breakout_alert[symbol]
-        seconds = (start_time - candidate["breakout_time"]).total_seconds()
-        MIN_CONFIRM_VOL = 10000
-        if seconds == 60:
-            if (
-                close >= candidate["breakout_close"] and
-                volume >= MIN_CONFIRM_VOL and
-                high > candidate["breakout_close"]
-            ):
-               msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
-                await send_telegram_async(msg)
-                alerted_symbols.add(symbol)
-            del pending_breakout_alert[symbol]
-        elif seconds > 60:
-            del pending_breakout_alert[symbol]
+   if symbol in pending_breakout_alert:
+    candidate = pending_breakout_alert[symbol]
+    seconds = (start_time - candidate["breakout_time"]).total_seconds()
+    MIN_CONFIRM_VOL = 10000
+    if seconds == 60:
+        if (
+            close >= candidate["breakout_close"] and
+            volume >= MIN_CONFIRM_VOL and
+            high > candidate["breakout_close"]
+        ):
+            msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
+            await send_telegram_async(msg)
+            alerted_symbols.add(symbol)
+        del pending_breakout_alert[symbol]
+    elif seconds > 60:
+        del pending_breakout_alert[symbol]
 
     if symbol in pending_runner_alert:
         candidate = pending_runner_alert[symbol]
