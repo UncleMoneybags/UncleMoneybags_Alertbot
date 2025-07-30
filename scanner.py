@@ -17,6 +17,45 @@ import numpy as np
 import atexit
 import sys  # for platform check
 
+float_cache = {}
+
+def save_float_cache():
+    with open("float_cache.pkl", "wb") as f:
+        pickle.dump(float_cache, f)
+    print(f"[DEBUG] Saved float cache, entries: {len(float_cache)}")
+
+def load_float_cache():
+    global float_cache
+    if os.path.exists("float_cache.pkl"):
+        with open("float_cache.pkl", "rb") as f:
+            float_cache = pickle.load(f)
+        print(f"[DEBUG] Loaded float cache, entries: {len(float_cache)}")
+    else:
+        float_cache = {}
+        print(f"[DEBUG] No float cache found, starting new.")
+
+def get_float_shares(ticker):
+    if ticker in float_cache:
+        print(f"[DEBUG] Cache HIT for {ticker}: {float_cache[ticker]}")
+        return float_cache[ticker]
+    print(f"[DEBUG] Cache MISS for {ticker}")
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        float_shares = info.get('floatShares', None)
+        float_cache[ticker] = float_shares
+        save_float_cache()
+        print(f"[DEBUG] Cached float for {ticker}: {float_shares}")
+        return float_shares
+    except Exception as e:
+        float_cache[ticker] = None
+        save_float_cache()
+        print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
+        return None
+
+# Load cache at the start!
+load_float_cache()
+
 # ==== NEWS SEEN PERSISTENCE ====
 NEWS_SEEN_FILE = "news_seen.txt"
 
