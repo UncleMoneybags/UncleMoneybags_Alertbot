@@ -9,13 +9,12 @@ from collections import deque, defaultdict
 from datetime import datetime, time, timezone, timedelta
 import pytz
 import signal
-import pickle  # For persistent float cache
-
-# ==== ML & Logging Imports (INJECTED) ====
+import pickle
 import csv
 import os
 import joblib
 import numpy as np
+import atexit
 
 # ==== NEWS SEEN PERSISTENCE ====
 NEWS_SEEN_FILE = "news_seen.txt"
@@ -65,13 +64,11 @@ ALERT_PRICE_DELTA = 0.25
 RVOL_SPIKE_THRESHOLD = 2.5
 RVOL_SPIKE_MIN_VOLUME = 25000
 
-# PATCH: Float filter config for both screener and news
 MIN_FLOAT_SHARES = 500_000
 MAX_FLOAT_SHARES = 10_000_000
 
 vwap_cum_vol = defaultdict(float)
 vwap_cum_pv = defaultdict(float)
-
 rvol_history = defaultdict(lambda: deque(maxlen=20))
 RVOL_MIN = 2.0
 
@@ -203,6 +200,7 @@ def save_float_cache():
         logger.error(f"Failed to save float cache: {e}")
 
 load_float_cache()
+atexit.register(save_float_cache)
 
 def get_float_shares(ticker):
     if ticker in float_cache:
@@ -218,9 +216,6 @@ def get_float_shares(ticker):
             logger.error(f"[DEBUG] Yahoo float error for {ticker}: {e}")
             return None
     return None
-
-import atexit
-atexit.register(save_float_cache)
 
 def log_halt_event(item, reason=None):
     row = {
@@ -557,6 +552,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
                     await send_telegram_async(rug_msg)
 
+    # Breakout/runner alert logic
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
     DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
@@ -606,22 +602,23 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "spike_time": start_time,
             }
 
-   if symbol in pending_breakout_alert:
-    candidate = pending_breakout_alert[symbol]
-    seconds = (start_time - candidate["breakout_time"]).total_seconds()
-    MIN_CONFIRM_VOL = 10000
-    if seconds == 60:
-        if (
-            close >= candidate["breakout_close"] and
-            volume >= MIN_CONFIRM_VOL and
-            high > candidate["breakout_close"]
-        ):
-            msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
-            await send_telegram_async(msg)
-            alerted_symbols.add(symbol)
-        del pending_breakout_alert[symbol]
-    elif seconds > 60:
-        del pending_breakout_alert[symbol]
+    # ---- Fixed indentation for breakout/runner confirm logic ----
+    if symbol in pending_breakout_alert:
+        candidate = pending_breakout_alert[symbol]
+        seconds = (start_time - candidate["breakout_time"]).total_seconds()
+        MIN_CONFIRM_VOL = 10000
+        if seconds == 60:
+            if (
+                close >= candidate["breakout_close"] and
+                volume >= MIN_CONFIRM_VOL and
+                high > candidate["breakout_close"]
+            ):
+                msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
+                await send_telegram_async(msg)
+                alerted_symbols.add(symbol)
+            del pending_breakout_alert[symbol]
+        elif seconds > 60:
+            del pending_breakout_alert[symbol]
 
     if symbol in pending_runner_alert:
         candidate = pending_runner_alert[symbol]
@@ -642,110 +639,100 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
 
-  if len(candles_seq) == 3:
-    c0, c1, c2 = list(candles_seq)
-    total_volume = c0["volume"] + c1["volume"] + c2["volume"]
+    if len(candles_seq) == 3:
+        c0, c1, c2 = list(candles_seq)
+        total_volume = c0["volume"] + c1["volume"] + c2["volume"]
 
-    rvol_history[symbol].append(total_volume)
-    rvol_hist_seq = rvol_history[symbol]
-    if not isinstance(rvol_hist_seq, (list, deque)):
-        rvol_hist_seq = list(rvol_hist_seq)
-    if len(rvol_hist_seq) >= 5:
-        trailing_vols = list(rvol_hist_seq)[:-1]
-        if trailing_vols:
-            avg_trailing = sum(trailing_vols) / len(trailing_vols)
-            if avg_trailing > 0:
-                rvol = total_volume / avg_trailing
-                logger.info(f"{symbol} RVOL: {rvol}")
+        rvol_history[symbol].append(total_volume)
+        rvol_hist_seq = rvol_history[symbol]
+        if not isinstance(rvol_hist_seq, (list, deque)):
+            rvol_hist_seq = list(rvol_hist_seq)
+        if len(rvol_hist_seq) >= 5:
+            trailing_vols = list(rvol_hist_seq)[:-1]
+            if trailing_vols:
+                avg_trailing = sum(trailing_vols) / len(trailing_vols)
+                if avg_trailing > 0:
+                    rvol = total_volume / avg_trailing
+                    logger.info(f"{symbol} RVOL: {rvol}")
 
-                # --- RVOL SPIKE ALERT ---
-                if rvol >= RVOL_SPIKE_THRESHOLD and total_volume >= RVOL_SPIKE_MIN_VOLUME:
-                    msg = (
-                       msg = (
-    f"🚨 {escape_html(symbol)} Volume Spike! "
-    f"Price=${c2['close']:.2f}"
-)
-                    )
-                    await send_telegram_async(msg)
-                    alerted_symbols.add(symbol)
+                    # --- RVOL SPIKE ALERT ---
+                    if rvol >= RVOL_SPIKE_THRESHOLD and total_volume >= RVOL_SPIKE_MIN_VOLUME:
+                        msg = (
+                            f"🚨 {escape_html(symbol)} Volume Spike! "
+                            f"Price=${c2['close']:.2f}"
+                        )
+                        await send_telegram_async(msg)
+                        alerted_symbols.add(symbol)
 
-                if rvol < RVOL_MIN:
-                    return
-    
-
-                    
                     if rvol < RVOL_MIN:
                         return
                 else:
                     return
             else:
                 return
-        else:
-            return
 
-        logger.debug(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
+            logger.debug(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
 
-        if (
-            c0["close"] < c1["close"] < c2["close"]
-            and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
-            and total_volume >= MIN_3MIN_VOLUME
-            and c0["volume"] >= MIN_PER_CANDLE_VOL
-            and c1["volume"] >= MIN_PER_CANDLE_VOL
-            and c2["volume"] >= MIN_PER_CANDLE_VOL
-        ):
-            move = c2["close"] - c0["close"]
-            prev_price = last_alerted_price.get(symbol)
-            if prev_price is not None and (c2["close"] - prev_price) < ALERT_PRICE_DELTA:
-                return
-            emoji = "🚨" if prev_price is None else "💰"
-            last_alerted_price[symbol] = c2["close"]
+            if (
+                c0["close"] < c1["close"] < c2["close"]
+                and (c2["close"] - c0["close"]) >= MIN_ALERT_MOVE
+                and total_volume >= MIN_3MIN_VOLUME
+                and c0["volume"] >= MIN_PER_CANDLE_VOL
+                and c1["volume"] >= MIN_PER_CANDLE_VOL
+                and c2["volume"] >= MIN_PER_CANDLE_VOL
+            ):
+                move = c2["close"] - c0["close"]
+                prev_price = last_alerted_price.get(symbol)
+                if prev_price is not None and (c2["close"] - prev_price) < ALERT_PRICE_DELTA:
+                    return
+                emoji = "🚨" if prev_price is None else "💰"
+                last_alerted_price[symbol] = c2["close"]
 
-            pct_move = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
+                pct_move = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
 
-            conf = 1
-            if 'rvol' in locals():
-                if rvol >= 5:
+                conf = 1
+                if 'rvol' in locals():
+                    if rvol >= 5:
+                        conf += 2
+                    elif rvol >= 3:
+                        conf += 1
+                if pct_move >= 0.10:
                     conf += 2
-                elif rvol >= 3:
+                elif pct_move >= 0.05:
                     conf += 1
-            if pct_move >= 0.10:
-                conf += 2
-            elif pct_move >= 0.05:
-                conf += 1
-            if move >= 0.50:
-                conf += 2
-            elif move >= 0.30:
-                conf += 1
-            if min(c0["volume"], c1["volume"], c2["volume"]) >= 10000:
-                conf += 1
-            conf = min(conf, 10)
+                if move >= 0.50:
+                    conf += 2
+                elif move >= 0.30:
+                    conf += 1
+                if min(c0["volume"], c1["volume"], c2["volume"]) >= 10000:
+                    conf += 1
+                conf = min(conf, 10)
 
-            if conf < 5:
-                return
+                if conf < 5:
+                    return
 
-            msg = (
-               msg = (
-    f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
-    f"Now ${c2['close']:.2f}. "
-    f"<b>Confidence: {conf}/10</b>"
-)
-    
-            await send_telegram_async(msg)
-            alerted_symbols.add(symbol)
-
-            log_event(
-                event_type="spike",
-                symbol=symbol,
-                price=c2["close"],
-                volume=total_volume,
-                event_time=start_time,
-                extra_features={"rvol": rvol if 'rvol' in locals() else None, "prepost": 0}
-            )
-            ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
-            if ml_prob > 0.7:
-                await send_telegram_async(
-                    f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+                msg = (
+                    f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
+                    f"Now ${c2['close']:.2f}. "
+                    f"<b>Confidence: {conf}/10</b>"
                 )
+
+                await send_telegram_async(msg)
+                alerted_symbols.add(symbol)
+
+                log_event(
+                    event_type="spike",
+                    symbol=symbol,
+                    price=c2["close"],
+                    volume=total_volume,
+                    event_time=start_time,
+                    extra_features={"rvol": rvol if 'rvol' in locals() else None, "prepost": 0}
+                )
+                ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
+                if ml_prob > 0.7:
+                    await send_telegram_async(
+                        f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+                    )
 
 async def handle_halt_event(item):
     logger.info(f"[HALT DEBUG] Received halt event: {item}")
@@ -812,7 +799,6 @@ async def handle_halt_event(item):
             f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
         )
 
-# ===== PATCH: Fetch Top 10 Pre-Market Gainers =====
 async def fetch_top_premarket_gainers():
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_API_KEY}&limit=25"
     try:
@@ -833,14 +819,12 @@ async def fetch_top_premarket_gainers():
                             "premarket_change": premarket_change_perc,
                             "volume": premarket_volume
                         })
-                # Sort by premarket_change desc and take top 10
                 top_10 = sorted(gainers, key=lambda x: x["premarket_change"], reverse=True)[:10]
                 return top_10
     except Exception as e:
         logger.error(f"Failed to fetch premarket gainers: {e}")
     return []
 
-# ===== PATCH: Enhanced Scheduled Alerts =====
 async def send_scheduled_alerts():
     logger.info("send_scheduled_alerts started")
     sent_open_msg = False
@@ -854,7 +838,6 @@ async def send_scheduled_alerts():
         weekday = now_ny.weekday()
         if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
             if not sent_open_msg:
-                # Fetch top pre-market gainers
                 gainers = await fetch_top_premarket_gainers()
                 if gainers:
                     gainers_msg = "\n".join([
