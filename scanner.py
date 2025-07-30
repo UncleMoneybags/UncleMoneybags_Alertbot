@@ -629,7 +629,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             del pending_runner_alert[symbol]
 
     # --- RVOL SPIKE ALERT (with price move filter, only if no breakout/runner this run) ---
-    MIN_PRICE_MOVE_PCT = 0.08  # 4% minimum price move required
+    MIN_PRICE_MOVE_PCT = 0.08  # 8% minimum price move required
 
     if len(candles_seq) == 3:
         c0, c1, c2 = list(candles_seq)
