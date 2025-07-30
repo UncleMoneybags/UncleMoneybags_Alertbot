@@ -642,21 +642,37 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
 
-    if len(candles_seq) == 3:
-        c0, c1, c2 = list(candles_seq)
-        total_volume = c0["volume"] + c1["volume"] + c2["volume"]
+  if len(candles_seq) == 3:
+    c0, c1, c2 = list(candles_seq)
+    total_volume = c0["volume"] + c1["volume"] + c2["volume"]
 
-        rvol_history[symbol].append(total_volume)
-        rvol_hist_seq = rvol_history[symbol]
-        if not isinstance(rvol_hist_seq, (list, deque)):
-            rvol_hist_seq = list(rvol_hist_seq)
-        if len(rvol_hist_seq) >= 5:
-            trailing_vols = list(rvol_hist_seq)[:-1]
-            if trailing_vols:
-                avg_trailing = sum(trailing_vols) / len(trailing_vols)
-                if avg_trailing > 0:
-                    rvol = total_volume / avg_trailing
-                    logger.info(f"{symbol} RVOL: {rvol}")
+    rvol_history[symbol].append(total_volume)
+    rvol_hist_seq = rvol_history[symbol]
+    if not isinstance(rvol_hist_seq, (list, deque)):
+        rvol_hist_seq = list(rvol_hist_seq)
+    if len(rvol_hist_seq) >= 5:
+        trailing_vols = list(rvol_hist_seq)[:-1]
+        if trailing_vols:
+            avg_trailing = sum(trailing_vols) / len(trailing_vols)
+            if avg_trailing > 0:
+                rvol = total_volume / avg_trailing
+                logger.info(f"{symbol} RVOL: {rvol}")
+
+                # --- RVOL SPIKE ALERT ---
+                if rvol >= RVOL_SPIKE_THRESHOLD and total_volume >= RVOL_SPIKE_MIN_VOLUME:
+                    msg = (
+                        f"🚨 {escape_html(symbol)} RVOL spike! "
+                        f"RVOL={rvol:.2f}, Vol={total_volume:,}, "
+                        f"Price=${c2['close']:.2f}"
+                    )
+                    await send_telegram_async(msg)
+                    alerted_symbols.add(symbol)
+
+                if rvol < RVOL_MIN:
+                    return
+    
+
+                    
                     if rvol < RVOL_MIN:
                         return
                 else:
