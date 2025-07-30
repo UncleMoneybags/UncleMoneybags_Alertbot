@@ -616,7 +616,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 volume >= MIN_CONFIRM_VOL and
                 high > candidate["breakout_close"]
             ):
-                msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f} (vol {volume:,})"
+               msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
                 await send_telegram_async(msg)
                 alerted_symbols.add(symbol)
             del pending_breakout_alert[symbol]
@@ -661,9 +661,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 # --- RVOL SPIKE ALERT ---
                 if rvol >= RVOL_SPIKE_THRESHOLD and total_volume >= RVOL_SPIKE_MIN_VOLUME:
                     msg = (
-                        f"🚨 {escape_html(symbol)} RVOL spike! "
-                        f"RVOL={rvol:.2f}, Vol={total_volume:,}, "
-                        f"Price=${c2['close']:.2f}"
+                       msg = (
+    f"🚨 {escape_html(symbol)} Volume Spike! "
+    f"Price=${c2['close']:.2f}"
+)
                     )
                     await send_telegram_async(msg)
                     alerted_symbols.add(symbol)
@@ -723,10 +724,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
 
             msg = (
-                f"{emoji} {escape_html(symbol)} up ${move:.2f} ({pct_move*100:.1f}%) in 3 minutes.\n"
-                f"Now ${c2['close']:.2f}. "
-                f"<b>Confidence: {conf}/10</b>"
-            )
+               msg = (
+    f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
+    f"Now ${c2['close']:.2f}. "
+    f"<b>Confidence: {conf}/10</b>"
+)
+    
             await send_telegram_async(msg)
             alerted_symbols.add(symbol)
 
