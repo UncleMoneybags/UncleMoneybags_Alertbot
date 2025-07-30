@@ -12,9 +12,12 @@ import signal
 import pickle
 import csv
 import os
-import joblib
+import joblib      # <-- already here!
 import numpy as np
 import atexit
+
+# ==== LOAD YOUR ML MODEL ====
+model = joblib.load('runner_model.joblib')
 
 # ==== NEWS SEEN PERSISTENCE ====
 NEWS_SEEN_FILE = "news_seen.txt"
