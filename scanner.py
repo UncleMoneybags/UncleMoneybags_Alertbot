@@ -842,7 +842,7 @@ async def send_scheduled_alerts():
         if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
             if not sent_open_msg:
                 gainers = await fetch_top_premarket_gainers()
-                if gainers:
+                if gainers and len(gainers) > 0:
                     gainers_msg = "\n".join([
                         f"{idx+1}. <b>{g['symbol']}</b> ${g['premarket_price']:.2f}  {g['premarket_change']:+.2f}%  Vol: {g['volume']:,}"
                         for idx, g in enumerate(gainers)
