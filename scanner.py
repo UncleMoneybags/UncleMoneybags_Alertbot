@@ -685,6 +685,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
 
+   # ...inside your on_new_candle function, find the RVOL SPIKE ALERT section and REPLACE IT with the following block:
+
+    # --- RVOL SPIKE ALERT (with price move filter) ---
+    MIN_PRICE_MOVE_PCT = 0.04  # 4% minimum price move required
+
     if len(candles_seq) == 3:
         c0, c1, c2 = list(candles_seq)
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
@@ -701,11 +706,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     rvol = total_volume / avg_trailing
                     logger.info(f"{symbol} RVOL: {rvol}")
 
-                    # --- RVOL SPIKE ALERT ---
-                    if rvol >= RVOL_SPIKE_THRESHOLD and total_volume >= RVOL_SPIKE_MIN_VOLUME:
+                    # --- RVOL SPIKE ALERT with price move filter ---
+                    price_move_pct = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
+
+                    if (
+                        rvol >= RVOL_SPIKE_THRESHOLD and
+                        total_volume >= RVOL_SPIKE_MIN_VOLUME and
+                        price_move_pct >= MIN_PRICE_MOVE_PCT
+                    ):
                         msg = (
                             f"🚨 {escape_html(symbol)} Volume Spike! "
-                            f"Price=${c2['close']:.2f}"
+                            f"Price=${c2['close']:.2f} (+{price_move_pct*100:.1f}%)"
                         )
                         await send_telegram_async(msg)
                         alerted_symbols.add(symbol)
@@ -718,6 +729,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
 
             logger.debug(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
+            
+            # ...[rest of your 3-min move/confidence alert logic continues here]...
 
             if (
                 c0["close"] < c1["close"] < c2["close"]
