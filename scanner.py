@@ -544,10 +544,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     await send_telegram_async(rug_msg)
 
     # Breakout/runner alert logic
-    DUAL_MIN_1M_PRICE_MOVE_PCT = 0.02
+    DUAL_MIN_1M_PRICE_MOVE_PCT = 0.05  # PATCHED: was 0.02, now 5%
     DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
     DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
-    PRE_BREAKOUT_DIST_PCT = 0.02
+    PRE_BREAKOUT_DIST_PCT = 0.05  # PATCHED: was 0.02, now 0.05 (to match 5% min move)
     PRE_BREAKOUT_DIST_ABS = 0.05
     VOLUME_SPIKE_MULTIPLIER = 2.5
     VOLUME_SPIKE_MIN = 5000
@@ -658,7 +658,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     ):
                         msg = (
                             f"🚨 {escape_html(symbol)} Volume Spike! "
-                            f"Price=${c2['close']:.2f} (+{price_move_pct*100:.1f}%)"
+                            f"Price=${c2['close']:.2f}"
                         )
                         await send_telegram_async(msg)
                         alerted_symbols.add(symbol)
