@@ -1,4 +1,4 @@
-symbol,price,size,is_runner
+price,volume,rvol,prepost,event_type_code,is_runner
 BTOG,0.355,50.0,0
 BTOG,0.3599,50.0,0
 SYTA,4.2,10.0,0
