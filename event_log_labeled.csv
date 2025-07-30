@@ -1,0 +1,116 @@
+timestamp,symbol,price,alert_type,note
+2025-07-14T04:10:00,BTCT,4.71,runner_warmup,within 0.01 of high
+2025-07-14T04:11:00,YHC,4.86,runner_warmup,within 0.05 of high
+2025-07-14T04:12:00,FTFT,2.94,breakout,NEW HIGH
+2025-07-14T04:13:00,BTCM,5.30,runner_warmup,within 0.05 of high
+2025-07-14T04:13:00,SNTI,2.95,runner_warmup,within 0.01 of high
+2025-07-14T04:15:00,TDTH,0.48,runner_warmup,within 0.03 of high
+2025-07-14T04:16:00,BTCM,5.82,move_up_3min,up $0.59 (11.3%) in 3 minutes. Confidence: 7/10
+2025-07-14T04:19:00,BTCM,6.12,move_up_3min,up $0.45 (7.8%) in 3 minutes. Confidence: 5/10
+2025-07-14T04:19:00,HCTI,0.02,breakout,NEW HIGH
+2025-07-14T04:23:00,SQNS,5.43,runner_warmup,within 0.04 of high
+2025-07-14T04:31:00,SNTI,2.93,runner_warmup,within 0.02 of high
+2025-07-14T04:32:00,SNTI,2.96,move_up_3min,up $0.16 (5.5%) in 3 minutes. Confidence: 3/10
+2025-07-14T04:36:00,GIBO,0.04,breakout,NEW HIGH
+2025-07-14T04:43:00,BTCM,6.02,runner_warmup,within 0.01 of high
+2025-07-14T04:48:00,BDSX,0.31,breakout,NEW HIGH
+2025-07-14T04:50:00,EHGO,0.87,breakout,NEW HIGH
+2025-07-14T04:54:00,SQNS,5.41,runner_warmup,within 0.01 of high
+2025-07-14T05:12:00,SQFT,8.68,runner_warmup,within 0.05 of high
+2025-07-14T05:13:00,YHC,3.64,move_up_3min,up $0.17 (4.9%) in 3 minutes. Confidence: 3/10
+2025-07-14T05:39:00,DVLT,0.85,runner_warmup,within 0.00 of high
+2025-07-14T05:47:00,OMEX,1.29,breakout,NEW HIGH
+2025-07-14T05:58:00,IXHL,0.26,runner_warmup,within 0.00 of high
+2025-07-14T06:01:00,SONN,8.86,runner_warmup,within 0.04 of high
+2025-07-14T06:04:00,ENTO,0.46,breakout,NEW HIGH
+2025-07-14T06:05:00,GOSS,1.40,runner_warmup,within 0.02 of high
+2025-07-14T06:16:00,SGN,2.08,breakout,NEW HIGH
+2025-07-14T06:23:00,SQNS,5.40,breakout,NEW HIGH
+2025-07-14T06:30:00,SQFT,7.99,move_up_3min,up $0.86 (12.1%) in 3 minutes. Confidence: 6/10
+2025-07-14T06:31:00,SQFT,9.28,runner_warmup,within 0.07 of high
+2025-07-14T06:31:00,SQFT,9.28,move_up_3min,up $1.85 (24.9%) in 3 minutes. Confidence: 8/10
+2025-07-14T06:33:00,BTCS,5.16,runner_warmup,within 0.05 of high
+2025-07-14T06:33:00,BTCS,5.16,move_up_3min,up $0.48 (10.3%) in 3 minutes. Confidence: 6/10
+2025-07-14T06:43:00,DEFT,3.56,breakout,NEW HIGH
+2025-07-14T06:43:00,DEFT,3.56,move_up_3min,up $0.19 (5.6%) in 3 minutes. Confidence: 4/10
+2025-07-14T06:50:00,DEFT,3.63,runner_warmup,within 0.06 of high
+2025-07-14T06:50:00,SQFT,9.89,move_up_3min,up $0.67 (7.3%) in 3 minutes. Confidence: 6/10
+2025-07-14T06:52:00,YHC,5.14,breakout,NEW HIGH
+2025-07-14T06:52:00,YHC,5.14,move_up_3min,up $1.26 (32.5%) in 3 minutes. Confidence: 8/10
+2025-07-14T06:56:00,SQFT,8.79,runner_warmup,within 0.16 of high
+2025-07-14T06:57:00,SQNS,5.78,runner_warmup,within 0.01 of high
+2025-07-14T06:59:00,BTBT,3.51,breakout,NEW HIGH
+2025-07-14T07:01:00,CGTX,0.56,breakout,NEW HIGH
+2025-07-14T07:08:00,ABVE,3.01,runner_warmup,within 0.04 of high
+2025-07-14T07:09:00,ABVE,3.10,move_up_3min,up $0.19 (6.5%) in 3 minutes. Confidence: 4/10
+2025-07-14T07:27:00,YHC,4.38,runner_warmup,within 0.02 of high
+2025-07-14T07:29:00,IXHL,0.25,runner_warmup,within 0.00 of high
+2025-07-14T07:31:00,DVLT,0.81,runner_warmup,within 0.02 of high
+2025-07-14T07:40:00,IBG,0.59,runner_warmup,within 0.02 of high
+2025-07-14T07:45:00,ABVE,2.97,breakout,NEW HIGH
+2025-07-14T07:48:00,AIFF,3.78,move_up_3min,up $0.44 (13.2%) in 3 minutes. Confidence: 7/10
+2025-07-14T07:48:00,DEFT,3.57,runner_warmup,within 0.02 of high
+2025-07-14T07:53:00,OGEN,1.52,breakout,NEW HIGH
+2025-07-14T07:54:00,AIFF,4.38,move_up_3min,up $0.71 (19.3%) in 3 minutes. Confidence: 7/10
+2025-07-14T08:01:00,TSLZ,1.64,breakout,NEW HIGH
+2025-07-14T08:01:00,CLDI,0.72,runner_warmup,within 0.01 of high
+2025-07-14T08:01:00,SGN,2.21,runner_warmup,within 0.03 of high
+2025-07-14T08:01:00,LGHL,4.13,runner_warmup,within 0.04 of high
+2025-07-14T08:01:00,NVVE,1.09,runner_warmup,within 0.01 of high
+2025-07-14T08:01:00,CGBS,0.07,runner_warmup,within 0.00 of high
+2025-07-14T08:01:00,HCTI,0.02,runner_warmup,within 0.00 of high
+2025-07-14T08:01:00,CTM,1.19,runner_warmup,within 0.01 of high
+2025-07-14T08:01:00,NAK,2.22,breakout,NEW HIGH
+2025-07-14T08:02:00,YAAS,0.43,runner_warmup,within 0.01 of high
+2025-07-14T08:02:00,GAME,1.88,runner_warmup,within 0.04 of high
+2025-07-14T08:02:00,JYD,0.19,runner_warmup,within 0.01 of high
+2025-07-14T08:03:00,NXTT,2.78,breakout,NEW HIGH
+2025-07-14T08:04:00,SAFX,2.04,breakout,NEW HIGH
+2025-07-14T08:05:00,INDO,3.13,runner_warmup,within 0.03 of high
+2025-07-14T08:06:00,DHAI,0.26,runner_warmup,within 0.01 of high
+2025-07-14T08:06:00,NCL,0.18,runner_warmup,within 0.00 of high
+2025-07-14T08:06:00,ALBT,2.86,runner_warmup,within 0.01 of high
+2025-07-14T08:07:00,CANG,5.88,breakout,NEW HIGH
+2025-07-14T08:10:00,ATXG,0.69,breakout,NEW HIGH
+2025-07-14T08:11:00,INTS,0.35,breakout,NEW HIGH
+2025-07-14T08:16:00,ZENA,5.36,move_up_3min,up $0.20 (3.8%) in 3 minutes. Confidence: 3/10
+2025-07-14T08:23:00,FTFT,3.00,breakout,NEW HIGH
+2025-07-14T08:24:00,SDST,0.42,runner_warmup,within 0.01 of high
+2025-07-14T08:27:00,GTI,0.08,breakout,NEW HIGH
+2025-07-14T08:31:00,GNLN,3.28,breakout,NEW HIGH
+2025-07-14T08:35:00,AZI,0.29,breakout,NEW HIGH
+2025-07-14T08:36:00,GNLN,3.37,runner_warmup,within 0.03 of high
+2025-07-14T08:40:00,BTCT,4.65,move_up_3min,up $0.16 (3.6%) in 3 minutes. Confidence: 2/10
+2025-07-14T08:45:00,SDST,0.55,runner_warmup,within 0.00 of high
+2025-07-14T08:54:00,GNLN,3.39,move_up_3min,up $0.36 (11.9%) in 3 minutes. Confidence: 6/10
+2025-07-14T09:09:00,BTCM,5.34,runner_warmup,
+2025-07-14T09:25:00,VSEE,1.59,breakout,NEW HIGH
+2025-07-14T09:26:00,LAES,3.60,breakout,NEW HIGH
+2025-07-14T09:31:00,QS,9.32,runner_warmup,
+2025-07-14T09:31:00,QS,9.32,move_up_3min,up $0.23 (2.6%) in 3 minutes. Confidence: 3/10
+2025-07-14T09:31:00,ALBT,3.03,runner_warmup,
+2025-07-14T09:31:00,EOSE,4.73,breakout,NEW HIGH
+2025-07-14T09:31:00,BBAI,6.37,runner_warmup,
+2025-07-14T09:31:00,SY,4.30,runner_warmup,
+2025-07-14T09:31:00,BTMD,4.17,runner_warmup,
+2025-07-14T09:31:00,QSG,9.11,runner_warmup,
+2025-07-14T09:31:00,MODV,3.30,runner_warmup,
+2025-07-14T09:31:00,CASK,0.59,breakout,NEW HIGH
+2025-07-14T15:58:00,YHC,4.77,breakout,
+2025-07-14T15:59:00,CCCC,2.38,breakout,
+2025-07-14T16:00:00,SONN,9.55,move_up_3min,up $0.39 (4.3%) in 3 minutes. Confidence: 4/10
+2025-07-14T16:01:00,SONN,9.56,runner_warmup,
+2025-07-14T16:04:00,TMQ,1.83,breakout,
+2025-07-14T16:07:00,MAMK,3.23,move_up_3min,up $0.16 (5.2%) in 3 minutes. Confidence: 3/10
+2025-07-14T16:09:00,SLNH,1.16,breakout,
+2025-07-14T16:19:00,BLMZ,0.17,runner_warmup,
+2025-07-14T16:36:00,XELB,2.71,move_up_3min,up $0.23 (9.3%) in 3 minutes. Confidence: 4/10
+2025-07-14T16:38:00,IBG,1.36,runner_warmup,
+2025-07-14T16:38:00,IBG,1.36,move_up_3min,up $0.23 (20.3%) in 3 minutes. Confidence: 6/10
+2025-07-14T16:42:00,CGBS,0.06,breakout,
+2025-07-14T16:56:00,TDTH,0.48,breakout,
+2025-07-14T16:58:00,GVH,0.08,breakout,
+2025-07-14T17:05:00,VBIX,7.41,move_up_3min,up $0.27 (3.8%) in 3 minutes. Confidence: 3/10
+2025-07-14T18:06:00,BLMZ,0.20,runner_warmup,
+2025-07-14T18:33:00,XAGE,4.48,move_up_3min,up $0.42 (10.3%) in 3 minutes. Confidence: 6/10
+2025-07-14T18:37:00,XAGE,4.50,runner_warmup,
