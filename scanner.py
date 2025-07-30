@@ -220,64 +220,7 @@ vwap_reclaimed_once = defaultdict(bool)
 dip_play_seen = set()
 recent_high = defaultdict(float)
 
-# ==== FLOAT CACHE ====
-FLOAT_CACHE_FILE = "float_cache.pkl"
-float_cache = {}
-
-def load_float_cache():
-    global float_cache
-    try:
-        with open(FLOAT_CACHE_FILE, "rb") as f:
-            float_cache = pickle.load(f)
-    except Exception:
-        float_cache = {}
-
-def save_float_cache():
-    try:
-        with open(FLOAT_CACHE_FILE, "wb") as f:
-            pickle.dump(float_cache, f)
-    except Exception as e:
-        logger.error(f"Failed to save float cache: {e}")
-
-load_float_cache()
-atexit.register(save_float_cache)
-
-def get_float_shares(ticker):
-    # Always use cached value if present, even if it's None
-    if ticker in float_cache:
-        return float_cache[ticker]
-    if YFINANCE_AVAILABLE:
-        try:
-            info = yf.Ticker(ticker).info
-            float_shares = info.get('floatShares', None)
-            float_cache[ticker] = float_shares  # Cache result, even None
-            save_float_cache()
-            return float_shares
-        except Exception as e:
-            # Cache failures too – so we never retry this ticker until restart/clear
-            float_cache[ticker] = None
-            save_float_cache()
-            logger.error(f"[DEBUG] Yahoo float error for {ticker}: {e}")
-            return None
-    return None
-    
-def log_halt_event(item, reason=None):
-    row = {
-        "symbol": item.get("sym"),
-        "event_time": item.get("t"),
-        "price": item.get("p"),
-        "ev": item.get("ev"),
-        "raw": str(item),
-        "log_reason": reason or "",
-        "logged_at": datetime.now(timezone.utc).isoformat()
-    }
-    write_header = not os.path.exists(HALT_LOG_FILE) or os.path.getsize(HALT_LOG_FILE) == 0
-    with open(HALT_LOG_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
-
+# News keyword helpers
 def news_matches_keywords(headline, summary):
     text_block = f"{headline} {summary}".lower()
     return any(word.lower() in text_block for word in KEYWORDS)
@@ -648,7 +591,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "spike_time": start_time,
             }
 
-    # ---- Fixed indentation for breakout/runner confirm logic ----
+    # ---- Breakout/runner confirm logic ----
     if symbol in pending_breakout_alert:
         candidate = pending_breakout_alert[symbol]
         seconds = (start_time - candidate["breakout_time"]).total_seconds()
@@ -685,9 +628,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
 
-   # ...inside your on_new_candle function, find the RVOL SPIKE ALERT section and REPLACE IT with the following block:
-
-    # --- RVOL SPIKE ALERT (with price move filter) ---
+    # --- RVOL SPIKE ALERT (with price move filter, only if no breakout/runner this run) ---
     MIN_PRICE_MOVE_PCT = 0.04  # 4% minimum price move required
 
     if len(candles_seq) == 3:
@@ -706,7 +647,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     rvol = total_volume / avg_trailing
                     logger.info(f"{symbol} RVOL: {rvol}")
 
-                    # --- RVOL SPIKE ALERT with price move filter ---
                     price_move_pct = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
 
                     if (
@@ -729,8 +669,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
 
             logger.debug(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
-            
-            # ...[rest of your 3-min move/confidence alert logic continues here]...
 
             if (
                 c0["close"] < c1["close"] < c2["close"]
