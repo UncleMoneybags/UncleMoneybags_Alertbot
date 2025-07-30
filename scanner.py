@@ -12,15 +12,10 @@ import signal
 import pickle
 import csv
 import os
-<<<<<<< HEAD
 import joblib
 import numpy as np
 import atexit
-
-=======
-import joblib      # <-- already here!
-import numpy as np
-import atexit
+import sys  # for platform check
 
 # ==== NEWS SEEN PERSISTENCE ====
 NEWS_SEEN_FILE = "news_seen.txt"
@@ -56,9 +51,9 @@ logger.info("scanner.py is running!!! --- If you see this, your file is found an
 logger.info("Imports completed successfully.")
 
 # --- CONFIG ---
-POLYGON_API_KEY = "VmF1boger0pp2M7gV5HboHheRbplmLi5"
-TELEGRAM_BOT_TOKEN = "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc"
-TELEGRAM_CHAT_ID = "-1002266463234"
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "VmF1boger0pp2M7gV5HboHheRbplmLi5")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1002266463234")
 PRICE_THRESHOLD = 10.00
 MAX_SYMBOLS = 400
 SCREENER_REFRESH_SEC = 60
@@ -124,7 +119,7 @@ KEYWORDS = [
 
 def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
-    now_utc = datetime.now(pytz.UTC)
+    now_utc = datetime.now(timezone.utc)
     now_ny = now_utc.astimezone(ny)
     if now_ny.weekday() >= 5:
         return False
@@ -134,7 +129,7 @@ def is_market_scan_time():
 
 def is_news_alert_time():
     ny = pytz.timezone("America/New_York")
-    now_utc = datetime.now(pytz.UTC)
+    now_utc = datetime.now(timezone.utc)
     now_ny = now_utc.astimezone(ny)
     if now_ny.weekday() >= 5:
         return False
@@ -382,6 +377,7 @@ async def news_alerts_task():
                     if most_recent:
                         latest_news_time = most_recent
             if len(news_seen) > 500:
+                # Use only the last 500 news ids (convert to list and back to set)
                 news_seen = set(list(news_seen)[-500:])
         except Exception as e:
             logger.error(f"[DEBUG] News fetch error: {e}")
@@ -405,7 +401,8 @@ async def is_recent_ipo(ticker):
                 list_date_str = data.get("results", {}).get("list_date")
                 if list_date_str:
                     list_date = datetime.strptime(list_date_str, "%Y-%m-%d").date()
-                    days_since_ipo = (datetime.utcnow().date() - list_date).days
+                    # FIX: use timezone-aware now
+                    days_since_ipo = (datetime.now(timezone.utc).date() - list_date).days
                     if days_since_ipo < MIN_IPO_DAYS:
                         logger.info(f"{ticker} is a recent IPO ({days_since_ipo} days).")
                     return days_since_ipo < MIN_IPO_DAYS
@@ -838,7 +835,7 @@ async def send_scheduled_alerts():
     sent_ebook_msg = False
     while True:
         logger.debug("send_scheduled_alerts loop")
-        now_utc = datetime.now(pytz.UTC)
+        now_utc = datetime.now(timezone.utc)
         ny = pytz.timezone("America/New_York")
         now_ny = now_utc.astimezone(ny)
         weekday = now_ny.weekday()
@@ -877,8 +874,11 @@ async def send_scheduled_alerts():
 
 def setup_signal_handlers(loop):
     logger.info("setup_signal_handlers called")
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
+    else:
+        logger.info("Signal handlers not supported on Windows - skipping.")
 
 async def shutdown(loop, sig):
     logger.info(f"Received exit signal {sig.name}...")
