@@ -204,16 +204,21 @@ load_float_cache()
 atexit.register(save_float_cache)
 
 def get_float_shares(ticker):
+    # If the ticker is in cache (even as None), return it—never re-query
     if ticker in float_cache:
         return float_cache[ticker]
     if YFINANCE_AVAILABLE:
         try:
             info = yf.Ticker(ticker).info
             float_shares = info.get('floatShares', None)
-            float_cache[ticker] = float_shares
+            float_cache[ticker] = float_shares  # cache even None
             save_float_cache()
+            # Optional: Slow down requests to avoid rate limit (uncomment if needed)
+            # import time; time.sleep(0.2)
             return float_shares
         except Exception as e:
+            float_cache[ticker] = None  # cache failures too
+            save_float_cache()
             logger.error(f"[DEBUG] Yahoo float error for {ticker}: {e}")
             return None
     return None
