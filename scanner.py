@@ -775,4 +775,133 @@ async def handle_halt_event(item):
             pass
         return
 
-    status = str(item.get("status", "")).lower
+    status = str(item.get("status", "")).lower()
+    halt_time = item.get("halt_time")
+    if status == "halt":
+        now = datetime.now(timezone.utc)
+        if (symbol in last_halt_alert and (now - last_halt_alert[symbol]).total_seconds() < 900):
+            return
+        msg = f"⏸️ {escape_html(symbol)} trading HALTED."
+        await send_telegram_async(msg, symbol=symbol)
+        last_halt_alert[symbol] = now
+        # Log event
+        log_event("halt", symbol, None, None, now, {"halt_time": halt_time})
+    elif status == "resume":
+        msg = f"▶️ {escape_html(symbol)} trading RESUMED."
+        await send_telegram_async(msg, symbol=symbol)
+        # Log event
+        now = datetime.now(timezone.utc)
+        log_event("resume", symbol, None, None, now, {"halt_time": halt_time})
+
+def log_halt_event(item, reason=""):
+    with open(HALT_LOG_FILE, "a") as f:
+        json.dump({"item": item, "reason": reason, "logged_at": str(datetime.now(timezone.utc))}, f)
+        f.write("\n")
+
+async def polygon_halt_websocket():
+    logger.info("polygon_halt_websocket started")
+    url = f"wss://delayed.polygon.io/stocks/halt?apiKey={POLYGON_API_KEY}"
+    async for websocket in websockets.connect(url):
+        try:
+            async for msg in websocket:
+                try:
+                    data = json.loads(msg)
+                    if isinstance(data, list):
+                        for item in data:
+                            await handle_halt_event(item)
+                    else:
+                        await handle_halt_event(data)
+                except Exception as e:
+                    logger.error(f"[DEBUG] Halt event error: {e}")
+        except Exception as e:
+            logger.error(f"[DEBUG] Halt websocket error: {e}")
+            await asyncio.sleep(5)  # Wait before reconnecting
+
+async def polygon_trades_websocket(symbol_queue):
+    logger.info("polygon_trades_websocket started")
+    url = f"wss://delayed.polygon.io/stocks/trades?apiKey={POLYGON_API_KEY}"
+    active_symbols = set()
+    while True:
+        symbols = []
+        try:
+            symbols = await symbol_queue.get()
+            if not symbols:
+                await asyncio.sleep(5)
+                continue
+            logger.info(f"polygon_trades_websocket: subscribing to {len(symbols)} symbols")
+            active_symbols = set(symbols)
+            url = f"wss://delayed.polygon.io/stocks/trades?apiKey={POLYGON_API_KEY}"
+            async for ws in websockets.connect(url):
+                try:
+                    subscribe_msg = {
+                        "action": "subscribe",
+                        "params": [f"T.{s}" for s in symbols]
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                            if isinstance(data, list):
+                                for item in data:
+                                    await handle_trade_event(item)
+                            else:
+                                await handle_trade_event(data)
+                        except Exception as e:
+                            logger.error(f"[DEBUG] Trade event error: {e}")
+                except Exception as e:
+                    logger.error(f"[DEBUG] Trades websocket error: {e}")
+                    await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"[DEBUG] polygon_trades_websocket error: {e}")
+            await asyncio.sleep(5)
+
+async def handle_trade_event(item):
+    symbol = item.get("sym")
+    price = item.get("p")
+    size = item.get("s")
+    trade_time_unix = item.get("t")
+    if trade_time_unix is None:
+        return
+    trade_time = datetime.fromtimestamp(trade_time_unix / 1000, tz=timezone.utc)
+    await on_trade_event(symbol, price, size, trade_time)
+
+async def main():
+    logger.info("main() starting")
+    symbol_queue = asyncio.Queue()
+    tasks = [
+        asyncio.create_task(dynamic_symbol_manager(symbol_queue)),
+        asyncio.create_task(polygon_trades_websocket(symbol_queue)),
+        asyncio.create_task(news_alerts_task()),
+        asyncio.create_task(polygon_halt_websocket()),
+    ]
+
+    def shutdown_handler(signum, frame):
+        logger.info(f"Received signal {signum}. Shutting down.")
+        for task in tasks:
+            task.cancel()
+        save_float_cache()
+        exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    # Save float cache on exit
+    atexit.register(save_float_cache)
+
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        logger.info("Tasks cancelled. Exiting.")
+    except Exception as e:
+        logger.error(f"Exception in main: {e}")
+
+if __name__ == "__main__":
+    logger.info(
+        "Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for pre-market gainers etc)."
+    )
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
+        logger.info(f"Bot stopped gracefully. Reason: {e}")
+    except Exception as e:
+        logger.error(f"Top-level exception: {e}")
