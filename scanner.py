@@ -212,6 +212,26 @@ last_volume_spike_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezon
 last_runner_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
 runner_alerted_today = set()
 
+# Global cooldown system to prevent overlapping alerts for the same symbol
+last_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+ALERT_COOLDOWN_SECONDS = 60  # 1 minute cooldown between any alerts for the same symbol
+
+def should_suppress_alert(symbol):
+    """
+    Check if an alert for the given symbol should be suppressed due to cooldown.
+    Returns True if alert should be suppressed, False if it's okay to send.
+    """
+    now = datetime.now(timezone.utc)
+    time_since_last = now - last_alert_time[symbol]
+    return time_since_last < timedelta(seconds=ALERT_COOLDOWN_SECONDS)
+
+def update_alert_time(symbol):
+    """
+    Update the last alert time for the given symbol to now.
+    Call this after successfully sending an alert.
+    """
+    last_alert_time[symbol] = datetime.now(timezone.utc)
+
 pending_runner_alert = {}
 pending_breakout_alert = {}
 HALT_LOG_FILE = "halt_event_log.csv"
@@ -526,11 +546,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
                 logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
                 if higher_lows and rising_volume:
+                    # Check cooldown before sending dip play alert
+                    if should_suppress_alert(symbol):
+                        logger.info(f"[COOLDOWN] Suppressing dip play alert for {symbol} due to recent alert")
+                        return
+                    
                     msg = (
                         f"📉 {escape_html(symbol)} Dip Play: Dropped {dip_pct*100:.1f}% to ${close:.2f}, "
                         f"2 higher lows with rising volume!"
                     )
                     await send_telegram_async(msg)
+                    update_alert_time(symbol)  # Update cooldown timer
                     dip_play_seen.add(symbol)
 
     if len(candles_seq) >= 3:
@@ -540,8 +566,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
             if bounce_pct < RUG_PULL_BOUNCE_PCT:
                 if symbol in alerted_symbols:
+                    # Check cooldown before sending rug pull warning
+                    if should_suppress_alert(symbol):
+                        logger.info(f"[COOLDOWN] Suppressing rug pull warning for {symbol} due to recent alert")
+                        return
+                    
                     rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
                     await send_telegram_async(rug_msg)
+                    update_alert_time(symbol)  # Update cooldown timer
 
     # Breakout/runner alert logic
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.05  # PATCHED: was 0.02, now 5%
@@ -604,9 +636,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 volume >= MIN_CONFIRM_VOL and
                 high > candidate["breakout_close"]
             ):
-                msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
-                await send_telegram_async(msg)
-                alerted_symbols.add(symbol)
+                # Check cooldown before sending breakout alert
+                if should_suppress_alert(symbol):
+                    logger.info(f"[COOLDOWN] Suppressing breakout alert for {symbol} due to recent alert")
+                else:
+                    msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
+                    await send_telegram_async(msg)
+                    update_alert_time(symbol)  # Update cooldown timer
+                    alerted_symbols.add(symbol)
             del pending_breakout_alert[symbol]
         elif seconds > 60:
             del pending_breakout_alert[symbol]
@@ -617,14 +654,20 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if close >= candidate["spike_close"] * 0.98:
                 today = datetime.now(timezone.utc).date()
                 symbol_day = f"{symbol}_{today}"
-                if symbol_day not in runner_alerted_today:
+                
+                # Check cooldown before sending runner alert
+                if should_suppress_alert(symbol):
+                    logger.info(f"[COOLDOWN] Suppressing runner alert for {symbol} due to recent alert")
+                elif symbol_day not in runner_alerted_today:
                     runner_alerted_today.add(symbol_day)
                     msg = f"👀 {symbol} runner warming up: ${close:.2f}"
                     await send_telegram_async(msg)
+                    update_alert_time(symbol)  # Update cooldown timer
                     alerted_symbols.add(symbol)
                 else:
                     msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
                     await send_telegram_async(msg)
+                    update_alert_time(symbol)  # Update cooldown timer
                     alerted_symbols.add(symbol)
             del pending_runner_alert[symbol]
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
@@ -656,12 +699,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         total_volume >= RVOL_SPIKE_MIN_VOLUME and
                         price_move_pct >= MIN_PRICE_MOVE_PCT
                     ):
-                        msg = (
-                            f"🚨 {escape_html(symbol)} Volume Spike! "
-                            f"Price=${c2['close']:.2f}"
-                        )
-                        await send_telegram_async(msg)
-                        alerted_symbols.add(symbol)
+                        # Check cooldown before sending RVOL spike alert
+                        if should_suppress_alert(symbol):
+                            logger.info(f"[COOLDOWN] Suppressing RVOL spike alert for {symbol} due to recent alert")
+                        else:
+                            msg = (
+                                f"🚨 {escape_html(symbol)} Volume Spike! "
+                                f"Price=${c2['close']:.2f}"
+                            )
+                            await send_telegram_async(msg)
+                            update_alert_time(symbol)  # Update cooldown timer
+                            alerted_symbols.add(symbol)
 
                     if rvol < RVOL_MIN:
                         return
@@ -710,6 +758,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if conf < 5:
                     return
 
+                # Check cooldown before sending traditional spike alert
+                if should_suppress_alert(symbol):
+                    logger.info(f"[COOLDOWN] Suppressing spike alert for {symbol} due to recent alert")
+                    return
+
                 msg = (
                     f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
                     f"Now ${c2['close']:.2f}. "
@@ -717,6 +770,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
 
                 await send_telegram_async(msg)
+                update_alert_time(symbol)  # Update cooldown timer
                 alerted_symbols.add(symbol)
 
                 log_event(
@@ -729,9 +783,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
                 ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
                 if ml_prob > 0.7:
-                    await send_telegram_async(
-                        f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
-                    )
+                    # Check cooldown before sending ML high potential alert
+                    if should_suppress_alert(symbol):
+                        logger.info(f"[COOLDOWN] Suppressing ML high potential alert for {symbol} due to recent alert")
+                    else:
+                        await send_telegram_async(
+                            f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+                        )
+                        update_alert_time(symbol)  # Update cooldown timer
 
 async def handle_halt_event(item):
     logger.info(f"[HALT DEBUG] Received halt event: {item}")
@@ -772,13 +831,25 @@ async def handle_halt_event(item):
         last_halt_alert[symbol] = halt_ts
 
     if status == "halted" or not status:
+        # Check cooldown before sending halt alert
+        if should_suppress_alert(symbol):
+            logger.info(f"[COOLDOWN] Suppressing halt alert for {symbol} due to recent alert")
+            return
+        
         msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
         await send_telegram_async(msg)
+        update_alert_time(symbol)  # Update cooldown timer
         log_halt_event(item, reason="alert_sent_halted")
         event_type = "halt"
     elif status == "resumed":
+        # Check cooldown before sending resume alert
+        if should_suppress_alert(symbol):
+            logger.info(f"[COOLDOWN] Suppressing resume alert for {symbol} due to recent alert")
+            return
+        
         msg = f"🟢 {escape_html(symbol)} (${price:.2f}) resumed trading!"
         await send_telegram_async(msg)
+        update_alert_time(symbol)  # Update cooldown timer
         log_halt_event(item, reason="alert_sent_resumed")
         event_type = "resume"
     else:
@@ -794,9 +865,14 @@ async def handle_halt_event(item):
     )
     ml_prob = score_event_ml(event_type, symbol, price, 0, 1.0, 0)
     if ml_prob > 0.7:
-        await send_telegram_async(
-            f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
-        )
+        # Check cooldown before sending ML high potential halt alert
+        if should_suppress_alert(symbol):
+            logger.info(f"[COOLDOWN] Suppressing ML high potential {event_type} alert for {symbol} due to recent alert")
+        else:
+            await send_telegram_async(
+                f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+            )
+            update_alert_time(symbol)  # Update cooldown timer
 
 async def fetch_top_premarket_gainers():
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_API_KEY}&limit=25"
