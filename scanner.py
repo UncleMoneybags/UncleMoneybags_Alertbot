@@ -641,7 +641,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         rvol_hist_seq = rvol_history[symbol]
         if not isinstance(rvol_hist_seq, (list, deque)):
             rvol_hist_seq = list(rvol_hist_seq)
-        if len(rvol_hist_seq) >= 5:
+        if len(rvol_hist_seq) >= 2:
             trailing_vols = list(rvol_hist_seq)[:-1]
             if trailing_vols:
                 avg_trailing = sum(trailing_vols) / len(trailing_vols)
