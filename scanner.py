@@ -178,7 +178,24 @@ def is_news_alert_time():
     end = time(20, 0)
     return start <= now_ny.time() <= end
 
-async def send_telegram_async(message):
+# === PATCH: ANTI-OVERLAP ALERT CONTROL ===
+last_sent_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+ALERT_COOLDOWN_SECONDS = 180  # 3 minutes
+
+def can_send_alert(symbol):
+    now = datetime.now(timezone.utc)
+    last = last_sent_alert_time[symbol]
+    if (now - last).total_seconds() < ALERT_COOLDOWN_SECONDS:
+        logger.debug(f"[ANTI-OVERLAP] Skipping alert for {symbol}: last sent {now - last} ago (cooldown {ALERT_COOLDOWN_SECONDS}s)")
+        return False
+    return True
+
+def update_alert_time(symbol):
+    last_sent_alert_time[symbol] = datetime.now(timezone.utc)
+
+async def send_telegram_async(message, symbol=None):
+    if symbol and not can_send_alert(symbol):
+        return
     logger.debug(f"[DEBUG] send_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -194,6 +211,8 @@ async def send_telegram_async(message):
                 logger.debug(f"[DEBUG] Telegram API status: {resp.status}, response: {result_text}")
                 if resp.status != 200:
                     logger.error(f"[DEBUG] Telegram send error: {result_text}")
+                if symbol:
+                    update_alert_time(symbol)
     except Exception as e:
         logger.error(f"[DEBUG] Telegram send error: {e}")
 
@@ -257,7 +276,9 @@ async def is_under_20(tickers):
             logger.error(f"[DEBUG] Price check failed for {ticker}: {e}")
     return False
 
-async def send_news_telegram_async(message):
+async def send_news_telegram_async(message, symbol=None):
+    if symbol and not can_send_alert(symbol):
+        return
     logger.debug(f"[DEBUG] send_news_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -280,6 +301,8 @@ async def send_news_telegram_async(message):
                         continue
                     if resp.status != 200:
                         logger.error(f"[DEBUG] Telegram send error (news): {result_text}")
+                    if symbol:
+                        update_alert_time(symbol)
                     return
             except Exception as e:
                 logger.error(f"[DEBUG] Telegram send error (news): {e}")
@@ -360,7 +383,9 @@ async def news_alerts_task():
 
                         news_seen.add(item['id'])
                         save_news_id(item['id'])
-                        await send_news_telegram_async(msg)
+                        # PATCH: Use anti-overlap for first ticker, or None
+                        symbol_for_alert = tickers[0] if tickers else None
+                        await send_news_telegram_async(msg, symbol=symbol_for_alert)
                         await asyncio.sleep(3)
                     if most_recent:
                         latest_news_time = most_recent
@@ -530,7 +555,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         f"📉 {escape_html(symbol)} Dip Play: Dropped {dip_pct*100:.1f}% to ${close:.2f}, "
                         f"2 higher lows with rising volume!"
                     )
-                    await send_telegram_async(msg)
+                    await send_telegram_async(msg, symbol=symbol)
                     dip_play_seen.add(symbol)
 
     if len(candles_seq) >= 3:
@@ -541,7 +566,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if bounce_pct < RUG_PULL_BOUNCE_PCT:
                 if symbol in alerted_symbols:
                     rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
-                    await send_telegram_async(rug_msg)
+                    await send_telegram_async(rug_msg, symbol=symbol)
 
     # Breakout/runner alert logic
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.05  # PATCHED: was 0.02, now 5%
@@ -605,7 +630,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 high > candidate["breakout_close"]
             ):
                 msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
-                await send_telegram_async(msg)
+                await send_telegram_async(msg, symbol=symbol)
                 alerted_symbols.add(symbol)
             del pending_breakout_alert[symbol]
         elif seconds > 60:
@@ -620,11 +645,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if symbol_day not in runner_alerted_today:
                     runner_alerted_today.add(symbol_day)
                     msg = f"👀 {symbol} runner warming up: ${close:.2f}"
-                    await send_telegram_async(msg)
+                    await send_telegram_async(msg, symbol=symbol)
                     alerted_symbols.add(symbol)
                 else:
                     msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
-                    await send_telegram_async(msg)
+                    await send_telegram_async(msg, symbol=symbol)
                     alerted_symbols.add(symbol)
             del pending_runner_alert[symbol]
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
@@ -660,7 +685,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                             f"🚨 {escape_html(symbol)} Volume Spike! "
                             f"Price=${c2['close']:.2f}"
                         )
-                        await send_telegram_async(msg)
+                        await send_telegram_async(msg, symbol=symbol)
                         alerted_symbols.add(symbol)
 
                     if rvol < RVOL_MIN:
@@ -716,7 +741,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"<b>Confidence: {conf}/10</b>"
                 )
 
-                await send_telegram_async(msg)
+                await send_telegram_async(msg, symbol=symbol)
                 alerted_symbols.add(symbol)
 
                 log_event(
@@ -730,7 +755,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
                 if ml_prob > 0.7:
                     await send_telegram_async(
-                        f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+                        f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀",
+                        symbol=symbol
                     )
 
 async def handle_halt_event(item):
@@ -773,12 +799,12 @@ async def handle_halt_event(item):
 
     if status == "halted" or not status:
         msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
-        await send_telegram_async(msg)
+        await send_telegram_async(msg, symbol=symbol)
         log_halt_event(item, reason="alert_sent_halted")
         event_type = "halt"
     elif status == "resumed":
         msg = f"🟢 {escape_html(symbol)} (${price:.2f}) resumed trading!"
-        await send_telegram_async(msg)
+        await send_telegram_async(msg, symbol=symbol)
         log_halt_event(item, reason="alert_sent_resumed")
         event_type = "resume"
     else:
@@ -795,7 +821,8 @@ async def handle_halt_event(item):
     ml_prob = score_event_ml(event_type, symbol, price, 0, 1.0, 0)
     if ml_prob > 0.7:
         await send_telegram_async(
-            f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+            f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀",
+            symbol=symbol
         )
 
 async def fetch_top_premarket_gainers():
@@ -991,10 +1018,4 @@ async def main():
     )
 
 if __name__ == "__main__":
-    logger.info("Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for pre-market gainers etc).")
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
-        logger.info(f"Bot stopped gracefully. Reason: {e}")
-    except Exception as e:
-        logger.error(f"Top-level exception: {e}")
+    logger.info("Starting real-time penny stock spike scanner ($10 & under, 
