@@ -96,14 +96,14 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "VmF1boger0pp2M7gV5HboHheRbp
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1002266463234")
 PRICE_THRESHOLD = 20.00
-MAX_SYMBOLS = 400
+MAX_SYMBOLS = 600
 SCREENER_REFRESH_SEC = 60
 MIN_ALERT_MOVE = 0.15
 MIN_3MIN_VOLUME = 25000
 MIN_PER_CANDLE_VOL = 25000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
-RVOL_SPIKE_THRESHOLD = 2.5
+RVOL_SPIKE_THRESHOLD = 2.0
 RVOL_SPIKE_MIN_VOLUME = 25000
 
 MIN_FLOAT_SHARES = 500_000
@@ -631,7 +631,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             del pending_runner_alert[symbol]
 
     # --- RVOL SPIKE ALERT (with price move filter, only if no breakout/runner this run) ---
-    MIN_PRICE_MOVE_PCT = 0.08  # 8% minimum price move required
+    MIN_PRICE_MOVE_PCT = 0.06  # 6% minimum price move required
 
     if len(candles_seq) == 3:
         c0, c1, c2 = list(candles_seq)
