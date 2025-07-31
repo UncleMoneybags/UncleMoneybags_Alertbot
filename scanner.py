@@ -19,6 +19,23 @@ import sys  # for platform check
 import requests
 from bs4 import BeautifulSoup
 
+# Global alert cooldown logic
+ALERT_COOLDOWN = 60  # 60 seconds cooldown between alerts for the same symbol
+last_alert_time = {}  # Dictionary to track last alert time per symbol
+
+def should_send_alert(symbol):
+    """Check if enough time has passed since the last alert for this symbol."""
+    if symbol not in last_alert_time:
+        return True
+    
+    now = datetime.now(timezone.utc)
+    time_since_last = (now - last_alert_time[symbol]).total_seconds()
+    return time_since_last >= ALERT_COOLDOWN
+
+def update_alert_time(symbol):
+    """Update the last alert time for this symbol to now."""
+    last_alert_time[symbol] = datetime.now(timezone.utc)
+
 float_cache = {}
 
 def save_float_cache():
@@ -358,10 +375,19 @@ async def news_alerts_task():
                         if url_:
                             msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
 
-                        news_seen.add(item['id'])
-                        save_news_id(item['id'])
-                        await send_news_telegram_async(msg)
-                        await asyncio.sleep(3)
+                        # Check cooldown for news alerts - only send if at least one ticker is not on cooldown
+                        should_send_news = True
+                        if tickers:
+                            should_send_news = any(should_send_alert(ticker) for ticker in tickers)
+                        
+                        if should_send_news:
+                            news_seen.add(item['id'])
+                            save_news_id(item['id'])
+                            await send_news_telegram_async(msg)
+                            # Update alert time for all tickers in this news item
+                            for ticker in tickers:
+                                update_alert_time(ticker)
+                            await asyncio.sleep(3)
                     if most_recent:
                         latest_news_time = most_recent
             if len(news_seen) > 500:
@@ -526,12 +552,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
                 logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
                 if higher_lows and rising_volume:
-                    msg = (
-                        f"📉 {escape_html(symbol)} Dip Play: Dropped {dip_pct*100:.1f}% to ${close:.2f}, "
-                        f"2 higher lows with rising volume!"
-                    )
-                    await send_telegram_async(msg)
-                    dip_play_seen.add(symbol)
+                    if should_send_alert(symbol):
+                        msg = (
+                            f"📉 {escape_html(symbol)} Dip Play: Dropped {dip_pct*100:.1f}% to ${close:.2f}, "
+                            f"2 higher lows with rising volume!"
+                        )
+                        await send_telegram_async(msg)
+                        update_alert_time(symbol)
+                        dip_play_seen.add(symbol)
 
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
@@ -540,8 +568,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
             if bounce_pct < RUG_PULL_BOUNCE_PCT:
                 if symbol in alerted_symbols:
-                    rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
-                    await send_telegram_async(rug_msg)
+                    if should_send_alert(symbol):
+                        rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
+                        await send_telegram_async(rug_msg)
+                        update_alert_time(symbol)
 
     # Breakout/runner alert logic
     DUAL_MIN_1M_PRICE_MOVE_PCT = 0.05  # PATCHED: was 0.02, now 5%
@@ -604,9 +634,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 volume >= MIN_CONFIRM_VOL and
                 high > candidate["breakout_close"]
             ):
-                msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
-                await send_telegram_async(msg)
-                alerted_symbols.add(symbol)
+                if should_send_alert(symbol):
+                    msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
+                    await send_telegram_async(msg)
+                    update_alert_time(symbol)
+                    alerted_symbols.add(symbol)
             del pending_breakout_alert[symbol]
         elif seconds > 60:
             del pending_breakout_alert[symbol]
@@ -618,14 +650,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 today = datetime.now(timezone.utc).date()
                 symbol_day = f"{symbol}_{today}"
                 if symbol_day not in runner_alerted_today:
-                    runner_alerted_today.add(symbol_day)
-                    msg = f"👀 {symbol} runner warming up: ${close:.2f}"
-                    await send_telegram_async(msg)
-                    alerted_symbols.add(symbol)
+                    if should_send_alert(symbol):
+                        runner_alerted_today.add(symbol_day)
+                        msg = f"👀 {symbol} runner warming up: ${close:.2f}"
+                        await send_telegram_async(msg)
+                        update_alert_time(symbol)
+                        alerted_symbols.add(symbol)
                 else:
-                    msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
-                    await send_telegram_async(msg)
-                    alerted_symbols.add(symbol)
+                    if should_send_alert(symbol):
+                        msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
+                        await send_telegram_async(msg)
+                        update_alert_time(symbol)
+                        alerted_symbols.add(symbol)
             del pending_runner_alert[symbol]
         elif (start_time - candidate["spike_time"]).total_seconds() > 60:
             del pending_runner_alert[symbol]
@@ -656,12 +692,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         total_volume >= RVOL_SPIKE_MIN_VOLUME and
                         price_move_pct >= MIN_PRICE_MOVE_PCT
                     ):
-                        msg = (
-                            f"🚨 {escape_html(symbol)} Volume Spike! "
-                            f"Price=${c2['close']:.2f}"
-                        )
-                        await send_telegram_async(msg)
-                        alerted_symbols.add(symbol)
+                        if should_send_alert(symbol):
+                            msg = (
+                                f"🚨 {escape_html(symbol)} Volume Spike! "
+                                f"Price=${c2['close']:.2f}"
+                            )
+                            await send_telegram_async(msg)
+                            update_alert_time(symbol)
+                            alerted_symbols.add(symbol)
 
                     if rvol < RVOL_MIN:
                         return
@@ -710,14 +748,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if conf < 5:
                     return
 
-                msg = (
-                    f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
-                    f"Now ${c2['close']:.2f}. "
-                    f"<b>Confidence: {conf}/10</b>"
-                )
+                if should_send_alert(symbol):
+                    msg = (
+                        f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
+                        f"Now ${c2['close']:.2f}. "
+                        f"<b>Confidence: {conf}/10</b>"
+                    )
 
-                await send_telegram_async(msg)
-                alerted_symbols.add(symbol)
+                    await send_telegram_async(msg)
+                    update_alert_time(symbol)
+                    alerted_symbols.add(symbol)
 
                 log_event(
                     event_type="spike",
@@ -729,9 +769,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
                 ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
                 if ml_prob > 0.7:
-                    await send_telegram_async(
-                        f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
-                    )
+                    if should_send_alert(symbol):
+                        await send_telegram_async(
+                            f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+                        )
+                        update_alert_time(symbol)
 
 async def handle_halt_event(item):
     logger.info(f"[HALT DEBUG] Received halt event: {item}")
@@ -772,14 +814,18 @@ async def handle_halt_event(item):
         last_halt_alert[symbol] = halt_ts
 
     if status == "halted" or not status:
-        msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
-        await send_telegram_async(msg)
-        log_halt_event(item, reason="alert_sent_halted")
+        if should_send_alert(symbol):
+            msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
+            await send_telegram_async(msg)
+            update_alert_time(symbol)
+            log_halt_event(item, reason="alert_sent_halted")
         event_type = "halt"
     elif status == "resumed":
-        msg = f"🟢 {escape_html(symbol)} (${price:.2f}) resumed trading!"
-        await send_telegram_async(msg)
-        log_halt_event(item, reason="alert_sent_resumed")
+        if should_send_alert(symbol):
+            msg = f"🟢 {escape_html(symbol)} (${price:.2f}) resumed trading!"
+            await send_telegram_async(msg)
+            update_alert_time(symbol)
+            log_halt_event(item, reason="alert_sent_resumed")
         event_type = "resume"
     else:
         return
@@ -794,9 +840,11 @@ async def handle_halt_event(item):
     )
     ml_prob = score_event_ml(event_type, symbol, price, 0, 1.0, 0)
     if ml_prob > 0.7:
-        await send_telegram_async(
-            f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
-        )
+        if should_send_alert(symbol):
+            await send_telegram_async(
+                f"🔥 <b>HIGH POTENTIAL {event_type.upper()}</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+            )
+            update_alert_time(symbol)
 
 async def fetch_top_premarket_gainers():
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_API_KEY}&limit=25"
