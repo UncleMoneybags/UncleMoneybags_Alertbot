@@ -759,149 +759,72 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         symbol=symbol
                     )
 
-async def handle_halt_event(item):
-    logger.info(f"[HALT DEBUG] Received halt event: {item}")
-    # You may have a log_halt_event function. If not, comment the next line out.
+async def fetch_top_premarket_gainers():
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_API_KEY}&limit=25"
     try:
-        log_halt_event(item, reason="received")
-    except Exception:
-        pass
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                gainers = []
+                for stock in data.get("tickers", []):
+                    symbol = stock.get("ticker")
+                    premarket = stock.get("preMarket", {})
+                    premarket_price = premarket.get("p", None)
+                    premarket_change_perc = premarket.get("cp", None)
+                    premarket_volume = premarket.get("v", None)
+                    if premarket_price and premarket_change_perc and premarket_volume:
+                        gainers.append({
+                            "symbol": symbol,
+                            "premarket_price": premarket_price,
+                            "premarket_change": premarket_change_perc,
+                            "volume": premarket_volume
+                        })
+                top_10 = sorted(gainers, key=lambda x: x["premarket_change"], reverse=True)[:10]
+                return top_10
+    except Exception as e:
+        logger.error(f"Failed to fetch premarket gainers: {e}")
+    return []
 
-    symbol = item.get("sym")
-    if not symbol or not is_equity_symbol(symbol):
-        try:
-            log_halt_event(item, reason="not_equity_symbol")
-        except Exception:
-            pass
-        return
-
-    status = str(item.get("status", "")).lower()
-    halt_time = item.get("halt_time")
-    if status == "halt":
-        now = datetime.now(timezone.utc)
-        if (symbol in last_halt_alert and (now - last_halt_alert[symbol]).total_seconds() < 900):
-            return
-        msg = f"⏸️ {escape_html(symbol)} trading HALTED."
-        await send_telegram_async(msg, symbol=symbol)
-        last_halt_alert[symbol] = now
-        # Log event
-        log_event("halt", symbol, None, None, now, {"halt_time": halt_time})
-    elif status == "resume":
-        msg = f"▶️ {escape_html(symbol)} trading RESUMED."
-        await send_telegram_async(msg, symbol=symbol)
-        # Log event
-        now = datetime.now(timezone.utc)
-        log_event("resume", symbol, None, None, now, {"halt_time": halt_time})
-
-def log_halt_event(item, reason=""):
-    with open(HALT_LOG_FILE, "a") as f:
-        json.dump({"item": item, "reason": reason, "logged_at": str(datetime.now(timezone.utc))}, f)
-        f.write("\n")
-
-async def polygon_halt_websocket():
-    logger.info("polygon_halt_websocket started")
-    url = f"wss://delayed.polygon.io/stocks/halt?apiKey={POLYGON_API_KEY}"
-    async for websocket in websockets.connect(url):
-        try:
-            async for msg in websocket:
-                try:
-                    data = json.loads(msg)
-                    if isinstance(data, list):
-                        for item in data:
-                            await handle_halt_event(item)
-                    else:
-                        await handle_halt_event(data)
-                except Exception as e:
-                    logger.error(f"[DEBUG] Halt event error: {e}")
-        except Exception as e:
-            logger.error(f"[DEBUG] Halt websocket error: {e}")
-            await asyncio.sleep(5)  # Wait before reconnecting
-
-async def polygon_trades_websocket(symbol_queue):
-    logger.info("polygon_trades_websocket started")
-    url = f"wss://delayed.polygon.io/stocks/trades?apiKey={POLYGON_API_KEY}"
-    active_symbols = set()
+async def send_scheduled_alerts():
+    logger.info("send_scheduled_alerts started")
+    sent_open_msg = False
+    sent_close_msg = False
+    sent_ebook_msg = False
     while True:
-        symbols = []
-        try:
-            symbols = await symbol_queue.get()
-            if not symbols:
-                await asyncio.sleep(5)
-                continue
-            logger.info(f"polygon_trades_websocket: subscribing to {len(symbols)} symbols")
-            active_symbols = set(symbols)
-            url = f"wss://delayed.polygon.io/stocks/trades?apiKey={POLYGON_API_KEY}"
-            async for ws in websockets.connect(url):
-                try:
-                    subscribe_msg = {
-                        "action": "subscribe",
-                        "params": [f"T.{s}" for s in symbols]
-                    }
-                    await ws.send(json.dumps(subscribe_msg))
-                    async for msg in ws:
-                        try:
-                            data = json.loads(msg)
-                            if isinstance(data, list):
-                                for item in data:
-                                    await handle_trade_event(item)
-                            else:
-                                await handle_trade_event(data)
-                        except Exception as e:
-                            logger.error(f"[DEBUG] Trade event error: {e}")
-                except Exception as e:
-                    logger.error(f"[DEBUG] Trades websocket error: {e}")
-                    await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"[DEBUG] polygon_trades_websocket error: {e}")
-            await asyncio.sleep(5)
-
-async def handle_trade_event(item):
-    symbol = item.get("sym")
-    price = item.get("p")
-    size = item.get("s")
-    trade_time_unix = item.get("t")
-    if trade_time_unix is None:
-        return
-    trade_time = datetime.fromtimestamp(trade_time_unix / 1000, tz=timezone.utc)
-    await on_trade_event(symbol, price, size, trade_time)
-
-async def main():
-    logger.info("main() starting")
-    symbol_queue = asyncio.Queue()
-    tasks = [
-        asyncio.create_task(dynamic_symbol_manager(symbol_queue)),
-        asyncio.create_task(polygon_trades_websocket(symbol_queue)),
-        asyncio.create_task(news_alerts_task()),
-        asyncio.create_task(polygon_halt_websocket()),
-    ]
-
-    def shutdown_handler(signum, frame):
-        logger.info(f"Received signal {signum}. Shutting down.")
-        for task in tasks:
-            task.cancel()
-        save_float_cache()
-        exit(0)
-
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
-    # Save float cache on exit
-    atexit.register(save_float_cache)
-
-    try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        logger.info("Tasks cancelled. Exiting.")
-    except Exception as e:
-        logger.error(f"Exception in main: {e}")
-
-if __name__ == "__main__":
-    logger.info(
-        "Starting real-time penny stock spike scanner ($10 & under, 4am–8pm ET, Mon–Fri) with RVOL, confidence scoring, and keyword-filtered news alerts as SEPARATE alerts (now only for pre-market gainers etc)."
-    )
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
-        logger.info(f"Bot stopped gracefully. Reason: {e}")
-    except Exception as e:
-        logger.error(f"Top-level exception: {e}")
+        logger.debug("send_scheduled_alerts loop")
+        now_utc = datetime.now(timezone.utc)
+        ny = pytz.timezone("America/New_York")
+        now_ny = now_utc.astimezone(ny)
+        weekday = now_ny.weekday()
+        if weekday < 5 and now_ny.hour == 9 and now_ny.minute == 25:
+            if not sent_open_msg:
+                gainers = await fetch_top_premarket_gainers()
+                if gainers and len(gainers) > 0:
+                    gainers_msg = "\n".join([
+                        f"{idx+1}. <b>{g['symbol']}</b> ${g['premarket_price']:.2f}  {g['premarket_change']:+.2f}%  Vol: {g['volume']:,}"
+                        for idx, g in enumerate(gainers)
+                    ])
+                    alert_msg = (
+                        "Market opens in 5 mins...secure the damn bag!\n\n"
+                        "<b>Top 10 Pre-Market Gainers:</b>\n"
+                        f"{gainers_msg}"
+                    )
+                else:
+                    alert_msg = "Market opens in 5 mins...secure the damn bag!\n\n(Pre-market gainer data unavailable.)"
+                await send_telegram_async(alert_msg)
+                sent_open_msg = True
+        else:
+            sent_open_msg = False
+        if weekday < 4 and now_ny.hour == 20 and now_ny.minute == 1:
+            if not sent_close_msg:
+                await send_telegram_async("Market closed, reconvene in pre market tomorrow morning.")
+                sent_close_msg = True
+        else:
+            sent_close_msg = False
+        if weekday == 5 and now_ny.hour == 12 and now_ny.minute == 0:
+            if not sent_ebook_msg:
+                await send_telegram_async("📚 Need help trading? My ebook has everything you need to know!")
+                sent_ebook_msg = True
+        else:
+            sent_ebook_msg = False
+        await asyncio
