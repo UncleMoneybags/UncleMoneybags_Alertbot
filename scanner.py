@@ -761,11 +761,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
 async def handle_halt_event(item):
     logger.info(f"[HALT DEBUG] Received halt event: {item}")
-    log_halt_event(item, reason="received")
+    # log_halt_event is not defined in your pasted code. You may want to implement or comment this out.
+    # log_halt_event(item, reason="received")
 
     symbol = item.get("sym")
     if not symbol or not is_equity_symbol(symbol):
-        log_halt_event(item, reason="not_equity_symbol")
+        # log_halt_event(item, reason="not_equity_symbol")
         return
 
     status = str(item.get("status", "")).lower()
@@ -782,30 +783,30 @@ async def handle_halt_event(item):
                     price = snap.get("lastTrade", {}).get("p") or snap.get("day", {}).get("c")
         except Exception as e:
             logger.error(f"[DEBUG] [HALT ALERT] Could not get price for {symbol}: {e}")
-            log_halt_event(item, reason=f"price_fetch_error: {e}")
+            # log_halt_event(item, reason=f"price_fetch_error: {e}")
 
     # PATCH: REQUIRED! Only alert for $20-and-under
     if price is None or price > 20.00 or price <= 0:
-        log_halt_event(item, reason=f"price_above_threshold: {price}")
+        # log_halt_event(item, reason=f"price_above_threshold: {price}")
         return
 
     halt_ts = item.get("t") if "t" in item else None
     global last_halt_alert
     if halt_ts is not None:
         if symbol in last_halt_alert and last_halt_alert[symbol] == halt_ts and status != "resumed":
-            log_halt_event(item, reason="duplicate_halt")
+            # log_halt_event(item, reason="duplicate_halt")
             return
         last_halt_alert[symbol] = halt_ts
 
     if status == "halted" or not status:
         msg = f"🚦 {escape_html(symbol)} (${price:.2f}) just got halted!"
         await send_telegram_async(msg, symbol=symbol)
-        log_halt_event(item, reason="alert_sent_halted")
+        # log_halt_event(item, reason="alert_sent_halted")
         event_type = "halt"
     elif status == "resumed":
         msg = f"🟢 {escape_html(symbol)} (${price:.2f}) resumed trading!"
         await send_telegram_async(msg, symbol=symbol)
-        log_halt_event(item, reason="alert_sent_resumed")
+        # log_halt_event(item, reason="alert_sent_resumed")
         event_type = "resume"
     else:
         return
@@ -881,141 +882,3 @@ async def send_scheduled_alerts():
                 sent_open_msg = True
         else:
             sent_open_msg = False
-        if weekday < 4 and now_ny.hour == 20 and now_ny.minute == 1:
-            if not sent_close_msg:
-                await send_telegram_async("Market closed, reconvene in pre market tomorrow morning.")
-                sent_close_msg = True
-        else:
-            sent_close_msg = False
-        if weekday == 5 and now_ny.hour == 12 and now_ny.minute == 0:
-            if not sent_ebook_msg:
-                await send_telegram_async("📚 Need help trading? My ebook has everything you need to know!")
-                sent_ebook_msg = True
-        else:
-            sent_ebook_msg = False
-        await asyncio.sleep(30)
-
-def setup_signal_handlers(loop):
-    logger.info("setup_signal_handlers called")
-    if sys.platform != "win32":
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown(loop, sig)))
-    else:
-        logger.info("Signal handlers not supported on Windows - skipping.")
-
-async def shutdown(loop, sig):
-    logger.info(f"Received exit signal {sig.name}...")
-    tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
-
-async def trade_ws(symbol_queue):
-    logger.info("trade_ws started")
-    subscribed_symbols = set()
-    halt_subscribed = False
-    while True:
-        logger.debug("trade_ws loop")
-        try:
-            uri = "wss://socket.polygon.io/stocks"
-            async with websockets.connect(uri, ping_interval=30, ping_timeout=10) as ws:
-                await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-                symbols = await symbol_queue.get()
-                if not symbols:
-                    await asyncio.sleep(SCREENER_REFRESH_SEC)
-                    continue
-                BATCH_SIZE = 100
-                params_batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-                for batch in params_batches:
-                    params = ",".join([f"T.{s}" for s in batch])
-                    await ws.send(json.dumps({"action": "subscribe", "params": params}))
-                    await asyncio.sleep(0.2)
-                subscribed_symbols = set(symbols)
-
-                if not halt_subscribed:
-                    await ws.send(json.dumps({"action": "subscribe", "params": "H.*"}))
-                    halt_subscribed = True
-
-                import traceback
-                async def ws_recv():
-                    logger.debug("ws_recv started")
-                    async for message in ws:
-                        try:
-                            logger.debug(f"[DEBUG] RAW MESSAGE: {message}")
-                            try:
-                                payload = json.loads(message)
-                            except Exception:
-                                logger.error(f"[DEBUG] Could not decode JSON: {message}")
-                                continue
-                            if isinstance(payload, dict):
-                                payload = [payload]
-                            elif isinstance(payload, list):
-                                pass
-                            else:
-                                logger.error(f"[DEBUG] Unexpected payload type: {type(payload)} {payload}")
-                                continue
-                            for item in payload:
-                                if not isinstance(item, dict):
-                                    logger.error(f"[DEBUG] Unexpected item type: {type(item)} {item}")
-                                    continue
-                                ev = item.get("ev")
-                                if ev == "T":
-                                    symbol = item.get("sym")
-                                    price = float(item.get("p"))
-                                    size = float(item.get("s", 0))
-                                    ts = item.get("t") / 1000
-                                    trade_time = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
-                                    await on_trade_event(symbol, price, size, trade_time)
-                                elif ev == "H":
-                                    await handle_halt_event(item)
-                                else:
-                                    logger.debug(f"[DEBUG] Unknown event type: {ev} {item}")
-                        except Exception as e:
-                            logger.error(f"[DEBUG] !!! ERROR processing WebSocket message: {e}")
-                            logger.error(f"[DEBUG] Offending message: {message}")
-                            traceback.print_exc()
-
-                async def ws_symbols():
-                    logger.debug("ws_symbols started")
-                    while True:
-                        new_symbols = await symbol_queue.get()
-                        to_unsubscribe = [s for s in subscribed_symbols if s not in new_symbols]
-                        to_subscribe = [s for s in new_symbols if s not in subscribed_symbols]
-                        if not to_unsubscribe and not to_subscribe:
-                            continue
-                        BATCH_SIZE = 100
-                        if to_unsubscribe:
-                            for i in range(0, len(to_unsubscribe), BATCH_SIZE):
-                                remove_params = ",".join([f"T.{s}" for s in to_unsubscribe[i:i+BATCH_SIZE]])
-                                await ws.send(json.dumps({"action": "unsubscribe", "params": remove_params}))
-                                await asyncio.sleep(0.2)
-                        if to_subscribe:
-                            for i in range(0, len(to_subscribe), BATCH_SIZE):
-                                add_params = ",".join([f"T.{s}" for s in to_subscribe[i:i+BATCH_SIZE]])
-                                await ws.send(json.dumps({"action": "subscribe", "params": add_params}))
-                                await asyncio.sleep(0.2)
-                        subscribed_symbols.clear()
-                        subscribed_symbols.update(new_symbols)
-
-                await asyncio.gather(ws_recv(), ws_symbols())
-        except Exception as e:
-            logger.error(f"[DEBUG] Trade WebSocket error: {e}. Reconnecting soon...")
-            await asyncio.sleep(5)
-
-async def main():
-    logger.info("main() started.")
-    loop = asyncio.get_event_loop()
-    setup_signal_handlers(loop)
-    symbol_queue = asyncio.Queue()
-    init_syms = await fetch_top_penny_symbols()
-    logger.info(f"Initial symbols: {init_syms[:10]}... total: {len(init_syms)}")
-    await symbol_queue.put(init_syms)
-    await asyncio.gather(
-        dynamic_symbol_manager(symbol_queue),
-        trade_ws(symbol_queue),
-        send_scheduled_alerts(),
-        news_alerts_task()
-    )
-
-if __name__ == "__main__":
-    logger.info("Starting real-time penny stock spike scanner ($10 & under, 
