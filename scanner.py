@@ -127,7 +127,7 @@ RVOL_SPIKE_THRESHOLD = 2.5
 RVOL_SPIKE_MIN_VOLUME = 25000
 
 MIN_FLOAT_SHARES = 500_000
-MAX_FLOAT_SHARES = 10_000_000
+MAX_FLOAT_SHARES = 12_000_000  # PATCHED to 12 million (was 10 million)
 
 vwap_cum_vol = defaultdict(float)
 vwap_cum_pv = defaultdict(float)
@@ -269,6 +269,12 @@ RUG_PULL_DROP_PCT = -0.10
 RUG_PULL_BOUNCE_PCT = 0.05
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
+    # FLOAT FILTER PATCH: Only process if float is in range
+    float_shares = get_float_shares(symbol)
+    if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
+        logger.debug(f"Skipping {symbol} due to float {float_shares}")
+        return
+
     logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
     if not is_market_scan_time() or close > 20.00:
         return
@@ -418,11 +424,51 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_msg)
 
-# --- Main event loop to keep script alive ---
+# --- Polygon WebSocket Ingest Loop with Float Filter ---
+def polygon_time_to_utc(ts):
+    return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc)
+
+async def ingest_polygon_minute_bars():
+    url = "wss://socket.polygon.io/stocks"
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+        await ws.send(json.dumps({"action": "subscribe", "params": "AM.*"}))  # all US stocks
+
+        print("Subscribed to: AM.* (all tickers)")
+        while True:
+            msg = await ws.recv()
+            try:
+                data = json.loads(msg)
+                if isinstance(data, dict) and data.get("ev") == "status" and data.get("status") == "auth_success":
+                    print("Polygon authentication successful.")
+                if not isinstance(data, list):
+                    continue
+                for event in data:
+                    if event.get("ev") == "AM":
+                        symbol = event["sym"]
+                        open_ = event["o"]
+                        high = event["h"]
+                        low = event["l"]
+                        close = event["c"]
+                        volume = event["v"]
+                        start_time = polygon_time_to_utc(event["s"])
+                        # This will call on_new_candle, which now filters for float
+                        await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+            except Exception as e:
+                print(f"Error processing message: {e}\nRaw: {msg}")
+
+# --- Main event loop ---
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
-    while True:
-        await asyncio.sleep(60)
+    ingest_task = asyncio.create_task(ingest_polygon_minute_bars())
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        print("Main loop cancelled.")
+    finally:
+        ingest_task.cancel()
+        await ingest_task
 
 if __name__ == "__main__":
     try:
