@@ -426,7 +426,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
 # --- Polygon WebSocket Ingest Loop with Float Filter ---
 def polygon_time_to_utc(ts):
-    return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc)
+    # FIX: Convert Polygon ms-since-epoch to seconds
+    return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
 
 async def ingest_polygon_minute_bars():
     url = "wss://socket.polygon.io/stocks"
@@ -451,7 +452,7 @@ async def ingest_polygon_minute_bars():
                         low = event["l"]
                         close = event["c"]
                         volume = event["v"]
-                        start_time = polygon_time_to_utc(event["s"])
+                        start_time = polygon_time_to_utc(event["s"])  # FIXED!
                         # This will call on_new_candle, which now filters for float
                         await on_new_candle(symbol, open_, high, low, close, volume, start_time)
             except Exception as e:
