@@ -19,6 +19,50 @@ import sys  # for platform check
 import requests
 from bs4 import BeautifulSoup
 
+# === INDICATORS: EMA & VWAP ===
+def ema(prices, period):
+    """
+    Calculate Exponential Moving Average (EMA).
+    Args:
+        prices (array-like): List or np.ndarray of prices.
+        period (int): The EMA period (e.g., 5, 8, 13).
+    Returns:
+        np.ndarray: EMA values, same length as prices.
+    """
+    prices = np.asarray(prices, dtype=float)
+    ema = np.zeros_like(prices)
+    alpha = 2 / (period + 1)
+    ema[0] = prices[0]
+    for i in range(1, len(prices)):
+        ema[i] = alpha * prices[i] + (1 - alpha) * ema[i - 1]
+    return ema
+
+def vwap_numpy(prices, volumes):
+    """
+    Calculate Volume Weighted Average Price (VWAP).
+    Args:
+        prices (array-like): List or np.ndarray of prices.
+        volumes (array-like): List or np.ndarray of volumes.
+    Returns:
+        float: VWAP value for the period.
+    """
+    prices = np.asarray(prices, dtype=float)
+    volumes = np.asarray(volumes, dtype=float)
+    return np.sum(prices * volumes) / np.sum(volumes) if np.sum(volumes) > 0 else 0.0
+
+def vwap_candles_numpy(candles):
+    """
+    Calculate VWAP for a list of candles.
+    Each candle is a dict with 'high', 'low', 'close', and 'volume' keys.
+    Args:
+        candles (list of dict): [{'high':..., 'low':..., 'close':..., 'volume':...}, ...]
+    Returns:
+        float: VWAP value for the period.
+    """
+    prices = [(c['high'] + c['low'] + c['close']) / 3 for c in candles]
+    volumes = [c['volume'] for c in candles]
+    return vwap_numpy(prices, volumes)
+
 float_cache = {}
 
 def save_float_cache():
@@ -776,15 +820,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
                     )
 
-    # === CALL EMA STACK ALERT HERE (if you have calculated EMA5/8/13 & VWAP) ===
-    # Example (uncomment and provide actual calculation where appropriate):
-    # if len(candles_seq) >= 13:
-    #     closes = [c['close'] for c in candles_seq]
-    #     ema5 = talib.EMA(np.array(closes), timeperiod=5)[-1]
-    #     ema8 = talib.EMA(np.array(closes), timeperiod=8)[-1]
-    #     ema13 = talib.EMA(np.array(closes), timeperiod=13)[-1]
-    #     vwap_value = vwap
-    #     await check_ema_stack_alert(symbol, list(candles_seq), ema5, ema8, ema13, vwap_value)
+    # === CALL EMA STACK ALERT HERE (now with NumPy, no TA-Lib needed) ===
+    if len(candles_seq) >= 13:
+        closes = [c['close'] for c in candles_seq]
+        ema5 = ema(closes, 5)[-1]
+        ema8 = ema(closes, 8)[-1]
+        ema13 = ema(closes, 13)[-1]
+        vwap_value = vwap_numpy(closes, [c['volume'] for c in candles_seq])
+        await check_ema_stack_alert(symbol, list(candles_seq), ema5, ema8, ema13, vwap_value)
 
 # ...rest of the script: websocket handling, main() etc...
 
