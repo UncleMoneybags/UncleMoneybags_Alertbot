@@ -254,7 +254,7 @@ async def check_ema_stack_alert(symbol, candles, ema5, ema8, ema13, vwap):
             candles[-1]['volume'] >= 100_000
         ):
             alert_msg = (
-                f"⚡️ <b>{symbol}</b> EMA STACK ALERT\n"
+                f"⚡️ <b>{escape_html(symbol)}</b> EMA STACK ALERT\n"
                 f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap:.2f}\n"
                 f"Ratio EMA5/EMA13: {ema5/ema13:.2f}\n"
                 f"1-min Vol: {candles[-1]['volume']:,}"
@@ -280,11 +280,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             prev_vols = [c['volume'] for c in list(candles[symbol])[-5:]]
             avg_prev_5 = sum(prev_vols) / 5
             if volume >= 150_000 and volume >= 2 * avg_prev_5:
-                msg = (
-                    f"🔊 <b>{escape_html(symbol)}</b> volume spike! "
-                    f"{volume:,} shares in 1 minute, 2x last 5min avg ({int(avg_prev_5):,}). "
-                    f"Price: ${close:.2f}"
-                )
+                msg = f"🔊 <b>{escape_html(symbol)}</b> Volume Spike! ${close:.2f}"
                 await send_telegram_async(msg)
                 volume_spike_alerted_today[symbol] = (today, True)
 
@@ -322,10 +318,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
                 logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
                 if higher_lows and rising_volume:
-                    msg = (
-                        f"📉 {escape_html(symbol)} Dip Play: Dropped {dip_pct*100:.1f}% to ${close:.2f}, "
-                        f"2 higher lows with rising volume!"
-                    )
+                    msg = f"📉 <b>{escape_html(symbol)}</b> Dip Play Alert! ${close:.2f}"
                     await send_telegram_async(msg)
                     dip_play_seen.add(symbol)
 
@@ -337,15 +330,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
             if bounce_pct < RUG_PULL_BOUNCE_PCT:
                 if symbol in alerted_symbols:
-                    rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
+                    rug_msg = f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull Warning: Now ${c2['close']:.2f}."
                     await send_telegram_async(rug_msg)
 
-    # === VWAP RECLAIM ALERT ===
-    # - Previous candle close < previous vwap
-    # - Current close > vwap
-    # - 1-min volume >= 100,000
-    # - RVOL for this candle >= 2.0 (relative to previous 20 candles)
-    # - Only once per symbol per session
+    # VWAP Reclaim Alert
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
         prev_close = prev_candle['close']
@@ -375,7 +363,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(msg)
             vwap_reclaimed_once[symbol] = True
 
-    # --- RVOL SPIKE ALERT (unchanged) ---
+    # RVOL Spike Alert
     MIN_PRICE_MOVE_PCT = 0.08
     if len(candles_seq) == 3:
         c0, c1, c2 = list(candles_seq)
@@ -398,10 +386,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         total_volume >= RVOL_SPIKE_MIN_VOLUME and
                         price_move_pct >= MIN_PRICE_MOVE_PCT
                     ):
-                        msg = (
-                            f"🚨 {escape_html(symbol)} Volume Spike! "
-                            f"Price=${c2['close']:.2f}"
-                        )
+                        msg = f"🔥 <b>{escape_html(symbol)}</b> RVOL Volume Spike ${c2['close']:.2f}"
                         await send_telegram_async(msg)
                         alerted_symbols.add(symbol)
                     if rvol < RVOL_MIN:
@@ -446,7 +431,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if conf < 5:
                     return
                 msg = (
-                    f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
+                    f"{emoji} <b>{escape_html(symbol)}</b> up ${move:.2f} in 3 minutes.\n"
                     f"Now ${c2['close']:.2f}. "
                     f"<b>Confidence: {conf}/10</b>"
                 )
@@ -463,17 +448,49 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 ml_prob = score_event_ml("spike", symbol, c2["close"], total_volume, rvol if 'rvol' in locals() else None, 0)
                 if ml_prob > 0.7:
                     await send_telegram_async(
-                        f"🔥 <b>HIGH POTENTIAL RUNNER</b> {escape_html(symbol)} Rocket Fuel: {ml_prob:.2f} 🚀"
+                        f"🔥 <b>HIGH POTENTIAL RUNNER</b> <b>{escape_html(symbol)}</b> Rocket Fuel: {ml_prob:.2f} 🚀"
                     )
 
-    # === CALL EMA STACK ALERT HERE (now with NumPy, no TA-Lib needed) ===
+    # Runner warming up / running alerts
+    if symbol in pending_runner_alert:
+        candidate = pending_runner_alert[symbol]
+        if (start_time - candidate["spike_time"]).total_seconds() == 60:
+            if close >= candidate["spike_close"] * 0.98:
+                today = datetime.now(timezone.utc).date()
+                symbol_day = f"{symbol}_{today}"
+                if symbol_day not in runner_alerted_today:
+                    runner_alerted_today.add(symbol_day)
+                    msg = f"👀 <b>{escape_html(symbol)}</b> Runner Warming Up! ${close:.2f}"
+                    await send_telegram_async(msg)
+                    alerted_symbols.add(symbol)
+                else:
+                    msg = f"🏃 <b>{escape_html(symbol)}</b> Is RUNNING! ${close:.2f}"
+                    await send_telegram_async(msg)
+                    alerted_symbols.add(symbol)
+            del pending_runner_alert[symbol]
+        elif (start_time - candidate["spike_time"]).total_seconds() > 60:
+            del pending_runner_alert[symbol]
+
+    # EMA STACK ALERT (unchanged except bolded ticker)
     if len(candles_seq) >= 13:
         closes = [c['close'] for c in candles_seq]
         ema5 = ema(closes, 5)[-1]
         ema8 = ema(closes, 8)[-1]
         ema13 = ema(closes, 13)[-1]
         vwap_value = vwap_numpy(closes, [c['volume'] for c in candles_seq])
-        await check_ema_stack_alert(symbol, list(candles_seq), ema5, ema8, ema13, vwap_value)
+        if (
+            ema5 > ema8 > ema13 and
+            ema5 > vwap_value and ema8 > vwap_value and ema13 > vwap_value and
+            (ema5 / ema13) >= 1.03 and
+            candles_seq[-1]['volume'] >= 100_000
+        ):
+            alert_msg = (
+                f"⚡️ <b>{escape_html(symbol)}</b> EMA STACK ALERT\n"
+                f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}\n"
+                f"Ratio EMA5/EMA13: {ema5/ema13:.2f}\n"
+                f"1-min Vol: {candles_seq[-1]['volume']:,}"
+            )
+            await send_telegram_async(alert_msg)
 
 # --- Main event loop to keep script alive ---
 async def main():
