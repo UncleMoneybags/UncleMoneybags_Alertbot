@@ -21,14 +21,6 @@ from bs4 import BeautifulSoup
 
 # === INDICATORS: EMA & VWAP ===
 def ema(prices, period):
-    """
-    Calculate Exponential Moving Average (EMA).
-    Args:
-        prices (array-like): List or np.ndarray of prices.
-        period (int): The EMA period (e.g., 5, 8, 13).
-    Returns:
-        np.ndarray: EMA values, same length as prices.
-    """
     prices = np.asarray(prices, dtype=float)
     ema = np.zeros_like(prices)
     alpha = 2 / (period + 1)
@@ -38,27 +30,11 @@ def ema(prices, period):
     return ema
 
 def vwap_numpy(prices, volumes):
-    """
-    Calculate Volume Weighted Average Price (VWAP).
-    Args:
-        prices (array-like): List or np.ndarray of prices.
-        volumes (array-like): List or np.ndarray of volumes.
-    Returns:
-        float: VWAP value for the period.
-    """
     prices = np.asarray(prices, dtype=float)
     volumes = np.asarray(volumes, dtype=float)
     return np.sum(prices * volumes) / np.sum(volumes) if np.sum(volumes) > 0 else 0.0
 
 def vwap_candles_numpy(candles):
-    """
-    Calculate VWAP for a list of candles.
-    Each candle is a dict with 'high', 'low', 'close', and 'volume' keys.
-    Args:
-        candles (list of dict): [{'high':..., 'low':..., 'close':..., 'volume':...}, ...]
-    Returns:
-        float: VWAP value for the period.
-    """
     prices = [(c['high'] + c['low'] + c['close']) / 3 for c in candles]
     volumes = [c['volume'] for c in candles]
     return vwap_numpy(prices, volumes)
@@ -257,7 +233,6 @@ last_runner_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezon
 runner_alerted_today = set()
 
 pending_runner_alert = {}
-pending_breakout_alert = {}
 HALT_LOG_FILE = "halt_event_log.csv"
 
 alerted_symbols = set()
@@ -271,10 +246,6 @@ volume_spike_alerted_today = {}
 
 # === EMA STACK ALERT ===
 async def check_ema_stack_alert(symbol, candles, ema5, ema8, ema13, vwap):
-    """
-    candles: list of dicts with keys ['close', 'volume'], most recent last
-    ema5, ema8, ema13, vwap: float values for latest close
-    """
     try:
         if (
             ema5 > ema8 > ema13 and
@@ -293,265 +264,6 @@ async def check_ema_stack_alert(symbol, candles, ema5, ema8, ema13, vwap):
     except Exception as e:
         logger.error(f"EMA STACK ALERT error for {symbol}: {e}")
 
-def news_matches_keywords(headline, summary):
-    text_block = f"{headline} {summary}".lower()
-    return any(word.lower() in text_block for word in KEYWORDS)
-
-def bold_keywords(text, keywords):
-    def replacer(match):
-        return f"<b>{match.group(0)}</b>"
-    for kw in keywords:
-        regex = re.compile(rf'\b({re.escape(kw)})\b', re.IGNORECASE)
-        text = regex.sub(replacer, text)
-    return text
-
-async def is_under_20(tickers):
-    logger.debug(f"[DEBUG] is_under_20 called for tickers: {tickers}")
-    for ticker in tickers:
-        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    price = None
-                    last_trade = data.get("ticker", {}).get("lastTrade", {})
-                    day = data.get("ticker", {}).get("day", {})
-                    if last_trade and last_trade.get("p", 0) > 0:
-                        price = last_trade["p"]
-                    elif day and day.get("c", 0) > 0:
-                        price = day["c"]
-                    logger.debug(f"[DEBUG] Ticker {ticker} price: {price}")
-                    if price is not None and 0 < price <= 20.00:
-                        return True
-        except Exception as e:
-            logger.error(f"[DEBUG] Price check failed for {ticker}: {e}")
-    return False
-
-async def send_news_telegram_async(message):
-    logger.debug(f"[DEBUG] send_news_telegram_async called. Message: {message}")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.post(url, data=payload, timeout=10) as resp:
-                    result_text = await resp.text()
-                    logger.debug(f"[DEBUG] Telegram API status (news): {resp.status}, response: {result_text}")
-                    if resp.status == 429:
-                        data = await resp.json()
-                        retry = data.get("parameters", {}).get("retry_after", 30)
-                        logger.warning(f"[DEBUG] Rate limited. Waiting {retry} seconds before retrying...")
-                        await asyncio.sleep(retry)
-                        continue
-                    if resp.status != 200:
-                        logger.error(f"[DEBUG] Telegram send error (news): {result_text}")
-                    return
-            except Exception as e:
-                logger.error(f"[DEBUG] Telegram send error (news): {e}")
-                return
-
-async def news_alerts_task():
-    logger.info("news_alerts_task started")
-    global news_seen, latest_news_time
-    url = f"https://api.polygon.io/v2/reference/news?apiKey={POLYGON_API_KEY}&limit=50"
-    while True:
-        logger.debug("news_alerts_task loop")
-        if not is_news_alert_time():
-            await asyncio.sleep(30)
-            continue
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    news_batch = data.get('results', [])
-                    if news_batch:
-                        times = [datetime.fromisoformat(item.get('published_utc').replace('Z', '+00:00')) for item in news_batch if item.get('published_utc')]
-                        most_recent = max(times) if times else None
-                    else:
-                        most_recent = None
-
-                    if latest_news_time is None:
-                        latest_news_time = most_recent
-                        await asyncio.sleep(30)
-                        continue
-
-                    for item in sorted(news_batch, key=lambda x: x.get('published_utc')):
-                        if item['id'] in news_seen:
-                            continue
-
-                        headline = item.get('title', '')
-                        summary = item.get('description', '')
-                        tickers = item.get('tickers', [])
-                        logger.debug(f"[DEBUG] News headline: {headline} | Summary: {summary} | Tickers: {tickers}")
-
-                        if not news_matches_keywords(headline, summary):
-                            continue
-                        if not await is_under_20(tickers):
-                            continue
-
-                        float_filter_pass = True
-                        if YFINANCE_AVAILABLE and tickers:
-                            for t in tickers:
-                                float_shares = get_float_shares(t)
-                                logger.debug(f"[DEBUG] {t}: float={float_shares}")
-                                if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
-                                    float_filter_pass = False
-                                    break
-                        if not float_filter_pass:
-                            logger.debug(f"[DEBUG] Skipping news for ticker due to float filter: {tickers}")
-                            continue
-
-                        if tickers:
-                            tickers_html = ", ".join([
-                                f'<a href="https://finance.yahoo.com/quote/{escape_html(t)}">{escape_html(t)}</a>'
-                                for t in tickers
-                            ])
-                            tickers_str = f"<b>{tickers_html}</b>"
-                        else:
-                            tickers_str = ""
-
-                        headline_clean = escape_html(headline)
-                        summary_clean = escape_html(summary)
-                        headline_bold = f"<b>{bold_keywords(headline_clean, KEYWORDS)}</b>"
-                        summary_it = f"<i>{bold_keywords(summary_clean, KEYWORDS)}</i>" if summary_clean else ""
-
-                        msg = f"📰 {tickers_str}\n{headline_bold}"
-                        if summary_it:
-                            msg += f"\n\n{summary_it}"
-
-                        url_ = item.get("article_url") or item.get("url")
-                        if url_:
-                            msg += f"\n<a href=\"{escape_html(url_)}\">Read more</a>"
-
-                        news_seen.add(item['id'])
-                        save_news_id(item['id'])
-                        await send_news_telegram_async(msg)
-                        await asyncio.sleep(3)
-                    if most_recent:
-                        latest_news_time = most_recent
-            if len(news_seen) > 500:
-                # Use only the last 500 news ids (convert to list and back to set)
-                news_seen = set(list(news_seen)[-500:])
-        except Exception as e:
-            logger.error(f"[DEBUG] News fetch error: {e}")
-        await asyncio.sleep(30)
-
-def is_equity_symbol(ticker):
-    if re.search(r'(\.|\bW$|\bWS$|\bU$|\bR$|\bP$)', ticker):
-        return False
-    if ticker.endswith(('W', 'U', 'R', 'P', 'WS')) or '.' in ticker:
-        return False
-    if any(x in ticker for x in ['WS', 'W', 'U', 'R', 'P', '.']):
-        return False
-    return True
-
-async def is_recent_ipo(ticker):
-    url = f"https://api.polygon.io/v3/reference/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                list_date_str = data.get("results", {}).get("list_date")
-                if list_date_str:
-                    list_date = datetime.strptime(list_date_str, "%Y-%m-%d").date()
-                    # FIX: use timezone-aware now
-                    days_since_ipo = (datetime.now(timezone.utc).date() - list_date).days
-                    if days_since_ipo < MIN_IPO_DAYS:
-                        logger.info(f"{ticker} is a recent IPO ({days_since_ipo} days).")
-                    return days_since_ipo < MIN_IPO_DAYS
-        except Exception as e:
-            logger.error(f"[DEBUG] IPO check failed for {ticker}: {e}")
-    return False
-
-async def fetch_top_penny_symbols():
-    logger.info("fetch_top_penny_symbols called")
-    penny_symbols = []
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}&limit=1000"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                if "tickers" not in data:
-                    logger.debug(f"[DEBUG] Tickers snapshot API response: {data}")
-                    return []
-                for stock in data.get("tickers", []):
-                    ticker = stock.get("ticker")
-                    if not is_equity_symbol(ticker):
-                        continue
-                    if await is_recent_ipo(ticker):
-                        continue
-                    last_trade = stock.get("lastTrade", {})
-                    day = stock.get("day", {})
-                    price = None
-                    price_time = 0
-                    if last_trade and last_trade.get("p", 0) > 0:
-                        price = last_trade["p"]
-                        price_time = last_trade.get("t", 0)
-                    if day and day.get("c", 0) > 0 and (not price or day.get("t", 0) > price_time):
-                        price = day["c"]
-                    volume = day.get("v", 0)
-                    if price is not None and 0 < price <= PRICE_THRESHOLD:
-                        float_shares = get_float_shares(ticker)
-                        logger.debug(f"[DEBUG] {ticker}: float={float_shares}")
-                        if float_shares is None or float_shares < MIN_FLOAT_SHARES or float_shares > MAX_FLOAT_SHARES:
-                            continue
-                        penny_symbols.append(ticker)
-                        if len(penny_symbols) >= MAX_SYMBOLS:
-                            break
-        except Exception as e:
-            logger.error(f"[DEBUG] Tickers snapshot fetch error: {e}")
-    logger.info(f"fetch_top_penny_symbols: found {len(penny_symbols)} symbols")
-    return penny_symbols
-
-current_symbols = set()
-
-async def dynamic_symbol_manager(symbol_queue):
-    logger.info("dynamic_symbol_manager started")
-    global current_symbols
-    while True:
-        logger.debug("dynamic_symbol_manager loop")
-        if is_market_scan_time():
-            symbols = await fetch_top_penny_symbols()
-            if symbols:
-                if set(symbols) != current_symbols:
-                    logger.info(f"dynamic_symbol_manager: updating symbol_queue with {len(symbols)} symbols")
-                    await symbol_queue.put(symbols)
-                    current_symbols = set(symbols)
-        await asyncio.sleep(SCREENER_REFRESH_SEC)
-
-async def on_trade_event(symbol, price, size, trade_time):
-    logger.debug(f"on_trade_event: {symbol}, price: {price}, size: {size}")
-    candle_time = trade_time.replace(second=0, microsecond=0)
-    last_time = trade_candle_last_time.get(symbol)
-    trades = trade_candle_builders[symbol]
-
-    if not isinstance(trades, (list, deque)):
-        logger.error(f"[DEBUG] ERROR: trades for {symbol} is not a list/deque! Actual: {type(trades)} | Value: {trades}")
-        trades = [trades]
-        trade_candle_builders[symbol] = trades
-
-    if last_time is not None and candle_time != last_time:
-        if trades:
-            trades = list(trades)
-            trades.sort(key=lambda t: t[2])
-            prices = [t[0] for t in trades]
-            volumes = [t[1] for t in trades]
-            open_ = prices[0]
-            close = prices[-1]
-            high = max(prices)
-            low = min(prices)
-            volume = sum(volumes)
-            start_time = last_time
-            await on_new_candle(symbol, open_, high, low, close, volume, start_time)
-        trade_candle_builders[symbol] = []
-    trade_candle_builders[symbol].append((price, size, trade_time))
-    trade_candle_last_time[symbol] = candle_time
-
 RUG_PULL_DROP_PCT = -0.10
 RUG_PULL_BOUNCE_PCT = 0.05
 
@@ -560,7 +272,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time() or close > 20.00:
         return
 
-    # ---- PATCH: Volume spike alert per ticker per day ----
     today = datetime.now(timezone.utc).date()
     if volume_spike_alerted_today.get(symbol, (None,))[0] != today:
         volume_spike_alerted_today[symbol] = (today, False)
@@ -593,17 +304,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     vwap_cum_vol[symbol] += volume
     vwap_cum_pv[symbol] += close * volume
     vwap = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else None
-
     candles_seq = candles[symbol]
 
+    # Dip Play Alert
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
-
     if len(candles_seq) >= DIP_LOOKBACK:
         highs = [c["high"] for c in list(candles_seq)[-DIP_LOOKBACK:]]
         rhigh = max(highs)
         recent_high[symbol] = rhigh
-
     if recent_high[symbol] > 0:
         dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
         if dip_pct >= MIN_DIP_PCT and symbol not in dip_play_seen and close <= 20.00:
@@ -620,6 +329,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     await send_telegram_async(msg)
                     dip_play_seen.add(symbol)
 
+    # Rug Pull Warning
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
@@ -630,100 +340,46 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     rug_msg = f"⚠️ {symbol} rug pull warning: Now ${c2['close']:.2f}."
                     await send_telegram_async(rug_msg)
 
-    # Breakout/runner alert logic
-    DUAL_MIN_1M_PRICE_MOVE_PCT = 0.05  # PATCHED: was 0.02, now 5%
-    DUAL_MIN_1M_PRICE_MOVE_ABS = 0.05
-    DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS = 0.10
-    PRE_BREAKOUT_DIST_PCT = 0.05  # PATCHED: was 0.02, now 0.05 (to match 5% min move)
-    PRE_BREAKOUT_DIST_ABS = 0.05
-    VOLUME_SPIKE_MULTIPLIER = 2.5
-    VOLUME_SPIKE_MIN = 5000
+    # === VWAP RECLAIM ALERT ===
+    # - Previous candle close < previous vwap
+    # - Current close > vwap
+    # - 1-min volume >= 100,000
+    # - RVOL for this candle >= 2.0 (relative to previous 20 candles)
+    # - Only once per symbol per session
+    if len(candles_seq) >= 2:
+        prev_candle = list(candles_seq)[-2]
+        prev_close = prev_candle['close']
+        prev_vwap_numerator = vwap_cum_pv[symbol] - close * volume
+        prev_vwap_denominator = vwap_cum_vol[symbol] - volume
+        prev_vwap = prev_vwap_numerator / prev_vwap_denominator if prev_vwap_denominator > 0 else None
 
-    prev_vols = [c["volume"] for c in list(candles_seq)[:-1]]
-    if len(prev_vols) >= 2 and vwap is not None:
-        avg_prev = sum(prev_vols) / len(prev_vols)
-        price_move = close - open_
-        price_move_pct = price_move / open_ if open_ > 0 else 0
-        min_abs = DUAL_MIN_1M_PRICE_MOVE_ABS if close < 2 else DUAL_MIN_1M_PRICE_MOVE_ABS_2PLUS
-        session_high = max([c["high"] for c in candles_seq])
-        dist_from_high = session_high - close
-        dist_pct = dist_from_high / session_high if session_high > 0 else 0
-        now = datetime.now(timezone.utc)
+        trailing_vols = [c['volume'] for c in list(candles_seq)[:-1]]
+        rvol = 0
+        if trailing_vols:
+            avg_trailing = sum(trailing_vols[-20:]) / min(len(trailing_vols), 20)
+            rvol = volume / avg_trailing if avg_trailing > 0 else 0
 
         if (
-            volume > VOLUME_SPIKE_MIN
-            and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
-            and close > open_
-            and close > vwap
-            and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
-            and abs(close - session_high) < 1e-6
-            and (now - last_volume_spike_time[symbol]).total_seconds() > 600
+            prev_close < (prev_vwap if prev_vwap is not None else prev_close) and
+            close > (vwap if vwap is not None else close) and
+            volume >= 100_000 and
+            rvol >= 2.0 and
+            not vwap_reclaimed_once[symbol]
         ):
-            pending_breakout_alert[symbol] = {
-                "breakout_close": close,
-                "breakout_time": start_time
-            }
-            last_volume_spike_time[symbol] = now
+            msg = (
+                f"🔄 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
+                f"Price: ${close:.2f} | VWAP: ${vwap:.2f}\n"
+                f"1-min Vol: {volume:,}\n"
+                f"RVOL: {rvol:.2f}"
+            )
+            await send_telegram_async(msg)
+            vwap_reclaimed_once[symbol] = True
 
-        elif (
-            volume > VOLUME_SPIKE_MIN
-            and volume >= VOLUME_SPIKE_MULTIPLIER * avg_prev
-            and close > open_
-            and close > vwap
-            and (price_move >= min_abs or price_move_pct >= DUAL_MIN_1M_PRICE_MOVE_PCT)
-            and close < session_high
-            and (0 < dist_from_high <= PRE_BREAKOUT_DIST_ABS or 0 < dist_pct <= PRE_BREAKOUT_DIST_PCT)
-            and (now - last_runner_alert_time[symbol]).total_seconds() > 900
-        ):
-            pending_runner_alert[symbol] = {
-                "spike_close": close,
-                "spike_time": start_time,
-            }
-
-    # ---- Breakout/runner confirm logic ----
-    if symbol in pending_breakout_alert:
-        candidate = pending_breakout_alert[symbol]
-        seconds = (start_time - candidate["breakout_time"]).total_seconds()
-        MIN_CONFIRM_VOL = 10000
-        if seconds == 60:
-            if (
-                close >= candidate["breakout_close"] and
-                volume >= MIN_CONFIRM_VOL and
-                high > candidate["breakout_close"]
-            ):
-                msg = f"🚀 {symbol} BREAKOUT CONFIRMED! ${close:.2f}"
-                await send_telegram_async(msg)
-                alerted_symbols.add(symbol)
-            del pending_breakout_alert[symbol]
-        elif seconds > 60:
-            del pending_breakout_alert[symbol]
-
-    if symbol in pending_runner_alert:
-        candidate = pending_runner_alert[symbol]
-        if (start_time - candidate["spike_time"]).total_seconds() == 60:
-            if close >= candidate["spike_close"] * 0.98:
-                today = datetime.now(timezone.utc).date()
-                symbol_day = f"{symbol}_{today}"
-                if symbol_day not in runner_alerted_today:
-                    runner_alerted_today.add(symbol_day)
-                    msg = f"👀 {symbol} runner warming up: ${close:.2f}"
-                    await send_telegram_async(msg)
-                    alerted_symbols.add(symbol)
-                else:
-                    msg = f"🏃 {symbol} is RUNNING: ${close:.2f}"
-                    await send_telegram_async(msg)
-                    alerted_symbols.add(symbol)
-            del pending_runner_alert[symbol]
-        elif (start_time - candidate["spike_time"]).total_seconds() > 60:
-            del pending_runner_alert[symbol]
-
-    # --- RVOL SPIKE ALERT (with price move filter, only if no breakout/runner this run) ---
-    MIN_PRICE_MOVE_PCT = 0.08  # 8% minimum price move required
-
+    # --- RVOL SPIKE ALERT (unchanged) ---
+    MIN_PRICE_MOVE_PCT = 0.08
     if len(candles_seq) == 3:
         c0, c1, c2 = list(candles_seq)
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
-
         rvol_history[symbol].append(total_volume)
         rvol_hist_seq = rvol_history[symbol]
         if not isinstance(rvol_hist_seq, (list, deque)):
@@ -737,7 +393,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     logger.info(f"{symbol} RVOL: {rvol}")
 
                     price_move_pct = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
-
                     if (
                         rvol >= RVOL_SPIKE_THRESHOLD and
                         total_volume >= RVOL_SPIKE_MIN_VOLUME and
@@ -749,13 +404,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         )
                         await send_telegram_async(msg)
                         alerted_symbols.add(symbol)
-
                     if rvol < RVOL_MIN:
                         return
-                else:
-                    return
-            else:
-                return
 
             logger.debug(f"ALERT DEBUG: {symbol} c0={c0['close']} c1={c1['close']} c2={c2['close']} move={c2['close']-c0['close']}")
 
@@ -793,19 +443,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if min(c0["volume"], c1["volume"], c2["volume"]) >= 10000:
                     conf += 1
                 conf = min(conf, 10)
-
                 if conf < 5:
                     return
-
                 msg = (
                     f"{emoji} {escape_html(symbol)} up ${move:.2f} in 3 minutes.\n"
                     f"Now ${c2['close']:.2f}. "
                     f"<b>Confidence: {conf}/10</b>"
                 )
-
                 await send_telegram_async(msg)
                 alerted_symbols.add(symbol)
-
                 log_event(
                     event_type="spike",
                     symbol=symbol,
@@ -829,13 +475,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         vwap_value = vwap_numpy(closes, [c['volume'] for c in candles_seq])
         await check_ema_stack_alert(symbol, list(candles_seq), ema5, ema8, ema13, vwap_value)
 
-# ...rest of the script: websocket handling, main() etc...
-
-# Websocket and main event loop logic (example stub)
+# --- Main event loop to keep script alive ---
 async def main():
-    # Your main loop, websocket connection setup, symbol management, etc.
-    # This is just a placeholder; your full code should go here.
-    pass
+    print("Main event loop running. Press Ctrl+C to exit.")
+    while True:
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
     try:
