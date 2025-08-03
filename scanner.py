@@ -127,7 +127,7 @@ RVOL_SPIKE_THRESHOLD = 2.5
 RVOL_SPIKE_MIN_VOLUME = 25000
 
 MIN_FLOAT_SHARES = 500_000
-MAX_FLOAT_SHARES = 12_000_000  # PATCHED to 12 million (was 10 million)
+MAX_FLOAT_SHARES = 10_000_000  # PATCHED to 10 million (was 12 million)
 
 vwap_cum_vol = defaultdict(float)
 vwap_cum_pv = defaultdict(float)
