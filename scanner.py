@@ -314,8 +314,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     today = datetime.now(timezone.utc).date()
 
+    candles_seq = candles[symbol]
+
     # --- WARMING UP LOGIC PATCH (STRICT) ---
-    if len(candles_seq := candles[symbol]) >= 6:
+    if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5
@@ -411,7 +413,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     rug_msg = f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull Warning: Now ${c2['close']:.2f}."
                     await send_telegram_async(rug_msg)
 
-    # VWAP Reclaim Alert
+    # VWAP Reclaim Alert (EMOJI FIXED TO CHART UP 📈)
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
         prev_close = prev_candle['close']
@@ -433,8 +435,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             not vwap_reclaimed_once[symbol]
         ):
             msg = (
-                f"🔄 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
-                f"Price: ${close:.2f} | VWAP: ${(vwap_cum_pv[symbol] / vwap_cum_vol[symbol]) if vwap_cum_vol[symbol] > 0 else 0:.2f}\n"
+                f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
+                f"Price: ${close:.2f} | VWAP: {(vwap_cum_pv[symbol] / vwap_cum_vol[symbol]) if vwap_cum_vol[symbol] > 0 else 0:.2f}\n"
                 f"1-min Vol: {volume:,}\n"
                 f"RVOL: {rvol:.2f} (float {float_shares:,})"
             )
