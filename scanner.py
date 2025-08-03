@@ -144,7 +144,7 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "VmF1boger0pp2M7gV5HboHheRbp
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1002266463234")
 PRICE_THRESHOLD = 20.00
-MAX_SYMBOLS = 3000
+MAX_SYMBOLS = 1000
 SCREENER_REFRESH_SEC = 30
 MIN_ALERT_MOVE = 0.15
 MIN_3MIN_VOLUME = 25000
@@ -269,8 +269,16 @@ vwap_reclaimed_once = defaultdict(bool)
 dip_play_seen = set()
 recent_high = defaultdict(float)
 
-volume_spike_alerted = set()  # not used
+volume_spike_alerted = set()
 rvol_spike_alerted = set()
+
+# Track tickers you've sent halt alerts for
+halted_symbols = set()
+
+# You may have a function or list that tracks "scanned tickers".
+# Here, we dynamically track all tickers with candles (those scanned/alerted)
+def get_scanned_tickers():
+    return set(candles.keys())
 
 async def check_ema_stack_alert(symbol, candles, ema5, ema8, ema13, vwap, float_shares):
     try:
@@ -512,7 +520,6 @@ async def premarket_gainers_alert_loop():
     while True:
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
-        # Monday=0, ..., Friday=4
         if now_est.weekday() in range(0, 5):
             if now_est.time().hour == 9 and now_est.time().minute >= 25 and not sent_today:
                 gainers = await get_premarket_gainers_yahoo()
@@ -526,7 +533,6 @@ async def premarket_gainers_alert_loop():
                 sent_today = True
         else:
             sent_today = False
-        # Reset for new day
         if now_est.time() < time(9, 20):
             sent_today = False
         await asyncio.sleep(30)
@@ -538,31 +544,56 @@ async def market_close_alert_loop():
     while True:
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
-        # Monday=0, ..., Thursday=3
         if now_est.weekday() in (0, 1, 2, 3):
             if now_est.time() >= time(20, 1) and not sent_today:
                 await send_telegram_async("Market Closed. Reconvene in pre market tomorrow.")
                 sent_today = True
         else:
             sent_today = False
-        # Reset for new day
         if now_est.time() < time(20, 0):
             sent_today = False
         await asyncio.sleep(30)
 
-async def ingest_polygon_minute_bars():
+# --- HALT & RESUME ALERT LOGIC ---
+async def handle_halt_event(event):
+    symbol = event.get("sym")
+    status = event.get("status")
+    reason = event.get("reason", "")
+    scanned = get_scanned_tickers()
+    if symbol in scanned:
+        msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}"
+        await send_telegram_async(msg)
+        halted_symbols.add(symbol)
+        with open(HALT_LOG_FILE, "a") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()},{symbol},{status},{reason}\n")
+        logger.info(f"HALT ALERT sent for {symbol}")
+
+async def handle_resume_event(event):
+    symbol = event.get("sym")
+    reason = event.get("reason", "")
+    if symbol in halted_symbols:
+        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}"
+        await send_telegram_async(msg)
+        halted_symbols.remove(symbol)
+
+# --- INGEST (Polygon Minute Bars + Status Events) ---
+async def ingest_polygon_events():
     url = "wss://socket.polygon.io/stocks"
     async with websockets.connect(url) as ws:
         await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-        await ws.send(json.dumps({"action": "subscribe", "params": "AM.*"}))
+        await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
 
-        print("Subscribed to: AM.* (all tickers)")
+        print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
         while True:
             msg = await ws.recv()
             try:
                 data = json.loads(msg)
-                if isinstance(data, dict) and data.get("ev") == "status" and data.get("status") == "auth_success":
-                    print("Polygon authentication successful.")
+                # Handle status events (halts/resumes)
+                if isinstance(data, dict) and data.get("ev") == "status":
+                    if data.get("status") == "halt":
+                        await handle_halt_event(data)
+                    elif data.get("status") == "resume":
+                        await handle_resume_event(data)
                 if not isinstance(data, list):
                     continue
                 for event in data:
@@ -574,13 +605,27 @@ async def ingest_polygon_minute_bars():
                         close = event["c"]
                         volume = event["v"]
                         start_time = polygon_time_to_utc(event["s"])
+                        candles[symbol].append({
+                            "open": open_,
+                            "high": high,
+                            "low": low,
+                            "close": close,
+                            "volume": volume,
+                            "start_time": start_time,
+                        })
+                        vwap_cum_vol[symbol] += volume
+                        vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
                         await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                    elif event.get("ev") == "status" and event.get("status") == "halt":
+                        await handle_halt_event(event)
+                    elif event.get("ev") == "status" and event.get("status") == "resume":
+                        await handle_resume_event(event)
             except Exception as e:
                 print(f"Error processing message: {e}\nRaw: {msg}")
 
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
-    ingest_task = asyncio.create_task(ingest_polygon_minute_bars())
+    ingest_task = asyncio.create_task(ingest_polygon_events())
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     try:
