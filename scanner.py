@@ -18,6 +18,7 @@ import atexit
 import sys  # for platform check
 import requests
 from bs4 import BeautifulSoup
+import time
 
 # === INDICATORS: EMA & VWAP & RSI & Bollinger Bands ===
 EMA_PERIODS = [5, 8, 13]
@@ -95,7 +96,8 @@ def load_float_cache():
         print(f"[DEBUG] No float cache found, starting new.")
 
 def get_float_shares(ticker):
-    if ticker in float_cache:
+    # If ticker is cached and value is valid (not None), use it:
+    if ticker in float_cache and float_cache[ticker] is not None:
         print(f"[DEBUG] Cache HIT for {ticker}: {float_cache[ticker]}")
         return float_cache[ticker]
     print(f"[DEBUG] Cache MISS for {ticker}")
@@ -103,15 +105,22 @@ def get_float_shares(ticker):
         import yfinance as yf
         info = yf.Ticker(ticker).info
         float_shares = info.get('floatShares', None)
-        float_cache[ticker] = float_shares
-        save_float_cache()
-        print(f"[DEBUG] Cached float for {ticker}: {float_shares}")
+        # Only update cache if we got a valid value
+        if float_shares is not None:
+            float_cache[ticker] = float_shares
+            save_float_cache()
+            print(f"[DEBUG] Cached float for {ticker}: {float_shares}")
+        else:
+            print(f"[DEBUG] Yahoo float error for {ticker}: No floatShares found")
+        # Sleep to avoid hammering Yahoo
+        time.sleep(0.5)
         return float_shares
     except Exception as e:
-        float_cache[ticker] = None
-        save_float_cache()
         print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
-        return None
+        # Do NOT overwrite valid cache entry with None on error/rate limit
+        if "Rate limited" in str(e):
+            time.sleep(10)
+        return float_cache.get(ticker, None)
 
 load_float_cache()
 
