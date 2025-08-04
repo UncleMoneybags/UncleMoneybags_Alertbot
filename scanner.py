@@ -280,36 +280,11 @@ ema_stack_alerted_today = {}  # <--- NEW: Track EMA stack alerts per ticker per 
 def get_scanned_tickers():
     return set(candles.keys())
 
-async def check_ema_stack_alert(symbol, candles, ema5, ema8, ema13, vwap, float_shares):
-    try:
-        if (
-            float_shares is not None and float_shares <= 10_000_000 and
-            ema5 > ema8 > ema13 and
-            (ema5 / ema13) >= 1.01 and
-            candles[-1]['volume'] >= 20_000
-        ):
-            event_time = datetime.now(timezone.utc)
-            log_event("ema_stack", symbol, candles[-1]['close'], candles[-1]['volume'], event_time, {
-                "ema5": ema5,
-                "ema8": ema8,
-                "ema13": ema13,
-                "vwap": vwap
-            })
-            alert_msg = (
-                f"⚡️ <b>{escape_html(symbol)}</b> EMA STACK ALERT\n"
-                f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap:.2f}\n"
-                f"Ratio EMA5/EMA13: {ema5/ema13:.2f}"
-            )
-            await send_telegram_async(alert_msg)
-            alerted_symbols[symbol] = datetime.now(timezone.utc).date()
-            logger.info(f"EMA STACK ALERT sent for {symbol}")
-    except Exception as e:
-        logger.error(f"EMA STACK ALERT error for {symbol}: {e}")
-
 RUG_PULL_DROP_PCT = -0.10
 RUG_PULL_BOUNCE_PCT = 0.05
 
-# PATCH: Multi-Alert Handling with single alert emoji logic
+# PATCHED: All alerts (single or multi) include current price.
+# PATCHED: EMA5 must be above VWAP and price above VWAP for EMA Stack alert!
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     float_shares = get_float_shares(symbol)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
@@ -323,11 +298,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
 
-    # --- PATCH: Multi-Alert Handling ---
     triggered_alerts = []
     event_time = datetime.now(timezone.utc)
 
-    # --- WARMING UP LOGIC PATCH (STRICT) ---
+    # WARMING UP ALERT
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -354,7 +328,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             triggered_alerts.append("Warming Up")
             alerted_symbols[symbol] = today
 
-    # --- RUNNER ALERT LOGIC (STRICT, ONLY AFTER WARMING UP) ---
+    # RUNNER ALERT LOGIC
     if len(candles_seq) >= 6 and symbol in alerted_symbols and alerted_symbols[symbol] == today:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -377,7 +351,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             triggered_alerts.append("Runner")
             last_runner_alert_time[symbol] = today
 
-    # --- OVERSOLD BOUNCE ALERT ---
+    # OVERSOLD BOUNCE ALERT
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -423,7 +397,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     dip_play_seen.add(symbol)
                     alerted_symbols[symbol] = today
 
-    # --- RUG PULL WARNING ---
+    # RUG PULL WARNING
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
@@ -437,7 +411,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     })
                     triggered_alerts.append("Rug Pull")
 
-    # VWAP Reclaim Alert
+    # VWAP RECLAIM ALERT
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
         prev_close = prev_candle['close']
@@ -465,7 +439,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             vwap_reclaimed_once[symbol] = True
             alerted_symbols[symbol] = today
 
-    # --- RVOL SPIKE ALERT ---
+    # RVOL SPIKE ALERT
     MIN_PRICE_MOVE_PCT = 0.08
     if symbol not in rvol_spike_alerted and len(candles_seq) == 3:
         c0, c1, c2 = list(candles_seq)
@@ -498,7 +472,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     if rvol < RVOL_MIN:
                         return
 
-    # --- EMA STACK ALERT --- (patched: single alert per ticker per day, AND price above VWAP)
+    # EMA STACK ALERT (single alert per ticker per day, price above VWAP AND EMA5 above VWAP)
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -512,8 +486,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema5 > ema8 > ema13 and
             (ema5 / ema13) >= 1.01 and
             candles_seq[-1]['volume'] >= 20_000 and
-            closes[-1] > vwap_value and  # PATCH: price must be above VWAP
-            (ema_stack_alerted_today.get(symbol) != today)
+            closes[-1] > vwap_value and
+            ema5 > vwap_value
+            and (ema_stack_alerted_today.get(symbol) != today)
         ):
             log_event("ema_stack", symbol, candles_seq[-1]['close'], candles_seq[-1]['volume'], event_time, {
                 "ema5": ema5,
@@ -525,8 +500,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema_stack_alerted_today[symbol] = today
             alerted_symbols[symbol] = today
 
-    # --- PATCH: Send correct emoji for single alerts; 💰 for multi-alerts ---
+    # PATCH: Every alert (single or multi) shows current price
     if triggered_alerts:
+        price_str = f"Current Price: ${close:.2f}"
         if len(triggered_alerts) == 1:
             alert_type = triggered_alerts[0]
             emoji = (
@@ -540,9 +516,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "⚡️" if alert_type == "EMA Stack" else
                 "❓"
             )
-            alert_text = f"{emoji} <b>{escape_html(symbol)}</b> {alert_type}"
+            alert_text = f"{emoji} <b>{escape_html(symbol)}</b> {alert_type}\n{price_str}"
         else:
-            alert_text = f"💰 <b>{escape_html(symbol)}</b> triggered: {', '.join(triggered_alerts)}"
+            alert_text = f"💰 <b>{escape_html(symbol)}</b> {price_str} triggered: {', '.join(triggered_alerts)}"
         await send_telegram_async(alert_text)
 
 def polygon_time_to_utc(ts):
