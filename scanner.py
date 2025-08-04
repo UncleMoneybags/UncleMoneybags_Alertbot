@@ -6,7 +6,7 @@ import json
 import html
 import re
 from collections import deque, defaultdict
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta, date, time as dt_time
 import pytz
 import signal
 import pickle
@@ -226,8 +226,8 @@ def is_market_scan_time():
     now_ny = now_utc.astimezone(ny)
     if now_ny.weekday() >= 5:
         return False
-    scan_start = time(4, 0)
-    scan_end = time(20, 0)
+    scan_start = dt_time(4, 0)
+    scan_end = dt_time(20, 0)
     return scan_start <= now_ny.time() <= scan_end
 
 def is_news_alert_time():
@@ -236,8 +236,8 @@ def is_news_alert_time():
     now_ny = now_utc.astimezone(ny)
     if now_ny.weekday() >= 5:
         return False
-    start = time(7, 0)
-    end = time(20, 0)
+    start = dt_time(7, 0)
+    end = dt_time(20, 0)
     return start <= now_ny.time() <= end
 
 async def send_telegram_async(message):
@@ -623,7 +623,7 @@ async def premarket_gainers_alert_loop():
                 sent_today = True
         else:
             sent_today = False
-        if now_est.time() < time(9, 20):
+        if now_est.time() < dt_time(9, 20):
             sent_today = False
         await asyncio.sleep(30)
 
@@ -634,14 +634,14 @@ async def market_close_alert_loop():
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
         if now_est.weekday() in (0, 1, 2, 3):
-            if now_est.time() >= time(20, 1) and not sent_today:
+            if now_est.time() >= dt_time(20, 1) and not sent_today:
                 await send_telegram_async("Market Closed. Reconvene in pre market tomorrow.")
                 event_time = datetime.now(timezone.utc)
                 log_event("market_close", "CLOSE", 0, 0, event_time)
                 sent_today = True
         else:
             sent_today = False
-        if now_est.time() < time(20, 0):
+        if now_est.time() < dt_time(20, 0):
             sent_today = False
         await asyncio.sleep(30)
 
