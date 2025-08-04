@@ -20,6 +20,9 @@ import requests
 from bs4 import BeautifulSoup
 
 # === INDICATORS: EMA & VWAP & RSI & Bollinger Bands ===
+# EMA periods to use everywhere
+EMA_PERIODS = [5, 8, 13]
+
 def ema(prices, period):
     prices = np.asarray(prices, dtype=float)
     ema = np.zeros_like(prices)
@@ -498,12 +501,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
-        len(candles_seq) >= 13
+        len(candles_seq) >= max(EMA_PERIODS)
     ):
         closes = [c['close'] for c in candles_seq]
-        ema5 = ema(closes, 5)[-1]
-        ema8 = ema(closes, 8)[-1]
-        ema13 = ema(closes, 13)[-1]
+        ema_vals = {period: ema(closes, period)[-1] for period in EMA_PERIODS}
+        ema5, ema8, ema13 = ema_vals[5], ema_vals[8], ema_vals[13]
         vwap_value = vwap_numpy(closes, [c['volume'] for c in candles_seq])
         if (
             ema5 > ema8 > ema13 and
