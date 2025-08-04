@@ -20,7 +20,6 @@ import requests
 from bs4 import BeautifulSoup
 
 # === INDICATORS: EMA & VWAP & RSI & Bollinger Bands ===
-# EMA periods to use everywhere
 EMA_PERIODS = [5, 8, 13]
 
 def ema(prices, period):
@@ -276,6 +275,8 @@ volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
 
+ema_stack_alerted_today = {}  # <--- NEW: Track EMA stack alerts per ticker per day
+
 def get_scanned_tickers():
     return set(candles.keys())
 
@@ -497,7 +498,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     if rvol < RVOL_MIN:
                         return
 
-    # --- EMA STACK ALERT ---
+    # --- EMA STACK ALERT --- (patched: single alert per ticker per day)
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -510,7 +511,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         if (
             ema5 > ema8 > ema13 and
             (ema5 / ema13) >= 1.01 and
-            candles_seq[-1]['volume'] >= 20_000
+            candles_seq[-1]['volume'] >= 20_000 and
+            (ema_stack_alerted_today.get(symbol) != today)  # PATCH: Only ONE EMA Stack alert per day per ticker
         ):
             log_event("ema_stack", symbol, candles_seq[-1]['close'], candles_seq[-1]['volume'], event_time, {
                 "ema5": ema5,
@@ -519,6 +521,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "vwap": vwap_value
             })
             triggered_alerts.append("EMA Stack")
+            ema_stack_alerted_today[symbol] = today
             alerted_symbols[symbol] = today
 
     # --- PATCH: Send correct emoji for single alerts; 💰 for multi-alerts ---
@@ -544,7 +547,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 def polygon_time_to_utc(ts):
     return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
 
-# --- Yahoo Finance News Scraper for a Ticker ---
 async def get_ticker_news_yahoo(ticker):
     url = f"https://finance.yahoo.com/quote/{ticker}/news?p={ticker}"
     try:
@@ -579,6 +581,7 @@ def highlight_keywords(title, keywords):
         return word
     return bold_match(title)
 
+# PATCH: News alert loop now runs every 60 seconds instead of 180
 async def catalyst_news_alert_loop():
     global news_seen
     while True:
@@ -602,7 +605,7 @@ async def catalyst_news_alert_loop():
                         })
                         news_seen.add(news_id)
                         save_news_id(news_id)
-        await asyncio.sleep(180)
+        await asyncio.sleep(60)  # <-- Now runs every 60 seconds
 
 async def get_premarket_gainers_yahoo():
     url = "https://finance.yahoo.com/premarket/"
