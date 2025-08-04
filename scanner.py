@@ -498,7 +498,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     if rvol < RVOL_MIN:
                         return
 
-    # --- EMA STACK ALERT --- (patched: single alert per ticker per day)
+    # --- EMA STACK ALERT --- (patched: single alert per ticker per day, AND price above VWAP)
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -512,7 +512,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema5 > ema8 > ema13 and
             (ema5 / ema13) >= 1.01 and
             candles_seq[-1]['volume'] >= 20_000 and
-            (ema_stack_alerted_today.get(symbol) != today)  # PATCH: Only ONE EMA Stack alert per day per ticker
+            closes[-1] > vwap_value and  # PATCH: price must be above VWAP
+            (ema_stack_alerted_today.get(symbol) != today)
         ):
             log_event("ema_stack", symbol, candles_seq[-1]['close'], candles_seq[-1]['volume'], event_time, {
                 "ema5": ema5,
