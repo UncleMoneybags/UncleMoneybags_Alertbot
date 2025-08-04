@@ -271,12 +271,8 @@ recent_high = defaultdict(float)
 
 volume_spike_alerted = set()
 rvol_spike_alerted = set()
-
-# Track tickers you've sent halt alerts for
 halted_symbols = set()
 
-# You may have a function or list that tracks "scanned tickers".
-# Here, we dynamically track all tickers with candles (those scanned/alerted)
 def get_scanned_tickers():
     return set(candles.keys())
 
@@ -288,6 +284,13 @@ async def check_ema_stack_alert(symbol, candles, ema5, ema8, ema13, vwap, float_
             (ema5 / ema13) >= 1.01 and
             candles[-1]['volume'] >= 20_000
         ):
+            event_time = datetime.now(timezone.utc)
+            log_event("ema_stack", symbol, candles[-1]['close'], candles[-1]['volume'], event_time, {
+                "ema5": ema5,
+                "ema8": ema8,
+                "ema13": ema13,
+                "vwap": vwap
+            })
             alert_msg = (
                 f"⚡️ <b>{escape_html(symbol)}</b> EMA STACK ALERT\n"
                 f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap:.2f}\n"
@@ -313,7 +316,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         return
 
     today = datetime.now(timezone.utc).date()
-
     candles_seq = candles[symbol]
 
     # --- WARMING UP LOGIC PATCH (STRICT) ---
@@ -336,6 +338,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             close_wu > vwap_wu and
             dollar_volume_wu >= 100_000
         ):
+            event_time = datetime.now(timezone.utc)
+            log_event("warming_up", symbol, close_wu, volume_wu, event_time, {
+                "price_move": price_move_wu,
+                "dollar_volume": dollar_volume_wu
+            })
             msg = f"🌡️ <b>{escape_html(symbol)}</b> Warming Up ${close_wu:.2f}"
             await send_telegram_async(msg)
             alerted_symbols[symbol] = today
@@ -357,6 +364,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             close_rn >= 0.50 and
             (not last_runner_alert_time[symbol] or last_runner_alert_time[symbol] < today)
         ):
+            event_time = datetime.now(timezone.utc)
+            log_event("runner", symbol, close_rn, volume_rn, event_time, {
+                "price_move": price_move_rn
+            })
             msg = f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner Alert ${close_rn:.2f}"
             await send_telegram_async(msg)
             last_runner_alert_time[symbol] = today
@@ -377,6 +388,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             closes[-1] <= lower_band[-1] and
             last_candle['close'] > last_candle['open']
         ):
+            event_time = datetime.now(timezone.utc)
+            log_event("oversold_bounce", symbol, close, volume, event_time, {
+                "rsi": rsi_val,
+                "lower_band": lower_band[-1]
+            })
             msg = f"🏀 <b>{escape_html(symbol)}</b> Oversold ${close:.2f}"
             await send_telegram_async(msg)
             alerted_symbols[symbol] = today
@@ -397,6 +413,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
                 logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
                 if higher_lows and rising_volume:
+                    event_time = datetime.now(timezone.utc)
+                    log_event("dip_play", symbol, close, volume, event_time, {
+                        "dip_pct": dip_pct
+                    })
                     msg = f"📉 <b>{escape_html(symbol)}</b> Dip Play Alert! ${close:.2f}"
                     await send_telegram_async(msg)
                     dip_play_seen.add(symbol)
@@ -410,6 +430,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
             if bounce_pct < RUG_PULL_BOUNCE_PCT:
                 if symbol in alerted_symbols and alerted_symbols[symbol] == today:
+                    event_time = datetime.now(timezone.utc)
+                    log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
+                        "drop_pct": drop_pct,
+                        "bounce_pct": bounce_pct
+                    })
                     rug_msg = f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull Warning: Now ${c2['close']:.2f}."
                     await send_telegram_async(rug_msg)
 
@@ -434,6 +459,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             rvol >= 2.0 and
             not vwap_reclaimed_once[symbol]
         ):
+            event_time = datetime.now(timezone.utc)
+            log_event("vwap_reclaim", symbol, close, volume, event_time, {
+                "rvol": rvol
+            })
             msg = (
                 f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
                 f"Price: ${close:.2f} | VWAP: {(vwap_cum_pv[symbol] / vwap_cum_vol[symbol]) if vwap_cum_vol[symbol] > 0 else 0:.2f}\n"
@@ -444,7 +473,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             vwap_reclaimed_once[symbol] = True
             alerted_symbols[symbol] = today
 
-    # --- RVOL SPIKE ALERT (ONCE PER TICKER PER SESSION, LABELLED AS VOLUME SPIKE WITH FIRE EMOJI) ---
+    # --- RVOL SPIKE ALERT (ONCE PER TICKER PER SESSION) ---
     MIN_PRICE_MOVE_PCT = 0.08
     if symbol not in rvol_spike_alerted and len(candles_seq) == 3:
         c0, c1, c2 = list(candles_seq)
@@ -467,6 +496,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         total_volume >= RVOL_SPIKE_MIN_VOLUME and
                         price_move_pct >= MIN_PRICE_MOVE_PCT
                     ):
+                        event_time = datetime.now(timezone.utc)
+                        log_event("volume_spike", symbol, c2['close'], total_volume, event_time, {
+                            "rvol": rvol,
+                            "price_move_pct": price_move_pct
+                        })
                         msg = f"🔥 <b>{escape_html(symbol)}</b> Volume Spike ${c2['close']:.2f}"
                         await send_telegram_async(msg)
                         rvol_spike_alerted.add(symbol)
@@ -487,10 +521,82 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         ema8 = ema(closes, 8)[-1]
         ema13 = ema(closes, 13)[-1]
         vwap_value = vwap_numpy(closes, [c['volume'] for c in candles_seq])
+        event_time = datetime.now(timezone.utc)
+        log_event("ema_stack", symbol, candles_seq[-1]['close'], candles_seq[-1]['volume'], event_time, {
+            "ema5": ema5,
+            "ema8": ema8,
+            "ema13": ema13,
+            "vwap": vwap_value
+        })
         await check_ema_stack_alert(symbol, candles_seq, ema5, ema8, ema13, vwap_value, float_shares)
 
 def polygon_time_to_utc(ts):
     return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
+
+# --- Yahoo Finance News Scraper for a Ticker ---
+async def get_ticker_news_yahoo(ticker):
+    url = f"https://finance.yahoo.com/quote/{ticker}/news?p={ticker}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                html_text = await resp.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        news_items = []
+        for item in soup.find_all('li', class_='js-stream-content'):
+            headline_tag = item.find('h3')
+            if not headline_tag:
+                continue
+            title = headline_tag.text.strip()
+            link_tag = headline_tag.find('a')
+            if not link_tag or not link_tag.get('href'):
+                continue
+            link = link_tag['href']
+            if not link.startswith('http'):
+                link = f"https://finance.yahoo.com{link}"
+            news_items.append((title, link))
+        return news_items
+    except Exception as e:
+        logger.error(f"[NEWS SCRAPER ERROR] {ticker}: {e}")
+        return []
+
+def highlight_keywords(title, keywords):
+    # Bold any keywords found in the title (case-insensitive)
+    words = set(kw.lower() for kw in keywords)
+    # Only bold full matches (not substrings within other words)
+    def bold_match(word):
+        for kw in words:
+            # e.g. FDA vs "FDA" in "FDA Approval"
+            pattern = r'\b(' + re.escape(kw) + r')\b'
+            word = re.sub(pattern, r"<b>\1</b>", word, flags=re.IGNORECASE)
+        return word
+    return bold_match(title)
+
+async def catalyst_news_alert_loop():
+    global news_seen
+    while True:
+        tickers = list(get_scanned_tickers())
+        for symbol in tickers:
+            news_items = await get_ticker_news_yahoo(symbol)
+            for title, link in news_items:
+                # Only alert if headline has a catalyst keyword
+                if any(kw.lower() in title.lower() for kw in KEYWORDS):
+                    news_id = f"{symbol}:{title}"
+                    if news_id not in news_seen:
+                        # Format: newspaper emoji, bold ticker, headline (keywords bolded), link
+                        headline_fmt = highlight_keywords(title, KEYWORDS)
+                        msg = (
+                            f"📰 <b>{escape_html(symbol)}</b> {headline_fmt}\n"
+                            f"{link}"
+                        )
+                        await send_telegram_async(msg)
+                        event_time = datetime.now(timezone.utc)
+                        log_event("news_alert", symbol, 0, 0, event_time, {
+                            "headline": title,
+                            "link": link
+                        })
+                        news_seen.add(news_id)
+                        save_news_id(news_id)
+        await asyncio.sleep(180)
 
 # --- Yahoo Finance Premarket Gainers Scraper ---
 async def get_premarket_gainers_yahoo():
@@ -532,6 +638,8 @@ async def premarket_gainers_alert_loop():
                     f"{gainers_text}"
                 )
                 await send_telegram_async(msg)
+                event_time = datetime.now(timezone.utc)
+                log_event("premarket_gainers", "PREMARKET", 0, 0, event_time, {"gainers": gainers_text})
                 sent_today = True
         else:
             sent_today = False
@@ -549,6 +657,8 @@ async def market_close_alert_loop():
         if now_est.weekday() in (0, 1, 2, 3):
             if now_est.time() >= time(20, 1) and not sent_today:
                 await send_telegram_async("Market Closed. Reconvene in pre market tomorrow.")
+                event_time = datetime.now(timezone.utc)
+                log_event("market_close", "CLOSE", 0, 0, event_time)
                 sent_today = True
         else:
             sent_today = False
@@ -565,6 +675,8 @@ async def handle_halt_event(event):
     if symbol in scanned:
         msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}"
         await send_telegram_async(msg)
+        event_time = datetime.now(timezone.utc)
+        log_event("halt", symbol, 0, 0, event_time, {"status": status, "reason": reason})
         halted_symbols.add(symbol)
         with open(HALT_LOG_FILE, "a") as f:
             f.write(f"{datetime.now(timezone.utc).isoformat()},{symbol},{status},{reason}\n")
@@ -576,6 +688,8 @@ async def handle_resume_event(event):
     if symbol in halted_symbols:
         msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}"
         await send_telegram_async(msg)
+        event_time = datetime.now(timezone.utc)
+        log_event("resume", symbol, 0, 0, event_time, {"reason": reason})
         halted_symbols.remove(symbol)
 
 # --- INGEST (Polygon Minute Bars + Status Events) ---
@@ -630,6 +744,7 @@ async def main():
     ingest_task = asyncio.create_task(ingest_polygon_events())
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
+    catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())  # ADDED
     try:
         while True:
             await asyncio.sleep(60)
@@ -639,9 +754,11 @@ async def main():
         ingest_task.cancel()
         close_alert_task.cancel()
         premarket_alert_task.cancel()
+        catalyst_news_task.cancel()
         await ingest_task
         await close_alert_task
         await premarket_alert_task
+        await catalyst_news_task
 
 if __name__ == "__main__":
     try:
