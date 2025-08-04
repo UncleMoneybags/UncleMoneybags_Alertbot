@@ -341,8 +341,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
         if (
             volume_wu >= 1.5 * avg_vol_5 and
-            price_move_wu >= 0.02 and
-            close_wu >= 0.50 and
+            price_move_wu >= 0.03 and
+            0.20 <= close_wu <= 20.00 and
             close_wu > vwap_wu and
             dollar_volume_wu >= 100_000
         ):
@@ -358,8 +358,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
 
-    # --- RUNNER: only if Warming Up sent for ticker today, only once per ticker per day ---
-    if len(candles_seq) >= 6 and alerted_symbols.get(symbol) == today and runner_alerted_today.get(symbol) != today:
+    # --- RUNNER: any stock that meets the criteria gets alerted, must be above VWAP ---
+    if len(candles_seq) >= 6 and runner_alerted_today.get(symbol) != today:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5
@@ -368,11 +368,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         close_rn = last_candle['close']
         volume_rn = last_candle['volume']
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
+        # Must be above session VWAP
+        vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
 
         if (
             volume_rn >= 2 * avg_vol_5 and
             price_move_rn >= 0.08 and
-            close_rn >= 0.50
+            close_rn >= 0.50 and
+            close_rn > vwap_rn
         ):
             log_event("runner", symbol, close_rn, volume_rn, event_time, {
                 "price_move": price_move_rn
