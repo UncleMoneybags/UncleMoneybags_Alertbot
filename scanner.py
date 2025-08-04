@@ -74,6 +74,9 @@ def bollinger_bands(prices, period=20, num_std=2):
     sma = pad + list(sma)
     return lower_band, sma, upper_band
 
+def polygon_time_to_utc(ts):
+    return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
+
 float_cache = {}
 
 def save_float_cache():
@@ -298,8 +301,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
-
-    triggered_alerts = []
 
     # --- WARMING UP: only once per ticker per day ---
     if len(candles_seq) >= 6 and alerted_symbols.get(symbol) != today:
