@@ -335,7 +335,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         close_wu = last_candle['close']
         volume_wu = last_candle['volume']
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
-        # PATCH: Use session VWAP only!
         vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dollar_volume_wu = close_wu * volume_wu
 
@@ -358,8 +357,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
 
-    # --- RUNNER: any stock that meets the criteria gets alerted, must be above VWAP ---
-    if len(candles_seq) >= 6 and runner_alerted_today.get(symbol) != today:
+    # --- RUNNER ALERT (no once per ticker per day restriction!) ---
+    if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5
@@ -368,7 +367,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         close_rn = last_candle['close']
         volume_rn = last_candle['volume']
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
-        # Must be above session VWAP
         vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
 
         if (
@@ -501,7 +499,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             vwap_reclaimed_once[symbol] = True
             alerted_symbols[symbol] = today
 
-    # --- VOLUME SPIKE ALERT (now uses most recent 3 candles, with a 10-minute cooldown, and above VWAP) ---
+    # --- VOLUME SPIKE ALERT (3 most recent candles, total volume ≥ 250,000, above VWAP, trailing volume logic unchanged) ---
     VOLUME_SPIKE_COOLDOWN_MINUTES = 10  # 10 min cooldown per ticker
     MIN_PRICE_MOVE_PCT = 0.08
     now = datetime.now(timezone.utc)
@@ -526,9 +524,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
                     if (
                         rvol >= RVOL_SPIKE_THRESHOLD and
-                        total_volume >= RVOL_SPIKE_MIN_VOLUME and
+                        total_volume >= 250000 and  # <--- updated threshold
                         price_move_pct >= MIN_PRICE_MOVE_PCT and
-                        c2["close"] > vwap_value
+                        c2["close"] > vwap_value  # <--- above VWAP
                     ):
                         log_event("volume_spike", symbol, c2['close'], total_volume, event_time, {
                             "rvol": rvol,
@@ -555,7 +553,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         closes = [c['close'] for c in candles_seq]
         ema_vals = {period: ema(closes, period)[-1] for period in EMA_PERIODS}
         ema5, ema8, ema13 = ema_vals[5], ema_vals[8], ema_vals[13]
-        # PATCH: Use only session candles for VWAP
         vwap_value = vwap_candles_numpy(vwap_candles[symbol])
         if (
             ema5 > ema8 > ema13 and
