@@ -501,10 +501,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             vwap_reclaimed_once[symbol] = True
             alerted_symbols[symbol] = today
 
-    # RVOL SPIKE ALERT
+    # --- VOLUME SPIKE ALERT (now uses most recent 3 candles, with a 10-minute cooldown, and above VWAP) ---
+    VOLUME_SPIKE_COOLDOWN_MINUTES = 10  # 10 min cooldown per ticker
     MIN_PRICE_MOVE_PCT = 0.08
-    if symbol not in rvol_spike_alerted and len(candles_seq) == 3:
-        c0, c1, c2 = list(candles_seq)
+    now = datetime.now(timezone.utc)
+    last_spike_time = last_volume_spike_time.get(symbol, datetime.min.replace(tzinfo=timezone.utc))
+
+    if len(candles_seq) >= 3 and (now - last_spike_time).total_seconds() > VOLUME_SPIKE_COOLDOWN_MINUTES * 60:
+        c0, c1, c2 = list(candles_seq)[-3:]
         total_volume = c0["volume"] + c1["volume"] + c2["volume"]
         rvol_history[symbol].append(total_volume)
         rvol_hist_seq = rvol_history[symbol]
@@ -519,14 +523,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     logger.info(f"{symbol} RVOL: {rvol}")
 
                     price_move_pct = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
+                    vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
                     if (
                         rvol >= RVOL_SPIKE_THRESHOLD and
                         total_volume >= RVOL_SPIKE_MIN_VOLUME and
-                        price_move_pct >= MIN_PRICE_MOVE_PCT
+                        price_move_pct >= MIN_PRICE_MOVE_PCT and
+                        c2["close"] > vwap_value
                     ):
                         log_event("volume_spike", symbol, c2['close'], total_volume, event_time, {
                             "rvol": rvol,
-                            "price_move_pct": price_move_pct
+                            "price_move_pct": price_move_pct,
+                            "vwap": vwap_value
                         })
                         price_str = f"{c2['close']:.2f}"
                         alert_text = (
@@ -534,7 +541,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                             f"Current Price: ${price_str}"
                         )
                         await send_telegram_async(alert_text)
-                        rvol_spike_alerted.add(symbol)
+                        last_volume_spike_time[symbol] = now
                         alerted_symbols[symbol] = today
                     if rvol < RVOL_MIN:
                         return
