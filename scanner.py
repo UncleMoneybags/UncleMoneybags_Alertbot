@@ -296,6 +296,20 @@ def get_scanned_tickers():
 RUG_PULL_DROP_PCT = -0.10
 RUG_PULL_BOUNCE_PCT = 0.05
 
+# ------- VWAP Session Tracking Patch START --------
+vwap_candles = defaultdict(list)      # symbol -> list of session candles (from 4am NY)
+vwap_session_date = defaultdict(lambda: None)  # symbol -> session date (starts at 4am NY)
+
+def get_session_date(dt):
+    # dt: datetime object (UTC)
+    ny = pytz.timezone("America/New_York")
+    dt_ny = dt.astimezone(ny)
+    # If before 4am, assign previous day's session
+    if dt_ny.time() < dt_time(4, 0):
+        return dt_ny.date() - timedelta(days=1)
+    return dt_ny.date()
+# ------- VWAP Session Tracking Patch END --------
+
 # PATCHED Warming Up/Runner logic
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     float_shares = get_float_shares(symbol)
@@ -321,7 +335,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         close_wu = last_candle['close']
         volume_wu = last_candle['volume']
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
-        vwap_wu = vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else 0
+        # PATCH: Use session VWAP only!
+        vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dollar_volume_wu = close_wu * volume_wu
 
         if (
@@ -446,13 +461,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     )
                     await send_telegram_async(alert_text)
 
-    # VWAP RECLAIM ALERT
+    # --- PATCH: VWAP Reclaim uses only intraday candles from 4am NY ---
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
         prev_close = prev_candle['close']
-        prev_vwap_numerator = vwap_cum_pv[symbol] - close * volume
-        prev_vwap_denominator = vwap_cum_vol[symbol] - volume
-        prev_vwap = prev_vwap_numerator / prev_vwap_denominator if prev_vwap_denominator > 0 else None
+        prev_vwap = vwap_candles_numpy(vwap_candles[symbol][:-1]) if len(vwap_candles[symbol]) >= 2 else None
+        curr_vwap = vwap_candles_numpy(vwap_candles[symbol])
 
         trailing_vols = [c['volume'] for c in list(candles_seq)[:-1]]
         rvol = 0
@@ -462,7 +476,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
         if (
             prev_close < (prev_vwap if prev_vwap is not None else prev_close) and
-            close > (vwap_cum_pv[symbol] / vwap_cum_vol[symbol] if vwap_cum_vol[symbol] > 0 else close) and
+            close > (curr_vwap if curr_vwap is not None else close) and
             volume >= 100_000 and
             rvol >= 2.0 and
             not vwap_reclaimed_once[symbol]
@@ -471,7 +485,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "rvol": rvol
             })
             price_str = f"{close:.2f}"
-            vwap_str = f"{vwap_cum_pv[symbol] / vwap_cum_vol[symbol]:.2f}" if vwap_cum_vol[symbol] > 0 else "?"
+            vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
             vol_str = f"{volume:,}"
             rvol_str = f"{rvol:.2f}"
             alert_text = (
@@ -531,7 +545,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         closes = [c['close'] for c in candles_seq]
         ema_vals = {period: ema(closes, period)[-1] for period in EMA_PERIODS}
         ema5, ema8, ema13 = ema_vals[5], ema_vals[8], ema_vals[13]
-        vwap_value = vwap_numpy(closes, [c['volume'] for c in candles_seq])
+        # PATCH: Use only session candles for VWAP
+        vwap_value = vwap_candles_numpy(vwap_candles[symbol])
         if (
             ema5 > ema8 > ema13 and
             (ema5 / ema13) >= 1.01 and
@@ -731,14 +746,25 @@ async def ingest_polygon_events():
                         close = event["c"]
                         volume = event["v"]
                         start_time = polygon_time_to_utc(event["s"])
-                        candles[symbol].append({
+                        candle = {
                             "open": open_,
                             "high": high,
                             "low": low,
                             "close": close,
                             "volume": volume,
                             "start_time": start_time,
-                        })
+                        }
+                        candles[symbol].append(candle)
+
+                        # ------- VWAP Session Tracking Patch Injected -------
+                        session_date = get_session_date(candle['start_time'])
+                        last_session = vwap_session_date[symbol]
+                        if last_session != session_date:
+                            vwap_candles[symbol] = []
+                            vwap_session_date[symbol] = session_date
+                        vwap_candles[symbol].append(candle)
+                        # ---------------------------------------------------
+
                         vwap_cum_vol[symbol] += volume
                         vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
                         await on_new_candle(symbol, open_, high, low, close, volume, start_time)
