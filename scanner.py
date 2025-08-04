@@ -6,7 +6,7 @@ import json
 import html
 import re
 from collections import deque, defaultdict
-from datetime import datetime, time, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta, date
 import pytz
 import signal
 import pickle
@@ -18,7 +18,7 @@ import atexit
 import sys  # for platform check
 import requests
 from bs4 import BeautifulSoup
-import time
+import time  # <-- FIX: Only import module time, do not import 'time' from datetime
 
 # === INDICATORS: EMA & VWAP & RSI & Bollinger Bands ===
 EMA_PERIODS = [5, 8, 13]
