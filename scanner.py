@@ -283,6 +283,10 @@ volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
 
+# Cooldown logic for all alerts
+ALERT_COOLDOWN_MINUTES = 10
+last_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+
 # Edge-trigger state tracking for all alerts
 warming_up_was_true = defaultdict(bool)
 runner_was_true = defaultdict(bool)
@@ -350,10 +354,9 @@ def get_ny_date():
 # --- END SESSION STATE RESET PATCH ---
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
-    # --- SESSION STATE RESET PATCH ---
     global current_session_date
     today_ny = get_ny_date()
-    # Reset per-day state if new trading day
+    now = datetime.now(timezone.utc)
     if current_session_date != today_ny:
         current_session_date = today_ny
         alerted_symbols.clear()
@@ -362,7 +365,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         dip_play_seen.clear()
         halted_symbols.clear()
         print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
-    # --- END SESSION STATE RESET PATCH ---
 
     float_shares = get_float_shares(symbol)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
@@ -397,6 +399,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dollar_volume_wu >= 100_000
         )
         if warming_up_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
             log_event("warming_up", symbol, close_wu, volume_wu, event_time, {
                 "price_move": price_move_wu,
                 "dollar_volume": dollar_volume_wu
@@ -408,6 +413,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
+            last_alert_time[symbol] = now
 
     # Runner Alert (fires every time criteria met)
     if len(candles_seq) >= 6:
@@ -427,6 +433,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             close_rn > vwap_rn
         )
         if runner_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
             log_event("runner", symbol, close_rn, volume_rn, event_time, {
                 "price_move": price_move_rn
             })
@@ -437,6 +446,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             runner_alerted_today[symbol] = today
+            last_alert_time[symbol] = now
 
     # Oversold Bounce Alert (fires every time criteria met)
     if (
@@ -455,6 +465,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_candle['close'] > last_candle['open']
         )
         if oversold_bounce_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
             log_event("oversold_bounce", symbol, close, volume, event_time, {
                 "rsi": rsi_val,
                 "lower_band": lower_band[-1]
@@ -466,6 +479,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
+            last_alert_time[symbol] = now
 
     # Dip Play Alert (fires every time criteria met)
     MIN_DIP_PCT = 0.10
@@ -487,6 +501,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dip_play_criteria = dip_play_criteria and higher_lows and rising_volume
             logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
             if dip_play_criteria:
+                # COOLDOWN CHECK
+                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                    return
                 log_event("dip_play", symbol, close, volume, event_time, {
                     "dip_pct": dip_pct
                 })
@@ -498,6 +515,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 await send_telegram_async(alert_text)
                 dip_play_seen.add(symbol)
                 alerted_symbols[symbol] = today
+                last_alert_time[symbol] = now
 
     # Rug Pull Alert (fires every time criteria met)
     if len(candles_seq) >= 3:
@@ -508,6 +526,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             drop_pct <= RUG_PULL_DROP_PCT and bounce_pct < RUG_PULL_BOUNCE_PCT and symbol in alerted_symbols and alerted_symbols[symbol] == today
         )
         if rug_pull_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
             log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
                 "drop_pct": drop_pct,
                 "bounce_pct": bounce_pct
@@ -518,6 +539,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"Current Price: ${price_str}"
             )
             await send_telegram_async(alert_text)
+            last_alert_time[symbol] = now
 
     # VWAP Reclaim Alert (fires every time criteria met)
     if len(candles_seq) >= 2:
@@ -540,6 +562,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             rvol >= 2.0
         )
         if vwap_reclaim_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
             log_event("vwap_reclaim", symbol, curr_candle['close'], curr_candle['volume'], event_time, {
                 "rvol": rvol
             })
@@ -555,22 +580,27 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
+            last_alert_time[symbol] = now
 
     # --- Injected Volume Spike Alert [PATCHED] ---
     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
     if check_volume_spike(candles_seq, vwap_value):
+        # COOLDOWN CHECK
+        if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+            return
         price_str = f"{close:.2f}"
         alert_text = (
             f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
             f"Current Price: ${price_str}"
         )
         await send_telegram_async(alert_text)
-        event_time = datetime.now(timezone.utc)
+        event_time = now
         log_event("volume_spike", symbol, close, volume, event_time, {
             "rvol": volume / (sum([c['volume'] for c in candles_seq[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
             "vwap": vwap_value
         })
         alerted_symbols[symbol] = today
+        last_alert_time[symbol] = now
     # --- End Injected Volume Spike Alert [PATCHED] ---
 
     # EMA Stack Alert (fires every time criteria met)
@@ -592,6 +622,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             candles_seq[-1]['volume'] >= 175000
         )
         if ema_stack_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
             log_event("ema_stack", symbol, closes[-1], candles_seq[-1]['volume'], event_time, {
                 "ema5": ema5,
                 "ema8": ema8,
@@ -606,6 +639,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
+            last_alert_time[symbol] = now
 
 async def catalyst_news_alert_loop():
     global news_seen
