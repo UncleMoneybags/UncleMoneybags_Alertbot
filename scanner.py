@@ -556,14 +556,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
 
-    # --- Injected Volume Spike Alert ---
+    # --- Injected Volume Spike Alert [PATCHED] ---
     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
     if check_volume_spike(candles_seq, vwap_value):
         price_str = f"{close:.2f}"
         alert_text = (
             f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
-            f"Current Price: ${price_str}\n"
-            f"Criteria: ≥125,000 vol, RVOL ≥2.0, above VWAP"
+            f"Current Price: ${price_str}"
         )
         await send_telegram_async(alert_text)
         event_time = datetime.now(timezone.utc)
@@ -572,7 +571,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             "vwap": vwap_value
         })
         alerted_symbols[symbol] = today
-    # --- End Injected Volume Spike Alert ---
+    # --- End Injected Volume Spike Alert [PATCHED] ---
 
     # EMA Stack Alert (fires every time criteria met)
     if (
