@@ -411,8 +411,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     float_shares = get_float_shares(symbol)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
-        logger.debug(f"Skipping {symbol} due to float {float_shares}")
+        print(f"[DEBUG] SKIPPING {symbol} due to float {float_shares}")
         return
+    assert MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES, f"Should not alert for {symbol} with float {float_shares}"
 
     logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
     if not is_market_scan_time() or close > 20.00:
@@ -432,6 +433,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"💰 <b>{escape_html(symbol)}</b> New High of the Day!\n"
                 f"Price: ${price_str}"
             )
+            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
             await send_telegram_async(alert_text)
             last_hod_alert_price[symbol] = high_today
 
@@ -465,6 +467,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
                 f"Current Price: ${price_str}"
             )
+            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
@@ -496,6 +499,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
                 f"Current Price: ${price_str}"
             )
+            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
             await send_telegram_async(alert_text)
             runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
@@ -527,6 +531,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"🏀 <b>{escape_html(symbol)}</b> Oversold Bounce\n"
                 f"Current Price: ${price_str}"
             )
+            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
@@ -559,6 +564,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
                     f"Current Price: ${price_str}"
                 )
+                print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
                 await send_telegram_async(alert_text)
                 dip_play_seen.add(symbol)
                 alerted_symbols[symbol] = today
@@ -583,6 +589,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull\n"
                 f"Current Price: ${price_str}"
             )
+            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
             await send_telegram_async(alert_text)
             last_alert_time[symbol] = now
 
@@ -619,6 +626,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"1-min Vol: {vol_str}\n"
                 f"RVOL: {rvol_str}"
             )
+            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
@@ -627,14 +635,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if check_volume_spike(candles_seq, vwap_value):
         if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
             return
-        price_str = f"{close:.2f}"
+        correct_close = candles_seq[-1]['close'] if candles_seq and 'close' in candles_seq[-1] else close
+        price_str = f"{correct_close:.2f}"
         alert_text = (
             f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
             f"Current Price: ${price_str}"
         )
+        print(f"[DEBUG] Volume spike alert for {symbol}: close from event={close}, close from candles_seq={correct_close}, float={float_shares}")
         await send_telegram_async(alert_text)
         event_time = now
-        log_event("volume_spike", symbol, close, volume, event_time, {
+        log_event("volume_spike", symbol, correct_close, volume, event_time, {
             "rvol": volume / (sum([c['volume'] for c in candles_seq[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
             "vwap": vwap_value
         })
@@ -673,6 +683,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"Current Price: ${price_str}\n"
                 f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
             )
+            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
