@@ -15,12 +15,11 @@ import os
 import joblib
 import numpy as np
 import atexit
-import sys  # for platform check
+import sys
 import requests
 from bs4 import BeautifulSoup
-import time  # <-- FIX: Only import module time, do not import 'time' from datetime
+import time
 
-# === INDICATORS: EMA & VWAP & RSI & Bollinger Bands ===
 EMA_PERIODS = [5, 8, 13]
 
 def ema(prices, period):
@@ -96,7 +95,6 @@ def load_float_cache():
         print(f"[DEBUG] No float cache found, starting new.")
 
 def get_float_shares(ticker):
-    # If ticker is cached and value is valid (not None), use it:
     if ticker in float_cache and float_cache[ticker] is not None:
         print(f"[DEBUG] Cache HIT for {ticker}: {float_cache[ticker]}")
         return float_cache[ticker]
@@ -105,19 +103,16 @@ def get_float_shares(ticker):
         import yfinance as yf
         info = yf.Ticker(ticker).info
         float_shares = info.get('floatShares', None)
-        # Only update cache if we got a valid value
         if float_shares is not None:
             float_cache[ticker] = float_shares
             save_float_cache()
             print(f"[DEBUG] Cached float for {ticker}: {float_shares}")
         else:
             print(f"[DEBUG] Yahoo float error for {ticker}: No floatShares found")
-        # Sleep to avoid hammering Yahoo
         time.sleep(0.5)
         return float_shares
     except Exception as e:
         print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
-        # Do NOT overwrite valid cache entry with None on error/rate limit
         if "Rate limited" in str(e):
             time.sleep(10)
         return float_cache.get(ticker, None)
@@ -278,7 +273,7 @@ pending_runner_alert = {}
 HALT_LOG_FILE = "halt_event_log.csv"
 
 alerted_symbols = {}
-runner_alerted_today = {}  # PATCH: Track runner alert per ticker per day
+runner_alerted_today = {}
 below_vwap_streak = defaultdict(int)
 vwap_reclaimed_once = defaultdict(bool)
 dip_play_seen = set()
@@ -288,7 +283,7 @@ volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
 
-ema_stack_alerted_today = {}  # <--- Track EMA stack alerts per ticker per day
+ema_stack_alerted_today = {}
 
 def get_scanned_tickers():
     return set(candles.keys())
@@ -296,21 +291,16 @@ def get_scanned_tickers():
 RUG_PULL_DROP_PCT = -0.10
 RUG_PULL_BOUNCE_PCT = 0.05
 
-# ------- VWAP Session Tracking Patch START --------
-vwap_candles = defaultdict(list)      # symbol -> list of session candles (from 4am NY)
-vwap_session_date = defaultdict(lambda: None)  # symbol -> session date (starts at 4am NY)
+vwap_candles = defaultdict(list)
+vwap_session_date = defaultdict(lambda: None)
 
 def get_session_date(dt):
-    # dt: datetime object (UTC)
     ny = pytz.timezone("America/New_York")
     dt_ny = dt.astimezone(ny)
-    # If before 4am, assign previous day's session
     if dt_ny.time() < dt_time(4, 0):
         return dt_ny.date() - timedelta(days=1)
     return dt_ny.date()
-# ------- VWAP Session Tracking Patch END --------
 
-# PATCHED Warming Up/Runner logic
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     float_shares = get_float_shares(symbol)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
@@ -325,7 +315,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
 
-    # --- WARMING UP: only once per ticker per day ---
     if len(candles_seq) >= 6 and alerted_symbols.get(symbol) != today:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -357,7 +346,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
 
-    # --- RUNNER ALERT (no once per ticker per day restriction!) ---
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -386,8 +374,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             runner_alerted_today[symbol] = today
 
-    # --- All other alerts run independently ---
-    # OVERSOLD BOUNCE ALERT
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -415,7 +401,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
 
-    # Dip Play Alert
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
     if len(candles_seq) >= DIP_LOOKBACK:
@@ -443,7 +428,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     dip_play_seen.add(symbol)
                     alerted_symbols[symbol] = today
 
-    # RUG PULL WARNING
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
@@ -462,7 +446,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     )
                     await send_telegram_async(alert_text)
 
-    # --- PATCH: VWAP Reclaim uses only intraday candles from 4am NY ---
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
         prev_close = prev_candle['close']
@@ -499,8 +482,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             vwap_reclaimed_once[symbol] = True
             alerted_symbols[symbol] = today
 
-    # --- VOLUME SPIKE ALERT (3 most recent candles, total volume ≥ 250,000, above VWAP, trailing volume logic unchanged) ---
-    VOLUME_SPIKE_COOLDOWN_MINUTES = 10  # 10 min cooldown per ticker
+    VOLUME_SPIKE_COOLDOWN_MINUTES = 10
     MIN_PRICE_MOVE_PCT = 0.08
     now = datetime.now(timezone.utc)
     last_spike_time = last_volume_spike_time.get(symbol, datetime.min.replace(tzinfo=timezone.utc))
@@ -524,9 +506,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
                     if (
                         rvol >= RVOL_SPIKE_THRESHOLD and
-                        total_volume >= 250000 and  # <--- updated threshold
+                        total_volume >= 250000 and
                         price_move_pct >= MIN_PRICE_MOVE_PCT and
-                        c2["close"] > vwap_value  # <--- above VWAP
+                        c2["close"] > vwap_value
                     ):
                         log_event("volume_spike", symbol, c2['close'], total_volume, event_time, {
                             "rvol": rvol,
@@ -544,25 +526,25 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     if rvol < RVOL_MIN:
                         return
 
-    # EMA STACK ALERT (single alert per ticker per day, price above VWAP AND EMA5 above VWAP)
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
         len(candles_seq) >= max(EMA_PERIODS)
     ):
         closes = [c['close'] for c in candles_seq]
-        ema_vals = {period: ema(closes, period)[-1] for period in EMA_PERIODS}
-        ema5, ema8, ema13 = ema_vals[5], ema_vals[8], ema_vals[13]
+        ema5 = ema(closes, 5)[-1]
+        ema8 = ema(closes, 8)[-1]
+        ema13 = ema(closes, 13)[-1]
         vwap_value = vwap_candles_numpy(vwap_candles[symbol])
         if (
             ema5 > ema8 > ema13 and
-            (ema5 / ema13) >= 1.01 and
-            candles_seq[-1]['volume'] >= 20_000 and
+            ema5 >= 1.015 * ema13 and
             closes[-1] > vwap_value and
             ema5 > vwap_value
+            and candles_seq[-1]['volume'] >= 175000
             and (ema_stack_alerted_today.get(symbol) != today)
         ):
-            log_event("ema_stack", symbol, candles_seq[-1]['close'], candles_seq[-1]['volume'], event_time, {
+            log_event("ema_stack", symbol, closes[-1], candles_seq[-1]['volume'], event_time, {
                 "ema5": ema5,
                 "ema8": ema8,
                 "ema13": ema13,
@@ -571,7 +553,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             price_str = f"{closes[-1]:.2f}"
             alert_text = (
                 f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack\n"
-                f"Current Price: ${price_str}"
+                f"Current Price: ${price_str}\n"
+                f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
             )
             await send_telegram_async(alert_text)
             ema_stack_alerted_today[symbol] = today
@@ -731,7 +714,6 @@ async def ingest_polygon_events():
     async with websockets.connect(url) as ws:
         await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
         await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
-
         print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
         while True:
             msg = await ws.recv()
@@ -762,16 +744,12 @@ async def ingest_polygon_events():
                             "start_time": start_time,
                         }
                         candles[symbol].append(candle)
-
-                        # ------- VWAP Session Tracking Patch Injected -------
                         session_date = get_session_date(candle['start_time'])
                         last_session = vwap_session_date[symbol]
                         if last_session != session_date:
                             vwap_candles[symbol] = []
                             vwap_session_date[symbol] = session_date
                         vwap_candles[symbol].append(candle)
-                        # ---------------------------------------------------
-
                         vwap_cum_vol[symbol] += volume
                         vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
                         await on_new_candle(symbol, open_, high, low, close, volume, start_time)
