@@ -821,58 +821,69 @@ async def get_ticker_news_yahoo(ticker):
         logger.error(f"[NEWS SCRAPER ERROR] {ticker}: {e}")
         return []
 
+# ----------- POLYGON INGEST WITH RECONNECT -----------
 async def ingest_polygon_events():
     url = "wss://socket.polygon.io/stocks"
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-        await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
-        print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
-        while True:
-            msg = await ws.recv()
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
+                print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
+                while True:
+                    msg = await ws.recv()
+                    try:
+                        data = json.loads(msg)
+                        if isinstance(data, dict) and data.get("ev") == "status":
+                            if data.get("status") == "halt":
+                                await handle_halt_event(data)
+                            elif data.get("status") == "resume":
+                                await handle_resume_event(data)
+                        if not isinstance(data, list):
+                            continue
+                        for event in data:
+                            if event.get("ev") == "AM":
+                                symbol = event["sym"]
+                                open_ = event["o"]
+                                high = event["h"]
+                                low = event["l"]
+                                close = event["c"]
+                                volume = event["v"]
+                                start_time = polygon_time_to_utc(event["s"])
+                                await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                                candle = {
+                                    "open": open_,
+                                    "high": high,
+                                    "low": low,
+                                    "close": close,
+                                    "volume": volume,
+                                    "start_time": start_time,
+                                }
+                                candles[symbol].append(candle)
+                                session_date = get_session_date(candle['start_time'])
+                                last_session = vwap_session_date[symbol]
+                                if last_session != session_date:
+                                    vwap_candles[symbol] = []
+                                    vwap_session_date[symbol] = session_date
+                                vwap_candles[symbol].append(candle)
+                                vwap_cum_vol[symbol] += volume
+                                vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+                            elif event.get("ev") == "status" and event.get("status") == "halt":
+                                await handle_halt_event(event)
+                            elif event.get("ev") == "status" and event.get("status") == "resume":
+                                await handle_resume_event(event)
+                    except Exception as e:
+                        print(f"Error processing message: {e}\nRaw: {msg}")
+        except Exception as e:
+            print(f"[WS ERROR] Polygon websocket disconnected or failed: {e}")
+            # Optional: send a Telegram alert if connection drops
             try:
-                data = json.loads(msg)
-                if isinstance(data, dict) and data.get("ev") == "status":
-                    if data.get("status") == "halt":
-                        await handle_halt_event(data)
-                    elif data.get("status") == "resume":
-                        await handle_resume_event(data)
-                if not isinstance(data, list):
-                    continue
-                for event in data:
-                    if event.get("ev") == "AM":
-                        symbol = event["sym"]
-                        open_ = event["o"]
-                        high = event["h"]
-                        low = event["l"]
-                        close = event["c"]
-                        volume = event["v"]
-                        start_time = polygon_time_to_utc(event["s"])
-                        # --- PATCH: Alert logic first, then append to candles deque ---
-                        await on_new_candle(symbol, open_, high, low, close, volume, start_time)
-                        # Now update the candles deque and vwap_candles
-                        candle = {
-                            "open": open_,
-                            "high": high,
-                            "low": low,
-                            "close": close,
-                            "volume": volume,
-                            "start_time": start_time,
-                        }
-                        candles[symbol].append(candle)
-                        session_date = get_session_date(candle['start_time'])
-                        last_session = vwap_session_date[symbol]
-                        if last_session != session_date:
-                            vwap_candles[symbol] = []
-                            vwap_session_date[symbol] = session_date
-                        vwap_candles[symbol].append(candle)
-                        vwap_cum_vol[symbol] += volume
-                        vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
-                    elif event.get("ev") == "status" and event.get("status") == "halt":
-                        await handle_halt_event(event)
-                    elif event.get("ev") == "status" and event.get("status") == "resume":
-                        await handle_resume_event(event)
-            except Exception as e:
-                print(f"Error processing message: {e}\nRaw: {msg}")
+                await send_telegram_async("⚠️ Scanner lost connection to Polygon. Attempting to reconnect...")
+            except:
+                pass
+            await asyncio.sleep(10)  # Wait before reconnecting
+
+# ----------- END POLYGON INGEST -----------
 
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
