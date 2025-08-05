@@ -283,7 +283,15 @@ volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
 
-ema_stack_alerted_today = {}
+# Edge-trigger state tracking for all alerts
+warming_up_was_true = defaultdict(bool)
+runner_was_true = defaultdict(bool)
+oversold_bounce_was_true = defaultdict(bool)
+dip_play_was_true = defaultdict(bool)
+rug_pull_was_true = defaultdict(bool)
+vwap_reclaim_was_true = defaultdict(bool)
+volume_spike_was_true = defaultdict(bool)
+ema_stack_was_true = defaultdict(bool)
 
 def get_scanned_tickers():
     return set(candles.keys())
@@ -315,7 +323,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
 
-    if len(candles_seq) >= 6 and alerted_symbols.get(symbol) != today:
+    # Warming Up Alert (edge-triggered)
+    warming_up_criteria = False
+    if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5
@@ -326,14 +336,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
         vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dollar_volume_wu = close_wu * volume_wu
-
-        if (
+        warming_up_criteria = (
             volume_wu >= 1.5 * avg_vol_5 and
             price_move_wu >= 0.03 and
             0.20 <= close_wu <= 20.00 and
             close_wu > vwap_wu and
             dollar_volume_wu >= 100_000
-        ):
+        )
+        if warming_up_criteria and not warming_up_was_true[symbol]:
             log_event("warming_up", symbol, close_wu, volume_wu, event_time, {
                 "price_move": price_move_wu,
                 "dollar_volume": dollar_volume_wu
@@ -345,7 +355,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
+        warming_up_was_true[symbol] = warming_up_criteria
 
+    # Runner Alert (edge-triggered)
+    runner_criteria = False
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -356,13 +369,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         volume_rn = last_candle['volume']
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
         vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-
-        if (
+        runner_criteria = (
             volume_rn >= 2 * avg_vol_5 and
             price_move_rn >= 0.06 and
             close_rn >= 0.10 and
             close_rn > vwap_rn
-        ):
+        )
+        if runner_criteria and not runner_was_true[symbol]:
             log_event("runner", symbol, close_rn, volume_rn, event_time, {
                 "price_move": price_move_rn
             })
@@ -373,7 +386,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             runner_alerted_today[symbol] = today
+        runner_was_true[symbol] = runner_criteria
 
+    # Oversold Bounce Alert (edge-triggered)
+    oversold_bounce_criteria = False
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -383,12 +399,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         rsi_val = rsi(closes)[-1]
         lower_band, sma, upper_band = bollinger_bands(closes, period=20, num_std=2)
         last_candle = candles_seq[-1]
-        if (
+        oversold_bounce_criteria = (
             rsi_val < 30 and
             lower_band[-1] is not None and
             closes[-1] <= lower_band[-1] and
             last_candle['close'] > last_candle['open']
-        ):
+        )
+        if oversold_bounce_criteria and not oversold_bounce_was_true[symbol]:
             log_event("oversold_bounce", symbol, close, volume, event_time, {
                 "rsi": rsi_val,
                 "lower_band": lower_band[-1]
@@ -400,7 +417,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
+        oversold_bounce_was_true[symbol] = oversold_bounce_criteria
 
+    # Dip Play Alert (edge-triggered)
+    dip_play_criteria = False
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
     if len(candles_seq) >= DIP_LOOKBACK:
@@ -409,44 +429,54 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         recent_high[symbol] = rhigh
     if recent_high[symbol] > 0:
         dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
-        if dip_pct >= MIN_DIP_PCT and symbol not in dip_play_seen and close <= 20.00:
-            if len(candles_seq) >= 3:
-                c1, c2, c3 = list(candles_seq)[-3:]
-                higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
-                rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
-                logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
-                if higher_lows and rising_volume:
-                    log_event("dip_play", symbol, close, volume, event_time, {
-                        "dip_pct": dip_pct
-                    })
-                    price_str = f"{close:.2f}"
-                    alert_text = (
-                        f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
-                        f"Current Price: ${price_str}"
-                    )
-                    await send_telegram_async(alert_text)
-                    dip_play_seen.add(symbol)
-                    alerted_symbols[symbol] = today
+        dip_play_criteria = (
+            dip_pct >= MIN_DIP_PCT and close <= 20.00
+        )
+        # Only check for three-candle pattern if basic criteria is met
+        if dip_play_criteria and len(candles_seq) >= 3:
+            c1, c2, c3 = list(candles_seq)[-3:]
+            higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
+            rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
+            dip_play_criteria = dip_play_criteria and higher_lows and rising_volume
+            logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
+            if dip_play_criteria and not dip_play_was_true[symbol]:
+                log_event("dip_play", symbol, close, volume, event_time, {
+                    "dip_pct": dip_pct
+                })
+                price_str = f"{close:.2f}"
+                alert_text = (
+                    f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
+                    f"Current Price: ${price_str}"
+                )
+                await send_telegram_async(alert_text)
+                dip_play_seen.add(symbol)
+                alerted_symbols[symbol] = today
+        dip_play_was_true[symbol] = dip_play_criteria
 
+    # Rug Pull Alert (edge-triggered)
+    rug_pull_criteria = False
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
-        if drop_pct <= RUG_PULL_DROP_PCT:
-            bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
-            if bounce_pct < RUG_PULL_BOUNCE_PCT:
-                if symbol in alerted_symbols and alerted_symbols[symbol] == today:
-                    log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
-                        "drop_pct": drop_pct,
-                        "bounce_pct": bounce_pct
-                    })
-                    price_str = f"{c2['close']:.2f}"
-                    alert_text = (
-                        f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull\n"
-                        f"Current Price: ${price_str}"
-                    )
-                    await send_telegram_async(alert_text)
+        bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
+        rug_pull_criteria = (
+            drop_pct <= RUG_PULL_DROP_PCT and bounce_pct < RUG_PULL_BOUNCE_PCT and symbol in alerted_symbols and alerted_symbols[symbol] == today
+        )
+        if rug_pull_criteria and not rug_pull_was_true[symbol]:
+            log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
+                "drop_pct": drop_pct,
+                "bounce_pct": bounce_pct
+            })
+            price_str = f"{c2['close']:.2f}"
+            alert_text = (
+                f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull\n"
+                f"Current Price: ${price_str}"
+            )
+            await send_telegram_async(alert_text)
+        rug_pull_was_true[symbol] = rug_pull_criteria
 
-    # VWAP Reclaim logic (restriction removed)
+    # VWAP Reclaim Alert (edge-triggered)
+    vwap_reclaim_criteria = False
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
         prev_close = prev_candle['close']
@@ -459,12 +489,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             avg_trailing = sum(trailing_vols[-20:]) / min(len(trailing_vols), 20)
             rvol = volume / avg_trailing if avg_trailing > 0 else 0
 
-        if (
+        vwap_reclaim_criteria = (
             prev_close < (prev_vwap if prev_vwap is not None else prev_close) and
             close > (curr_vwap if curr_vwap is not None else close) and
             volume >= 100_000 and
             rvol >= 2.0
-        ):
+        )
+        if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
             log_event("vwap_reclaim", symbol, close, volume, event_time, {
                 "rvol": rvol
             })
@@ -480,7 +511,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
+        vwap_reclaim_was_true[symbol] = vwap_reclaim_criteria
 
+    # Volume Spike Alert (edge-triggered)
+    volume_spike_criteria = False
     VOLUME_SPIKE_COOLDOWN_MINUTES = 10
     MIN_PRICE_MOVE_PCT = 0.08
     now = datetime.now(timezone.utc)
@@ -503,12 +537,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
                     price_move_pct = (c2["close"] - c0["close"]) / c0["close"] if c0["close"] > 0 else 0
                     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-                    if (
+                    volume_spike_criteria = (
                         rvol >= RVOL_SPIKE_THRESHOLD and
                         total_volume >= 250000 and
                         price_move_pct >= MIN_PRICE_MOVE_PCT and
                         c2["close"] > vwap_value
-                    ):
+                    )
+                    if volume_spike_criteria and not volume_spike_was_true[symbol]:
                         log_event("volume_spike", symbol, c2['close'], total_volume, event_time, {
                             "rvol": rvol,
                             "price_move_pct": price_move_pct,
@@ -522,9 +557,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         await send_telegram_async(alert_text)
                         last_volume_spike_time[symbol] = now
                         alerted_symbols[symbol] = today
+                    volume_spike_was_true[symbol] = volume_spike_criteria
                     if rvol < RVOL_MIN:
                         return
 
+    # EMA Stack Alert (edge-triggered)
+    ema_stack_criteria = False
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -535,14 +573,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         ema8 = ema(closes, 8)[-1]
         ema13 = ema(closes, 13)[-1]
         vwap_value = vwap_candles_numpy(vwap_candles[symbol])
-        if (
+        ema_stack_criteria = (
             ema5 > ema8 > ema13 and
             ema5 >= 1.015 * ema13 and
             closes[-1] > vwap_value and
-            ema5 > vwap_value
-            and candles_seq[-1]['volume'] >= 175000
-            and (ema_stack_alerted_today.get(symbol) != today)
-        ):
+            ema5 > vwap_value and
+            candles_seq[-1]['volume'] >= 175000
+        )
+        if ema_stack_criteria and not ema_stack_was_true[symbol]:
             log_event("ema_stack", symbol, closes[-1], candles_seq[-1]['volume'], event_time, {
                 "ema5": ema5,
                 "ema8": ema8,
@@ -556,8 +594,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
             )
             await send_telegram_async(alert_text)
-            ema_stack_alerted_today[symbol] = today
             alerted_symbols[symbol] = today
+        ema_stack_was_true[symbol] = ema_stack_criteria
 
 async def catalyst_news_alert_loop():
     global news_seen
