@@ -446,6 +446,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     )
                     await send_telegram_async(alert_text)
 
+    # VWAP Reclaim logic (restriction removed)
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
         prev_close = prev_candle['close']
@@ -462,8 +463,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             prev_close < (prev_vwap if prev_vwap is not None else prev_close) and
             close > (curr_vwap if curr_vwap is not None else close) and
             volume >= 100_000 and
-            rvol >= 2.0 and
-            not vwap_reclaimed_once[symbol]
+            rvol >= 2.0
         ):
             log_event("vwap_reclaim", symbol, close, volume, event_time, {
                 "rvol": rvol
@@ -479,7 +479,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"RVOL: {rvol_str}"
             )
             await send_telegram_async(alert_text)
-            vwap_reclaimed_once[symbol] = True
             alerted_symbols[symbol] = today
 
     VOLUME_SPIKE_COOLDOWN_MINUTES = 10
