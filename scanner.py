@@ -391,7 +391,7 @@ def get_ny_date():
     now_utc = datetime.now(timezone.utc)
     return now_utc.astimezone(ny).date()
 
-last_hod_alert_price = defaultdict(float)
+# ---- HOD ALERT LOGIC REMOVED ----
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     global current_session_date
@@ -404,7 +404,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         recent_high.clear()
         dip_play_seen.clear()
         halted_symbols.clear()
-        last_hod_alert_price.clear()
         print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
 
     candles[symbol] = ensure_deque(candles[symbol], maxlen=20)
@@ -424,21 +423,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     candles_seq = ensure_list(candles[symbol])
     event_time = datetime.now(timezone.utc)
 
-    # --- FIXED HOD LOGIC: Always use event's high for alert ---
-    highs = [c['high'] for c in candles_seq if c and 'high' in c]
-    latest_high = high  # Use event's high directly
-    prev_hod = last_hod_alert_price[symbol]
-    print(f"[DEBUG] HOD highs list: {highs}, max(highs): {max(highs) if highs else None}, event high: {latest_high}, last_hod_alert_price: {prev_hod}")
-    # Alert only if event's high is a new high above previous alert
-    if latest_high > prev_hod and (prev_hod == 0 or latest_high >= prev_hod + 0.75):
-        price_str = f"{latest_high:.2f}"
-        alert_text = (
-            f"💰 <b>{escape_html(symbol)}</b> New High of the Day!\n"
-            f"Price: ${price_str}"
-        )
-        print(f"[DEBUG] About to alert for {symbol}. Event high: {latest_high}, max in deque: {max(highs) if highs else None}, Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-        await send_telegram_async(alert_text)
-        last_hod_alert_price[symbol] = latest_high
+    # --- HOD logic is removed from here ---
 
     # Warming up, runner, etc. -- still use event data directly for all checks
     if len(candles_seq) >= 6:
@@ -722,7 +707,7 @@ async def get_premarket_gainers_yahoo():
                 table = soup.find("table")
                 gainers = []
                 if table and table.find("tbody"):
-                    for row in table.find("tbody").find_all("tr")[:10]:
+                    for row in table.find_all("tr")[:10]:
                         cols = row.find_all("td")
                         if len(cols) >= 5:
                             ticker = cols[0].text.strip()
