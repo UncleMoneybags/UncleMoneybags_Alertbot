@@ -366,6 +366,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         halted_symbols.clear()
         print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
 
+    # PATCH: Ensure correct types before slicing/appending
+    if not isinstance(candles[symbol], deque):
+        candles[symbol] = deque(candles[symbol], maxlen=20)
+    if not isinstance(vwap_candles[symbol], list):
+        vwap_candles[symbol] = list(vwap_candles[symbol])
+
     float_shares = get_float_shares(symbol)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
         logger.debug(f"Skipping {symbol} due to float {float_shares}")
@@ -694,8 +700,9 @@ async def premarket_gainers_alert_loop():
     while True:
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
+        # Only send once, exactly at 9:25am
         if now_est.weekday() in range(0, 5):
-            if now_est.time().hour == 9 and now_est.time().minute >= 25 and not sent_today:
+            if now_est.time().hour == 9 and now_est.time().minute == 25 and not sent_today:
                 gainers = await get_premarket_gainers_yahoo()
                 gainers_text = "\n".join(gainers)
                 msg = (
@@ -709,7 +716,8 @@ async def premarket_gainers_alert_loop():
                 sent_today = True
         else:
             sent_today = False
-        if now_est.time() < dt_time(9, 20):
+        # Reset sent_today if before 9:25, so you get a fresh alert every day
+        if now_est.time().hour < 9 or (now_est.time().hour == 9 and now_est.time().minute < 25):
             sent_today = False
         await asyncio.sleep(30)
 
