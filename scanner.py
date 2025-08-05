@@ -359,8 +359,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
         if (
             volume_rn >= 2 * avg_vol_5 and
-            price_move_rn >= 0.08 and
-            close_rn >= 0.50 and
+            price_move_rn >= 0.06 and
+            close_rn >= 0.10 and
             close_rn > vwap_rn
         ):
             log_event("runner", symbol, close_rn, volume_rn, event_time, {
