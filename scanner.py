@@ -1,3 +1,5 @@
+print("Script started!")  # DEBUG: Startup print
+
 import logging
 import asyncio
 import websockets
@@ -19,6 +21,25 @@ import sys
 import requests
 from bs4 import BeautifulSoup
 import time
+
+# DEBUG: Set logging to DEBUG level
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s] %(levelname)s:%(name)s:%(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("scanner")
+logger.info("Logging is working!")
+
+# DEBUG: Assert API keys (fail fast if missing)
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+assert POLYGON_API_KEY, "POLYGON_API_KEY is missing!"
+assert TELEGRAM_BOT_TOKEN, "TELEGRAM_BOT_TOKEN is missing!"
+assert TELEGRAM_CHAT_ID, "TELEGRAM_CHAT_ID is missing!"
+print("API keys loaded.")  # DEBUG
 
 EMA_PERIODS = [5, 8, 13]
 
@@ -106,9 +127,9 @@ def save_float_cache():
     try:
         with open("float_cache.pkl", "wb") as f:
             pickle.dump(float_cache, f)
-        logging.debug(f"Saved float cache, entries: {len(float_cache)}")
+        logger.debug(f"Saved float cache, entries: {len(float_cache)}")
     except Exception as e:
-        logging.error(f"Failed to save float cache: {e}")
+        logger.error(f"Failed to save float cache: {e}")
 
 def load_float_cache():
     global float_cache
@@ -116,19 +137,20 @@ def load_float_cache():
         if os.path.exists("float_cache.pkl"):
             with open("float_cache.pkl", "rb") as f:
                 float_cache = pickle.load(f)
-            logging.debug(f"Loaded float cache, entries: {len(float_cache)}")
+            logger.debug(f"Loaded float cache, entries: {len(float_cache)}")
         else:
             float_cache = {}
-            logging.debug("No float cache found, starting new.")
+            logger.debug("No float cache found, starting new.")
     except Exception as e:
         float_cache = {}
-        logging.error(f"Failed to load float cache: {e}")
+        logger.error(f"Failed to load float cache: {e}")
 
 def get_float_shares(ticker):
+    print(f"Checking float for ticker: {ticker}")  # DEBUG
     if ticker in float_cache and float_cache[ticker] is not None:
-        logging.debug(f"Cache HIT for {ticker}: {float_cache[ticker]}")
+        logger.debug(f"Cache HIT for {ticker}: {float_cache[ticker]}")
         return float_cache[ticker]
-    logging.debug(f"Cache MISS for {ticker}")
+    logger.debug(f"Cache MISS for {ticker}")
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info
@@ -136,13 +158,16 @@ def get_float_shares(ticker):
         if float_shares is not None:
             float_cache[ticker] = float_shares
             save_float_cache()
-            logging.debug(f"Cached float for {ticker}: {float_shares}")
+            logger.debug(f"Cached float for {ticker}: {float_shares}")
         else:
-            logging.debug(f"Yahoo float error for {ticker}: No floatShares found")
+            logger.warning(f"No floatShares found for {ticker} (Yahoo returned no info)")
         time.sleep(0.5)
         return float_shares
     except Exception as e:
-        logging.debug(f"Yahoo float error for {ticker}: {e}")
+        print(f"Failed to get float for {ticker}: {e}")  # DEBUG
+        logger.error(f"Yahoo float error for {ticker}: {e}")
+        if "404" in str(e):
+            logger.warning(f"Yahoo Finance 404 for ticker {ticker} (likely delisted or invalid)")
         if "Rate limited" in str(e):
             time.sleep(10)
         return float_cache.get(ticker, None)
@@ -158,7 +183,7 @@ def load_news_seen():
     except FileNotFoundError:
         return set()
     except Exception as e:
-        logging.error(f"Error loading news seen file: {e}")
+        logger.error(f"Error loading news seen file: {e}")
         return set()
 
 def save_news_id(news_id):
@@ -166,14 +191,7 @@ def save_news_id(news_id):
         with open(NEWS_SEEN_FILE, "a") as f:
             f.write(news_id + "\n")
     except Exception as e:
-        logging.error(f"Failed to save news id {news_id}: {e}")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s:%(name)s:%(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger("scanner")
+        logger.error(f"Failed to save news id {news_id}: {e}")
 
 try:
     import yfinance as yf
@@ -185,9 +203,6 @@ except ImportError:
 logger.info("market_alerts.py is running!!! --- If you see this, your file is found and started.")
 logger.info("Imports completed successfully.")
 
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PRICE_THRESHOLD = 20.00
 MAX_SYMBOLS = 4000
 SCREENER_REFRESH_SEC = 30
