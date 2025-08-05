@@ -22,6 +22,22 @@ import time
 
 EMA_PERIODS = [5, 8, 13]
 
+def ensure_deque(obj, maxlen=20):
+    if isinstance(obj, deque):
+        return obj
+    elif isinstance(obj, list):
+        return deque(obj, maxlen=maxlen)
+    else:
+        return deque(maxlen=maxlen)
+
+def ensure_list(obj):
+    if isinstance(obj, list):
+        return obj
+    elif isinstance(obj, deque):
+        return list(obj)
+    else:
+        return []
+
 def ema(prices, period):
     prices = np.asarray(prices, dtype=float)
     ema = np.zeros_like(prices)
@@ -37,6 +53,7 @@ def vwap_numpy(prices, volumes):
     return np.sum(prices * volumes) / np.sum(volumes) if np.sum(volumes) > 0 else 0.0
 
 def vwap_candles_numpy(candles):
+    candles = ensure_list(candles)
     prices = [(c['high'] + c['low'] + c['close']) / 3 for c in candles]
     volumes = [c['volume'] for c in candles]
     return vwap_numpy(prices, volumes)
@@ -312,6 +329,7 @@ def get_session_date(dt):
     return dt_ny.date()
 
 def check_volume_spike(candles_seq, vwap_value):
+    candles_seq = ensure_list(candles_seq)
     if len(candles_seq) < 4:
         return False
     curr_candle = candles_seq[-1]
@@ -352,10 +370,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         last_hod_alert_price.clear()
         print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
 
-    if not isinstance(candles[symbol], deque):
-        candles[symbol] = deque(candles[symbol], maxlen=20)
-    if not isinstance(vwap_candles[symbol], list):
-        vwap_candles[symbol] = list(vwap_candles[symbol])
+    # Always enforce correct types for sequence containers
+    candles[symbol] = ensure_deque(candles[symbol], maxlen=20)
+    vwap_candles[symbol] = ensure_list(vwap_candles[symbol])
 
     float_shares = get_float_shares(symbol)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
@@ -367,7 +384,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         return
 
     today = datetime.now(timezone.utc).date()
-    candles_seq = candles[symbol]
+    candles_seq = ensure_list(candles[symbol])
     event_time = datetime.now(timezone.utc)
 
     # --- High Of The Day (HOD) Alert ---
@@ -386,7 +403,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     # Warming Up Alert
     if len(candles_seq) >= 6:
-        last_6 = list(candles_seq)[-6:]
+        last_6 = candles_seq[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5
         last_candle = last_6[-1]
@@ -421,7 +438,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     # Runner Alert
     if len(candles_seq) >= 6:
-        last_6 = list(candles_seq)[-6:]
+        last_6 = candles_seq[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5
         last_candle = last_6[-1]
@@ -487,7 +504,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
     if len(candles_seq) >= DIP_LOOKBACK:
-        highs = [c["high"] for c in list(candles_seq)[-DIP_LOOKBACK:]]
+        highs = [c["high"] for c in candles_seq[-DIP_LOOKBACK:]]
         rhigh = max(highs)
         recent_high[symbol] = rhigh
     if recent_high[symbol] > 0:
@@ -496,7 +513,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dip_pct >= MIN_DIP_PCT and close <= 20.00
         )
         if dip_play_criteria and len(candles_seq) >= 3:
-            c1, c2, c3 = list(candles_seq)[-3:]
+            c1, c2, c3 = candles_seq[-3:]
             higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
             rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
             dip_play_criteria = dip_play_criteria and higher_lows and rising_volume
@@ -519,7 +536,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     # Rug Pull Alert
     if len(candles_seq) >= 3:
-        c0, c1, c2 = list(candles_seq)[-3:]
+        c0, c1, c2 = candles_seq[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
         bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
         rug_pull_criteria = (
@@ -817,10 +834,9 @@ async def ingest_polygon_events():
                             "volume": volume,
                             "start_time": start_time,
                         }
-                        if not isinstance(candles[symbol], deque):
-                            candles[symbol] = deque(candles[symbol], maxlen=20)
-                        if not isinstance(vwap_candles[symbol], list):
-                            vwap_candles[symbol] = list(vwap_candles[symbol])
+                        # Enforce types to avoid slice errors
+                        candles[symbol] = ensure_deque(candles[symbol], maxlen=20)
+                        vwap_candles[symbol] = ensure_list(vwap_candles[symbol])
                         candles[symbol].append(candle)
                         session_date = get_session_date(candle['start_time'])
                         last_session = vwap_session_date[symbol]
