@@ -365,7 +365,7 @@ def get_session_date(dt):
         return dt_ny.date() - timedelta(days=1)
     return dt_ny.date()
 
-def check_volume_spike(candles_seq, vwap_value):
+def check_volume_spike(candles_seq, vwap_value, event_close):
     candles_seq = ensure_list(candles_seq)
     if len(candles_seq) < 4:
         return False
@@ -374,7 +374,8 @@ def check_volume_spike(candles_seq, vwap_value):
     trailing_volumes = [c.get('volume', 0) for c in candles_seq[-4:-1]]
     trailing_avg = sum(trailing_volumes) / 3 if trailing_volumes else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
-    above_vwap = curr_candle.get('close', 0) > vwap_value
+    # Compare to event_close, not just curr_candle['close']
+    above_vwap = event_close > vwap_value
     if (
         curr_volume >= 125000 and
         rvol >= 2.0 and
@@ -423,28 +424,30 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     candles_seq = ensure_list(candles[symbol])
     event_time = datetime.now(timezone.utc)
 
+    # --- FIXED HOD LOGIC: Always use event's high for alert ---
     highs = [c['high'] for c in candles_seq if c and 'high' in c]
-    if highs:
-        high_today = max(highs)
-        prev_hod = last_hod_alert_price[symbol]
-        if symbol in alerted_symbols and high_today > prev_hod and (prev_hod == 0 or high_today >= prev_hod + 0.75):
-            price_str = f"{high_today:.2f}"
-            alert_text = (
-                f"💰 <b>{escape_html(symbol)}</b> New High of the Day!\n"
-                f"Price: ${price_str}"
-            )
-            print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-            await send_telegram_async(alert_text)
-            last_hod_alert_price[symbol] = high_today
+    latest_high = high  # Use event's high directly
+    prev_hod = last_hod_alert_price[symbol]
+    print(f"[DEBUG] HOD highs list: {highs}, max(highs): {max(highs) if highs else None}, event high: {latest_high}, last_hod_alert_price: {prev_hod}")
+    # Alert only if event's high is a new high above previous alert
+    if latest_high > prev_hod and (prev_hod == 0 or latest_high >= prev_hod + 0.75):
+        price_str = f"{latest_high:.2f}"
+        alert_text = (
+            f"💰 <b>{escape_html(symbol)}</b> New High of the Day!\n"
+            f"Price: ${price_str}"
+        )
+        print(f"[DEBUG] About to alert for {symbol}. Event high: {latest_high}, max in deque: {max(highs) if highs else None}, Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
+        await send_telegram_async(alert_text)
+        last_hod_alert_price[symbol] = latest_high
 
+    # Warming up, runner, etc. -- still use event data directly for all checks
     if len(candles_seq) >= 6:
         last_6 = candles_seq[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1] if c and 'volume' in c]
         avg_vol_5 = sum(volumes_5) / 5 if volumes_5 else 1
-        last_candle = last_6[-1]
-        open_wu = last_candle['open']
-        close_wu = last_candle['close']
-        volume_wu = last_candle['volume']
+        volume_wu = volume
+        open_wu = open_
+        close_wu = close
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
         vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dollar_volume_wu = close_wu * volume_wu
@@ -476,10 +479,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         last_6 = candles_seq[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1] if c and 'volume' in c]
         avg_vol_5 = sum(volumes_5) / 5 if volumes_5 else 1
-        last_candle = last_6[-1]
-        open_rn = last_candle['open']
-        close_rn = last_candle['close']
-        volume_rn = last_candle['volume']
+        volume_rn = volume
+        open_rn = open_
+        close_rn = close
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
         vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         runner_criteria = (
@@ -512,12 +514,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         closes = [c['close'] for c in candles_seq if c and 'close' in c]
         rsi_val = rsi(closes)[-1] if closes else 0
         lower_band, sma, upper_band = bollinger_bands(closes, period=20, num_std=2)
-        last_candle = candles_seq[-1]
         oversold_bounce_criteria = (
             rsi_val < 30 and
             lower_band[-1] is not None and
-            closes[-1] <= lower_band[-1] and
-            last_candle['close'] > last_candle['open']
+            close <= lower_band[-1] and
+            close > open_
         )
         if oversold_bounce_criteria:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
@@ -595,30 +596,29 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     if len(candles_seq) >= 2:
         prev_candle = candles_seq[-2]
-        curr_candle = candles_seq[-1]
-        prev_vwap = vwap_candles_numpy(vwap_candles[symbol][:-1]) if len(vwap_candles[symbol]) >= 2 else None
         curr_vwap = vwap_candles_numpy(vwap_candles[symbol])
         trailing_vols = [c['volume'] for c in candles_seq[:-1] if c and 'volume' in c]
         rvol = 0
         if trailing_vols:
             avg_trailing = sum(trailing_vols[-20:]) / min(len(trailing_vols), 20)
-            rvol = curr_candle['volume'] / avg_trailing if avg_trailing > 0 else 0
+            rvol = volume / avg_trailing if avg_trailing > 0 else 0
 
+        prev_vwap = vwap_candles_numpy(vwap_candles[symbol][:-1]) if len(vwap_candles[symbol]) >= 2 else None
         vwap_reclaim_criteria = (
             prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close']) and
-            curr_candle['close'] > (curr_vwap if curr_vwap is not None else curr_candle['close']) and
-            curr_candle['volume'] >= 100_000 and
+            close > (curr_vwap if curr_vwap is not None else close) and
+            volume >= 100_000 and
             rvol >= 2.0
         )
         if vwap_reclaim_criteria:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("vwap_reclaim", symbol, curr_candle['close'], curr_candle['volume'], event_time, {
+            log_event("vwap_reclaim", symbol, close, volume, event_time, {
                 "rvol": rvol
             })
-            price_str = f"{curr_candle['close']:.2f}"
+            price_str = f"{close:.2f}"
             vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
-            vol_str = f"{curr_candle['volume']:,}"
+            vol_str = f"{volume:,}"
             rvol_str = f"{rvol:.2f}"
             alert_text = (
                 f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
@@ -632,19 +632,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_alert_time[symbol] = now
 
     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-    if check_volume_spike(candles_seq, vwap_value):
+    # Always pass event close to volume spike check
+    if check_volume_spike(candles_seq, vwap_value, close):
         if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
             return
-        correct_close = candles_seq[-1]['close'] if candles_seq and 'close' in candles_seq[-1] else close
-        price_str = f"{correct_close:.2f}"
+        price_str = f"{close:.2f}"  # Use event close price ONLY
+        print(f"[DEBUG] Volume spike alert for {symbol}: event close={close}, latest candle close={candles_seq[-1]['close'] if candles_seq else 'n/a'}, float={float_shares}")
         alert_text = (
             f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
             f"Current Price: ${price_str}"
         )
-        print(f"[DEBUG] Volume spike alert for {symbol}: close from event={close}, close from candles_seq={correct_close}, float={float_shares}")
-        await send_telegram_async(alert_text)
         event_time = now
-        log_event("volume_spike", symbol, correct_close, volume, event_time, {
+        log_event("volume_spike", symbol, close, volume, event_time, {
             "rvol": volume / (sum([c['volume'] for c in candles_seq[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
             "vwap": vwap_value
         })
@@ -666,18 +665,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema5 >= 1.015 * ema13 and
             closes[-1] > vwap_value and
             ema5 > vwap_value and
-            candles_seq[-1]['volume'] >= 175000
+            volume >= 175000
         )
         if ema_stack_criteria:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("ema_stack", symbol, closes[-1], candles_seq[-1]['volume'], event_time, {
+            log_event("ema_stack", symbol, closes[-1], volume, event_time, {
                 "ema5": ema5,
                 "ema8": ema8,
                 "ema13": ema13,
                 "vwap": vwap_value
             })
-            price_str = f"{closes[-1]:.2f}"
+            price_str = f"{close:.2f}"
             alert_text = (
                 f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack\n"
                 f"Current Price: ${price_str}\n"
@@ -863,6 +862,9 @@ async def ingest_polygon_events():
                         close = event["c"]
                         volume = event["v"]
                         start_time = polygon_time_to_utc(event["s"])
+                        # --- PATCH: Alert logic first, then append to candles deque ---
+                        await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                        # Now update the candles deque and vwap_candles
                         candle = {
                             "open": open_,
                             "high": high,
@@ -871,8 +873,6 @@ async def ingest_polygon_events():
                             "volume": volume,
                             "start_time": start_time,
                         }
-                        candles[symbol] = ensure_deque(candles[symbol], maxlen=20)
-                        vwap_candles[symbol] = ensure_list(vwap_candles[symbol])
                         candles[symbol].append(candle)
                         session_date = get_session_date(candle['start_time'])
                         last_session = vwap_session_date[symbol]
@@ -882,7 +882,6 @@ async def ingest_polygon_events():
                         vwap_candles[symbol].append(candle)
                         vwap_cum_vol[symbol] += volume
                         vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
-                        await on_new_candle(symbol, open_, high, low, close, volume, start_time)
                     elif event.get("ev") == "status" and event.get("status") == "halt":
                         await handle_halt_event(event)
                     elif event.get("ev") == "status" and event.get("status") == "resume":
