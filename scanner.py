@@ -389,6 +389,8 @@ def get_ny_date():
     return now_utc.astimezone(ny).date()
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
+    # DEBUG PRINT: Show every incoming candle processed
+    print(f"Scanning: {symbol} open={open_} close={close} vol={volume} time={start_time}")
     try:
         global current_session_date
         today_ny = get_ny_date()
@@ -841,6 +843,8 @@ async def ingest_polygon_events():
                 while True:
                     try:
                         msg = await ws.recv()
+                        # DEBUG PRINT: Show every message received from Polygon
+                        print(f"[DEBUG] Received from Polygon: {msg}")
                         data = json.loads(msg)
                         if isinstance(data, dict) and data.get("ev") == "status":
                             if data.get("status") == "halt":
