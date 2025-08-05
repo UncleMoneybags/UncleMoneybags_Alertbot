@@ -824,6 +824,11 @@ async def ingest_polygon_events():
                             "volume": volume,
                             "start_time": start_time,
                         }
+                        # PATCH: Ensure correct types before appending!
+                        if not isinstance(candles[symbol], deque):
+                            candles[symbol] = deque(candles[symbol], maxlen=20)
+                        if not isinstance(vwap_candles[symbol], list):
+                            vwap_candles[symbol] = list(vwap_candles[symbol])
                         candles[symbol].append(candle)
                         session_date = get_session_date(candle['start_time'])
                         last_session = vwap_session_date[symbol]
