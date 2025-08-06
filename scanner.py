@@ -143,6 +143,70 @@ def load_float_cache():
         float_cache = {}
         logger.error(f"Failed to load float cache: {e}")
 
+# ----------------- PATCH START: ASYNC DYNAMIC GAPPER FLOAT PREWARM -----------------
+import yfinance as yf
+
+async def fetch_gappers_yahoo(limit=15):
+    """Fetch a list of premarket gappers from Yahoo Finance (top N)."""
+    url = "https://finance.yahoo.com/premarket/"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                html_text = await resp.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        table = soup.find("table")
+        tickers = []
+        if table and table.find("tbody"):
+            for row in table.find_all("tr")[:limit]:
+                cols = row.find_all("td")
+                if len(cols) >= 1:
+                    ticker = cols[0].text.strip().upper()
+                    if re.match(r"^[A-Z]{1,5}$", ticker):  # Only valid stock tickers
+                        tickers.append(ticker)
+        logger.info(f"Fetched {len(tickers)} premarket gappers from Yahoo: {tickers}")
+        return tickers
+    except Exception as e:
+        logger.error(f"Failed to fetch gappers from Yahoo: {e}")
+        return []
+
+async def async_get_float_shares(ticker, session=None):
+    """Async wrapper for yfinance float fetch (runs in executor)."""
+    loop = asyncio.get_event_loop()
+    try:
+        float_val = await loop.run_in_executor(
+            None,
+            lambda: yf.Ticker(ticker).info.get('floatShares', None)
+        )
+        return float_val
+    except Exception as e:
+        logger.warning(f"Error fetching float for {ticker}: {e}")
+        return None
+
+async def prewarm_float_cache_async():
+    """Fetch today's gappers and pre-cache their float asynchronously."""
+    global float_cache
+    # Fetch premarket gappers
+    gappers = await fetch_gappers_yahoo(limit=15)
+    logger.info(f"Pre-warming float cache for tickers: {gappers}")
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for ticker in gappers:
+            if ticker in float_cache and float_cache[ticker] is not None:
+                logger.debug(f"Float already cached for {ticker}: {float_cache[ticker]}")
+                continue
+            tasks.append((ticker, async_get_float_shares(ticker, session=session)))
+        # Run all float fetches in parallel
+        results = await asyncio.gather(*(t[1] for t in tasks))
+        for (ticker, result) in zip((t[0] for t in tasks), results):
+            if result is not None:
+                float_cache[ticker] = result
+                logger.info(f"Pre-cached float for {ticker}: {result}")
+            else:
+                logger.warning(f"Could not fetch float for {ticker}")
+        save_float_cache()
+    logger.info(f"Float cache pre-warming complete. Entries: {len(float_cache)}")
+# ----------------- PATCH END -----------------
+
 def get_float_shares(ticker):
     print(f"Checking float for ticker: {ticker}")  # DEBUG
     if ticker in float_cache and float_cache[ticker] is not None:
@@ -899,6 +963,8 @@ async def ingest_polygon_events():
 
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
+    # PREWARM THE FLOAT CACHE BEFORE STARTING MAIN TASKS!
+    await prewarm_float_cache_async()
     ingest_task = asyncio.create_task(ingest_polygon_events())
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
