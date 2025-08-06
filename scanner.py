@@ -443,6 +443,48 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
+
+    # ---- PATCH: Stricter VWAP runner check ----
+    # Only compute vwap_rn if there is enough VWAP data (at least 3 candles)
+    vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] and len(vwap_candles[symbol]) >= 3 else None
+
+    if len(candles_seq) >= 6:
+        last_6 = list(candles_seq)[-6:]
+        volumes_5 = [c['volume'] for c in last_6[:-1]]
+        avg_vol_5 = sum(volumes_5) / 5
+        last_candle = last_6[-1]
+        open_rn = last_candle['open']
+        close_rn = last_candle['close']
+        volume_rn = last_candle['volume']
+        price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
+
+        # PATCH: Only allow runner if VWAP exists and we are above it!
+        runner_criteria = (
+            volume_rn >= 2 * avg_vol_5 and
+            price_move_rn >= 0.06 and
+            close_rn >= 0.10 and
+            vwap_rn is not None and
+            close_rn > vwap_rn
+        )
+        logger.info(f"[RUNNER DEBUG] {symbol}: close={close_rn}, vwap={vwap_rn}, runner_criteria={runner_criteria}")
+        if runner_criteria:
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            log_event("runner", symbol, close_rn, volume_rn, event_time, {
+                "price_move": price_move_rn
+            })
+            price_str = f"{close_rn:.2f}"
+            alert_text = (
+                f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
+                f"Current Price: ${price_str}"
+            )
+            await send_telegram_async(alert_text)
+            runner_alerted_today[symbol] = today
+            last_alert_time[symbol] = now
+
+    # -- The rest of your on_new_candle remains unchanged --
+
+    # WARMING UP LOGIC
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -475,36 +517,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
-            last_alert_time[symbol] = now
-    if len(candles_seq) >= 6:
-        last_6 = list(candles_seq)[-6:]
-        volumes_5 = [c['volume'] for c in last_6[:-1]]
-        avg_vol_5 = sum(volumes_5) / 5
-        last_candle = last_6[-1]
-        open_rn = last_candle['open']
-        close_rn = last_candle['close']
-        volume_rn = last_candle['volume']
-        price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
-        vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-        runner_criteria = (
-            volume_rn >= 2 * avg_vol_5 and
-            price_move_rn >= 0.06 and
-            close_rn >= 0.10 and
-            close_rn > vwap_rn
-        )
-        if runner_criteria:
-            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                return
-            log_event("runner", symbol, close_rn, volume_rn, event_time, {
-                "price_move": price_move_rn
-            })
-            price_str = f"{close_rn:.2f}"
-            alert_text = (
-                f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
-                f"Current Price: ${price_str}"
-            )
-            await send_telegram_async(alert_text)
-            runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
 
     # DIP PLAY LOGIC
