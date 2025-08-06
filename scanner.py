@@ -984,8 +984,16 @@ async def main():
         await premarket_alert_task
         await catalyst_news_task
 
+# --- PATCHED ENTRYPOINT: only run one major mode at a time! ---
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Shutting down gracefully...")
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "prewarm":
+        print("Running prewarm_float_cache_async ONLY")
+        import asyncio
+        asyncio.run(prewarm_float_cache_async())
+    else:
+        print("Running main scanner")
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("Shutting down gracefully...")
