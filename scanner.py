@@ -22,6 +22,11 @@ import requests
 from bs4 import BeautifulSoup
 import time
 
+# --- NEW: Log system time and timezone at startup ---
+print(f"[DEBUG] System UTC time at startup: {datetime.now(timezone.utc).isoformat()}")
+ny_tz = pytz.timezone("America/New_York")
+print(f"[DEBUG] System NY time at startup: {datetime.now(timezone.utc).astimezone(ny_tz).isoformat()}")
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='[%(asctime)s] %(levelname)s:%(name)s:%(message)s',
@@ -748,24 +753,30 @@ async def premarket_gainers_alert_loop():
         except Exception as e:
             logger.error(f"Error in premarket_gainers_alert_loop: {e}")
 
+# --- PATCH: market_close_alert_loop with tighter timing and debug logging ---
 async def market_close_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
+    SLEEP_SEC = 5  # Reduced from 30s to 5s for tighter timing
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
             now_est = now_utc.astimezone(eastern)
-            if now_est.weekday() in (0, 1, 2, 3):
+            logger.debug(f"[MARKET CLOSE LOOP] Current NY time: {now_est.strftime('%Y-%m-%d %H:%M:%S')}, sent_today: {sent_today}")
+            if now_est.weekday() in (0, 1, 2, 3):  # Mon-Thu
+                # Check for first eligible time after 8:00pm (20:01:00)
                 if now_est.time() >= dt_time(20, 1) and not sent_today:
+                    logger.info(f"[MARKET CLOSE LOOP] Triggering market close alert at {now_est.strftime('%Y-%m-%d %H:%M:%S')}")
                     await send_telegram_async("Market Closed. Reconvene in pre market tomorrow.")
                     event_time = datetime.now(timezone.utc)
                     log_event("market_close", "CLOSE", 0, 0, event_time)
                     sent_today = True
             else:
                 sent_today = False
+            # Reset sent_today for next day after 8:00pm
             if now_est.time() < dt_time(20, 0):
                 sent_today = False
-            await asyncio.sleep(30)
+            await asyncio.sleep(SLEEP_SEC)
         except Exception as e:
             logger.error(f"Error in market_close_alert_loop: {e}")
 
