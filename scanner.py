@@ -313,28 +313,15 @@ def get_session_date(dt):
         return dt_ny.date() - timedelta(days=1)
     return dt_ny.date()
 
-# --- Volume Spike Criteria Function Injected ---
 def check_volume_spike(candles_seq, vwap_value):
-    """
-    Returns True if volume spike criteria is met:
-      - Current 1-min candle trades 125,000 shares or more
-      - Volume ratio (RVOL) is 2.0 or higher
-      - Current candle close is ABOVE VWAP
-    """
     if len(candles_seq) < 4:
         return False
-
     curr_candle = candles_seq[-1]
     curr_volume = curr_candle['volume']
-
     trailing_volumes = [c['volume'] for c in candles_seq[-4:-1]]
     trailing_avg = sum(trailing_volumes) / 3
-
-    # Calculate RVOL (Relative Volume)
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
-
     above_vwap = curr_candle['close'] > vwap_value
-
     if (
         curr_volume >= 125000 and
         rvol >= 2.0 and
@@ -342,16 +329,13 @@ def check_volume_spike(candles_seq, vwap_value):
     ):
         return True
     return False
-# --- End Injected Function ---
 
-# --- SESSION STATE RESET PATCH ---
 current_session_date = None
 
 def get_ny_date():
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(timezone.utc)
     return now_utc.astimezone(ny).date()
-# --- END SESSION STATE RESET PATCH ---
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     global current_session_date
@@ -365,27 +349,20 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         dip_play_seen.clear()
         halted_symbols.clear()
         print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
-
-    # PATCH: Ensure correct types before slicing/appending
     if not isinstance(candles[symbol], deque):
         candles[symbol] = deque(candles[symbol], maxlen=20)
     if not isinstance(vwap_candles[symbol], list):
         vwap_candles[symbol] = list(vwap_candles[symbol])
-
     float_shares = get_float_shares(symbol)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
         logger.debug(f"Skipping {symbol} due to float {float_shares}")
         return
-
     logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
     if not is_market_scan_time() or close > 20.00:
         return
-
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
-
-    # Warming Up Alert (fires every time criteria met)
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -405,7 +382,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dollar_volume_wu >= 100_000
         )
         if warming_up_criteria:
-            # COOLDOWN CHECK
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
             log_event("warming_up", symbol, close_wu, volume_wu, event_time, {
@@ -420,8 +396,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
-
-    # Runner Alert (fires every time criteria met)
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -439,7 +413,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             close_rn > vwap_rn
         )
         if runner_criteria:
-            # COOLDOWN CHECK
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
             log_event("runner", symbol, close_rn, volume_rn, event_time, {
@@ -453,8 +426,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
-
-    # Oversold Bounce Alert (fires every time criteria met)
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -471,7 +442,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_candle['close'] > last_candle['open']
         )
         if oversold_bounce_criteria:
-            # COOLDOWN CHECK
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
             log_event("oversold_bounce", symbol, close, volume, event_time, {
@@ -486,8 +456,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
-
-    # Dip Play Alert (fires every time criteria met)
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
     if len(candles_seq) >= DIP_LOOKBACK:
@@ -499,7 +467,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         dip_play_criteria = (
             dip_pct >= MIN_DIP_PCT and close <= 20.00
         )
-        # Only check for three-candle pattern if basic criteria is met
         if dip_play_criteria and len(candles_seq) >= 3:
             c1, c2, c3 = list(candles_seq)[-3:]
             higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
@@ -507,7 +474,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dip_play_criteria = dip_play_criteria and higher_lows and rising_volume
             logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
             if dip_play_criteria:
-                # COOLDOWN CHECK
                 if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                     return
                 log_event("dip_play", symbol, close, volume, event_time, {
@@ -522,8 +488,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 dip_play_seen.add(symbol)
                 alerted_symbols[symbol] = today
                 last_alert_time[symbol] = now
-
-    # Rug Pull Alert (fires every time criteria met)
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
@@ -532,7 +496,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             drop_pct <= RUG_PULL_DROP_PCT and bounce_pct < RUG_PULL_BOUNCE_PCT and symbol in alerted_symbols and alerted_symbols[symbol] == today
         )
         if rug_pull_criteria:
-            # COOLDOWN CHECK
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
             log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
@@ -546,21 +509,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             await send_telegram_async(alert_text)
             last_alert_time[symbol] = now
-
-    # VWAP Reclaim Alert (fires every time criteria met)
     if len(candles_seq) >= 2:
         prev_candle = candles_seq[-2]
         curr_candle = candles_seq[-1]
-
         prev_vwap = vwap_candles_numpy(vwap_candles[symbol][:-1]) if len(vwap_candles[symbol]) >= 2 else None
         curr_vwap = vwap_candles_numpy(vwap_candles[symbol])
-
         trailing_vols = [c['volume'] for c in candles_seq[:-1]]
         rvol = 0
         if trailing_vols:
             avg_trailing = sum(trailing_vols[-20:]) / min(len(trailing_vols), 20)
             rvol = curr_candle['volume'] / avg_trailing if avg_trailing > 0 else 0
-
         vwap_reclaim_criteria = (
             prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close']) and
             curr_candle['close'] > (curr_vwap if curr_vwap is not None else curr_candle['close']) and
@@ -568,7 +526,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             rvol >= 2.0
         )
         if vwap_reclaim_criteria:
-            # COOLDOWN CHECK
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
             log_event("vwap_reclaim", symbol, curr_candle['close'], curr_candle['volume'], event_time, {
@@ -587,11 +544,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
-
-    # --- Injected Volume Spike Alert [PATCHED] ---
     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
     if check_volume_spike(candles_seq, vwap_value):
-        # COOLDOWN CHECK
         if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
             return
         price_str = f"{close:.2f}"
@@ -607,9 +561,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         })
         alerted_symbols[symbol] = today
         last_alert_time[symbol] = now
-    # --- End Injected Volume Spike Alert [PATCHED] ---
-
-    # EMA Stack Alert (fires every time criteria met)
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -628,7 +579,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             candles_seq[-1]['volume'] >= 175000
         )
         if ema_stack_criteria:
-            # COOLDOWN CHECK
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
             log_event("ema_stack", symbol, closes[-1], candles_seq[-1]['volume'], event_time, {
@@ -700,7 +650,6 @@ async def premarket_gainers_alert_loop():
     while True:
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
-        # Only send once, exactly at 9:25am
         if now_est.weekday() in range(0, 5):
             if now_est.time().hour == 9 and now_est.time().minute == 25 and not sent_today:
                 gainers = await get_premarket_gainers_yahoo()
@@ -716,7 +665,6 @@ async def premarket_gainers_alert_loop():
                 sent_today = True
         else:
             sent_today = False
-        # Reset sent_today if before 9:25, so you get a fresh alert every day
         if now_est.time().hour < 9 or (now_est.time().hour == 9 and now_est.time().minute < 25):
             sent_today = False
         await asyncio.sleep(30)
@@ -798,61 +746,66 @@ async def get_ticker_news_yahoo(ticker):
         logger.error(f"[NEWS SCRAPER ERROR] {ticker}: {e}")
         return []
 
+# --- PATCHED RECONNECT LOGIC ---
 async def ingest_polygon_events():
     url = "wss://socket.polygon.io/stocks"
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-        await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
-        print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
-        while True:
-            msg = await ws.recv()
-            try:
-                data = json.loads(msg)
-                if isinstance(data, dict) and data.get("ev") == "status":
-                    if data.get("status") == "halt":
-                        await handle_halt_event(data)
-                    elif data.get("status") == "resume":
-                        await handle_resume_event(data)
-                if not isinstance(data, list):
-                    continue
-                for event in data:
-                    if event.get("ev") == "AM":
-                        symbol = event["sym"]
-                        open_ = event["o"]
-                        high = event["h"]
-                        low = event["l"]
-                        close = event["c"]
-                        volume = event["v"]
-                        start_time = polygon_time_to_utc(event["s"])
-                        candle = {
-                            "open": open_,
-                            "high": high,
-                            "low": low,
-                            "close": close,
-                            "volume": volume,
-                            "start_time": start_time,
-                        }
-                        # PATCH: Ensure correct types before appending!
-                        if not isinstance(candles[symbol], deque):
-                            candles[symbol] = deque(candles[symbol], maxlen=20)
-                        if not isinstance(vwap_candles[symbol], list):
-                            vwap_candles[symbol] = list(vwap_candles[symbol])
-                        candles[symbol].append(candle)
-                        session_date = get_session_date(candle['start_time'])
-                        last_session = vwap_session_date[symbol]
-                        if last_session != session_date:
-                            vwap_candles[symbol] = []
-                            vwap_session_date[symbol] = session_date
-                        vwap_candles[symbol].append(candle)
-                        vwap_cum_vol[symbol] += volume
-                        vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
-                        await on_new_candle(symbol, open_, high, low, close, volume, start_time)
-                    elif event.get("ev") == "status" and event.get("status") == "halt":
-                        await handle_halt_event(event)
-                    elif event.get("ev") == "status" and event.get("status") == "resume":
-                        await handle_resume_event(event)
-            except Exception as e:
-                print(f"Error processing message: {e}\nRaw: {msg}")
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
+                print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
+                while True:
+                    msg = await ws.recv()
+                    try:
+                        data = json.loads(msg)
+                        if isinstance(data, dict) and data.get("ev") == "status":
+                            if data.get("status") == "halt":
+                                await handle_halt_event(data)
+                            elif data.get("status") == "resume":
+                                await handle_resume_event(data)
+                        if not isinstance(data, list):
+                            continue
+                        for event in data:
+                            if event.get("ev") == "AM":
+                                symbol = event["sym"]
+                                open_ = event["o"]
+                                high = event["h"]
+                                low = event["l"]
+                                close = event["c"]
+                                volume = event["v"]
+                                start_time = polygon_time_to_utc(event["s"])
+                                candle = {
+                                    "open": open_,
+                                    "high": high,
+                                    "low": low,
+                                    "close": close,
+                                    "volume": volume,
+                                    "start_time": start_time,
+                                }
+                                if not isinstance(candles[symbol], deque):
+                                    candles[symbol] = deque(candles[symbol], maxlen=20)
+                                if not isinstance(vwap_candles[symbol], list):
+                                    vwap_candles[symbol] = list(vwap_candles[symbol])
+                                candles[symbol].append(candle)
+                                session_date = get_session_date(candle['start_time'])
+                                last_session = vwap_session_date[symbol]
+                                if last_session != session_date:
+                                    vwap_candles[symbol] = []
+                                    vwap_session_date[symbol] = session_date
+                                vwap_candles[symbol].append(candle)
+                                vwap_cum_vol[symbol] += volume
+                                vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+                                await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                            elif event.get("ev") == "status" and event.get("status") == "halt":
+                                await handle_halt_event(event)
+                            elif event.get("ev") == "status" and event.get("status") == "resume":
+                                await handle_resume_event(event)
+                    except Exception as e:
+                        print(f"Error processing message: {e}\nRaw: {msg}")
+        except Exception as e:
+            print(f"Websocket error: {e} — reconnecting in 10 seconds...")
+            await asyncio.sleep(10)
 
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
