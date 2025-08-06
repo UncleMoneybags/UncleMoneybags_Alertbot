@@ -77,15 +77,20 @@ def bollinger_bands(prices, period=20, num_std=2):
 def polygon_time_to_utc(ts):
     return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
 
+# --- FLOAT CACHE patch: cache negative results with retry cooldown ---
 float_cache = {}
+float_cache_none_retry = {}
+FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
 
 def save_float_cache():
     with open("float_cache.pkl", "wb") as f:
         pickle.dump(float_cache, f)
-    print(f"[DEBUG] Saved float cache, entries: {len(float_cache)}")
+    with open("float_cache_none.pkl", "wb") as f:
+        pickle.dump(float_cache_none_retry, f)
+    print(f"[DEBUG] Saved float cache, entries: {len(float_cache)}, none cache: {len(float_cache_none_retry)}")
 
 def load_float_cache():
-    global float_cache
+    global float_cache, float_cache_none_retry
     if os.path.exists("float_cache.pkl"):
         with open("float_cache.pkl", "rb") as f:
             float_cache = pickle.load(f)
@@ -93,11 +98,26 @@ def load_float_cache():
     else:
         float_cache = {}
         print(f"[DEBUG] No float cache found, starting new.")
+    if os.path.exists("float_cache_none.pkl"):
+        with open("float_cache_none.pkl", "rb") as f:
+            float_cache_none_retry = pickle.load(f)
+        print(f"[DEBUG] Loaded float_cache_none_retry, entries: {len(float_cache_none_retry)}")
+    else:
+        float_cache_none_retry = {}
+        print(f"[DEBUG] No float_cache_none_retry found, starting new.")
 
 def get_float_shares(ticker):
+    now = datetime.now(timezone.utc)
+    # Check positive/real float first
     if ticker in float_cache and float_cache[ticker] is not None:
         print(f"[DEBUG] Cache HIT for {ticker}: {float_cache[ticker]}")
         return float_cache[ticker]
+    # Check negative/None cache, only retry every N minutes
+    if ticker in float_cache_none_retry:
+        last_none = float_cache_none_retry[ticker]
+        if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
+            print(f"[DEBUG] Cache NONE HIT for {ticker}")
+            return None
     print(f"[DEBUG] Cache MISS for {ticker}")
     try:
         import yfinance as yf
@@ -107,12 +127,18 @@ def get_float_shares(ticker):
             float_cache[ticker] = float_shares
             save_float_cache()
             print(f"[DEBUG] Cached float for {ticker}: {float_shares}")
+            if ticker in float_cache_none_retry:
+                del float_cache_none_retry[ticker]
         else:
             print(f"[DEBUG] Yahoo float error for {ticker}: No floatShares found")
+            float_cache_none_retry[ticker] = now
+            save_float_cache()
         time.sleep(0.5)
         return float_shares
     except Exception as e:
         print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
+        float_cache_none_retry[ticker] = now
+        save_float_cache()
         if "Rate limited" in str(e):
             time.sleep(10)
         return float_cache.get(ticker, None)
@@ -149,9 +175,14 @@ except ImportError:
 logger.info("scanner.py is running!!! --- If you see this, your file is found and started.")
 logger.info("Imports completed successfully.")
 
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "VmF1boger0pp2M7gV5HboHheRbplmLi5")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1002266463234")
+# Remove hardcoded API keys for security; rely on environment variables ONLY
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+if not POLYGON_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    logger.critical("API keys or chat id missing in environment variables! Exiting.")
+    sys.exit(1)
+
 PRICE_THRESHOLD = 20.00
 MAX_SYMBOLS = 4000
 SCREENER_REFRESH_SEC = 30
@@ -316,9 +347,9 @@ def get_session_date(dt):
 def check_volume_spike(candles_seq, vwap_value):
     if len(candles_seq) < 4:
         return False
-    curr_candle = candles_seq[-1]
+    curr_candle = list(candles_seq)[-1]
     curr_volume = curr_candle['volume']
-    trailing_volumes = [c['volume'] for c in candles_seq[-4:-1]]
+    trailing_volumes = [c['volume'] for c in list(candles_seq)[-4:-1]]
     trailing_avg = sum(trailing_volumes) / 3
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
     above_vwap = curr_candle['close'] > vwap_value
@@ -335,7 +366,8 @@ current_session_date = None
 def get_ny_date():
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(timezone.utc)
-    return now_utc.astimezone(ny).date()
+    now_ny = now_utc.astimezone(ny)
+    return now_ny.date()
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     global current_session_date
@@ -431,10 +463,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         float_shares <= 10_000_000 and
         len(candles_seq) >= 20
     ):
-        closes = [c['close'] for c in candles_seq]
+        closes = [c['close'] for c in list(candles_seq)]
         rsi_val = rsi(closes)[-1]
         lower_band, sma, upper_band = bollinger_bands(closes, period=20, num_std=2)
-        last_candle = candles_seq[-1]
+        last_candle = list(candles_seq)[-1]
         oversold_bounce_criteria = (
             rsi_val < 30 and
             lower_band[-1] is not None and
@@ -510,11 +542,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             last_alert_time[symbol] = now
     if len(candles_seq) >= 2:
-        prev_candle = candles_seq[-2]
-        curr_candle = candles_seq[-1]
-        prev_vwap = vwap_candles_numpy(vwap_candles[symbol][:-1]) if len(vwap_candles[symbol]) >= 2 else None
-        curr_vwap = vwap_candles_numpy(vwap_candles[symbol])
-        trailing_vols = [c['volume'] for c in candles_seq[:-1]]
+        prev_candle = list(candles_seq)[-2]
+        curr_candle = list(candles_seq)[-1]
+        prev_vwap = vwap_candles_numpy(list(vwap_candles[symbol])[:-1]) if len(vwap_candles[symbol]) >= 2 else None
+        curr_vwap = vwap_candles_numpy(list(vwap_candles[symbol]))
+        trailing_vols = [c['volume'] for c in list(candles_seq)[:-1]]
         rvol = 0
         if trailing_vols:
             avg_trailing = sum(trailing_vols[-20:]) / min(len(trailing_vols), 20)
@@ -556,7 +588,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         await send_telegram_async(alert_text)
         event_time = now
         log_event("volume_spike", symbol, close, volume, event_time, {
-            "rvol": volume / (sum([c['volume'] for c in candles_seq[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
+            "rvol": volume / (sum([c['volume'] for c in list(candles_seq)[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
             "vwap": vwap_value
         })
         alerted_symbols[symbol] = today
@@ -566,7 +598,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         float_shares <= 10_000_000 and
         len(candles_seq) >= max(EMA_PERIODS)
     ):
-        closes = [c['close'] for c in candles_seq]
+        closes = [c['close'] for c in list(candles_seq)]
         ema5 = ema(closes, 5)[-1]
         ema8 = ema(closes, 8)[-1]
         ema13 = ema(closes, 13)[-1]
@@ -576,12 +608,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema5 >= 1.015 * ema13 and
             closes[-1] > vwap_value and
             ema5 > vwap_value and
-            candles_seq[-1]['volume'] >= 175000
+            list(candles_seq)[-1]['volume'] >= 175000
         )
         if ema_stack_criteria:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("ema_stack", symbol, closes[-1], candles_seq[-1]['volume'], event_time, {
+            log_event("ema_stack", symbol, closes[-1], list(candles_seq)[-1]['volume'], event_time, {
                 "ema5": ema5,
                 "ema8": ema8,
                 "ema13": ema13,
