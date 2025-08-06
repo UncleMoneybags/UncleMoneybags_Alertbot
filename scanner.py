@@ -458,38 +458,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         'start_time': start_time
     })
 
-    # --- Improved Time-of-Day RVOL Spike Alert ---
-    def is_regular_hours(dt):
-        ny = pytz.timezone("America/New_York")
-        local = dt.astimezone(ny)
-        return local.time() >= dt_time(9,30) and local.time() < dt_time(16,0)
-
-    minute_idx = get_minute_of_day(start_time)
-    rvol_tod = vol_profile.get_rvol(symbol, minute_idx, volume)
-    dollar_volume = close * volume
-
-    if is_regular_hours(start_time):
-        rvol_threshold = 5.0
-    else:
-        rvol_threshold = 8.0
-
-    if rvol_tod >= rvol_threshold and dollar_volume >= 100_000:
-        if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-            pass
-        else:
-            price_str = f"{close:.2f}"
-            alert_text = (
-                f"👁️ <b>{escape_html(symbol)}</b> Volume Spike Alert\n"
-                f"Current Price: ${price_str}\n"
-                f"RVOL: {rvol_tod:.2f} | $Vol: ${dollar_volume:,.0f}"
-            )
-            await send_telegram_async(alert_text)
-            event_time = now
-            log_event("rvol_timeofday_spike", symbol, close, volume, event_time, {
-                "rvol_timeofday": rvol_tod,
-                "dollar_volume": dollar_volume
-            })
-            last_alert_time[symbol] = now
+    # --- RVOL spike alert removed ---
 
     # Warming Up Logic
     if len(candles_seq) >= 6:
