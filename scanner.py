@@ -321,7 +321,6 @@ last_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
 # Edge-trigger state tracking for all alerts
 warming_up_was_true = defaultdict(bool)
 runner_was_true = defaultdict(bool)
-oversold_bounce_was_true = defaultdict(bool)
 dip_play_was_true = defaultdict(bool)
 rug_pull_was_true = defaultdict(bool)
 vwap_reclaim_was_true = defaultdict(bool)
@@ -458,36 +457,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_telegram_async(alert_text)
             runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
-    if (
-        float_shares is not None and
-        float_shares <= 10_000_000 and
-        len(candles_seq) >= 20
-    ):
-        closes = [c['close'] for c in list(candles_seq)]
-        rsi_val = rsi(closes)[-1]
-        lower_band, sma, upper_band = bollinger_bands(closes, period=20, num_std=2)
-        last_candle = list(candles_seq)[-1]
-        oversold_bounce_criteria = (
-            rsi_val < 30 and
-            lower_band[-1] is not None and
-            closes[-1] <= lower_band[-1] and
-            last_candle['close'] > last_candle['open']
-        )
-        if oversold_bounce_criteria:
-            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                return
-            log_event("oversold_bounce", symbol, close, volume, event_time, {
-                "rsi": rsi_val,
-                "lower_band": lower_band[-1]
-            })
-            price_str = f"{close:.2f}"
-            alert_text = (
-                f"🏀 <b>{escape_html(symbol)}</b> Oversold Bounce\n"
-                f"Current Price: ${price_str}"
-            )
-            await send_telegram_async(alert_text)
-            alerted_symbols[symbol] = today
-            last_alert_time[symbol] = now
+
+    # DIP PLAY LOGIC
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
     if len(candles_seq) >= DIP_LOOKBACK:
@@ -520,6 +491,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 dip_play_seen.add(symbol)
                 alerted_symbols[symbol] = today
                 last_alert_time[symbol] = now
+
     if len(candles_seq) >= 3:
         c0, c1, c2 = list(candles_seq)[-3:]
         drop_pct = (c1["close"] - c0["close"]) / c0["close"]
@@ -593,6 +565,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         })
         alerted_symbols[symbol] = today
         last_alert_time[symbol] = now
+
+    # EMA STACK LOGIC
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -610,6 +584,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema5 > vwap_value and
             list(candles_seq)[-1]['volume'] >= 175000
         )
+        logger.info(f"[EMA STACK DEBUG] {symbol}: ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}, vwap={vwap_value:.2f}, close={closes[-1]:.2f}, volume={list(candles_seq)[-1]['volume']}, criteria={ema_stack_criteria}")
         if ema_stack_criteria:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
@@ -684,6 +659,7 @@ async def premarket_gainers_alert_loop():
         now_est = now_utc.astimezone(eastern)
         if now_est.weekday() in range(0, 5):
             if now_est.time().hour == 9 and now_est.time().minute == 25 and not sent_today:
+                logger.info("Sending premarket gainers alert at 9:25am ET")
                 gainers = await get_premarket_gainers_yahoo()
                 gainers_text = "\n".join(gainers)
                 msg = (
@@ -695,11 +671,11 @@ async def premarket_gainers_alert_loop():
                 event_time = datetime.now(timezone.utc)
                 log_event("premarket_gainers", "PREMARKET", 0, 0, event_time, {"gainers": gainers_text})
                 sent_today = True
+            if now_est.time().hour != 9 or now_est.time().minute != 25:
+                sent_today = False
         else:
             sent_today = False
-        if now_est.time().hour < 9 or (now_est.time().hour == 9 and now_est.time().minute < 25):
-            sent_today = False
-        await asyncio.sleep(30)
+        await asyncio.sleep(1)
 
 async def market_close_alert_loop():
     eastern = pytz.timezone("America/New_York")
@@ -807,6 +783,8 @@ async def ingest_polygon_events():
                                 close = event["c"]
                                 volume = event["v"]
                                 start_time = polygon_time_to_utc(event["s"])
+                                # Print/log statement for confirming live Polygon data
+                                print(f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}")
                                 candle = {
                                     "open": open_,
                                     "high": high,
