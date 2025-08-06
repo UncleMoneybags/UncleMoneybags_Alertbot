@@ -19,6 +19,7 @@ import sys
 import requests
 from bs4 import BeautifulSoup
 import time
+import threading
 
 EMA_PERIODS = [5, 8, 13]
 
@@ -77,10 +78,12 @@ def bollinger_bands(prices, period=20, num_std=2):
 def polygon_time_to_utc(ts):
     return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
 
-# --- FLOAT CACHE patch: cache negative results with retry cooldown ---
+# --- PATCHED FLOAT CACHE & LOOKUP: Polygon primary, Yahoo fallback, thread-safe, with None-retry & disk cache ---
 float_cache = {}
 float_cache_none_retry = {}
+float_locks = {}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
+FLOAT_CACHE_EXPIRATION = 6 * 60 * 60  # 6 hours
 
 def save_float_cache():
     with open("float_cache.pkl", "wb") as f:
@@ -106,42 +109,81 @@ def load_float_cache():
         float_cache_none_retry = {}
         print(f"[DEBUG] No float_cache_none_retry found, starting new.")
 
-def get_float_shares(ticker):
+def get_float_shares(symbol, logger=None):
+    """Thread-safe, Polygon-first, Yahoo fallback, in-memory & disk-cached float lookup."""
+    symbol = symbol.upper()
     now = datetime.now(timezone.utc)
-    # Check positive/real float first
-    if ticker in float_cache and float_cache[ticker] is not None:
-        print(f"[DEBUG] Cache HIT for {ticker}: {float_cache[ticker]}")
-        return float_cache[ticker]
-    # Check negative/None cache, only retry every N minutes
-    if ticker in float_cache_none_retry:
-        last_none = float_cache_none_retry[ticker]
-        if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
-            print(f"[DEBUG] Cache NONE HIT for {ticker}")
-            return None
-    print(f"[DEBUG] Cache MISS for {ticker}")
-    try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).info
-        float_shares = info.get('floatShares', None)
-        if float_shares is not None:
-            float_cache[ticker] = float_shares
-            save_float_cache()
-            print(f"[DEBUG] Cached float for {ticker}: {float_shares}")
-            if ticker in float_cache_none_retry:
-                del float_cache_none_retry[ticker]
-        else:
-            print(f"[DEBUG] Yahoo float error for {ticker}: No floatShares found")
-            float_cache_none_retry[ticker] = now
-            save_float_cache()
-        time.sleep(0.5)
-        return float_shares
-    except Exception as e:
-        print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
-        float_cache_none_retry[ticker] = now
+
+    # Lock by symbol to avoid parallel lookups
+    lock = float_locks.setdefault(symbol, threading.Lock())
+    with lock:
+        # CACHE: Check if result is fresh
+        cached = float_cache.get(symbol)
+        if cached:
+            float_shares, ts = cached
+            if (now - ts).total_seconds() < FLOAT_CACHE_EXPIRATION:
+                print(f"[DEBUG] Cache HIT for {symbol}: {float_shares}")
+                return float_shares
+
+        # CACHE: Check negative/None cache (with retry cooldown)
+        if symbol in float_cache_none_retry:
+            last_none = float_cache_none_retry[symbol]
+            if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
+                print(f"[DEBUG] Cache NONE HIT for {symbol}")
+                return None
+
+        print(f"[DEBUG] Cache MISS for {symbol}")
+
+        # 1. Try Polygon API first
+        float_shares = None
+        try:
+            api_key = os.environ.get("POLYGON_API_KEY")
+            if api_key:
+                url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={api_key}"
+                resp = requests.get(url, timeout=3)
+                resp.raise_for_status()
+                data = resp.json()
+                float_shares = data.get('results', {}).get('share_class_shares_outstanding')
+                if float_shares:
+                    float_cache[symbol] = (float_shares, now)
+                    save_float_cache()
+                    print(f"[DEBUG] Cached float from Polygon for {symbol}: {float_shares}")
+                    if symbol in float_cache_none_retry:
+                        del float_cache_none_retry[symbol]
+                    return float_shares
+        except Exception as e:
+            msg = f"[Polygon float error for {symbol}]: {e}"
+            if logger:
+                logger.debug(msg)
+            else:
+                print(msg)
+
+        # 2. Fallback to Yahoo/yfinance ONLY if Polygon failed
+        try:
+            import yfinance as yf
+            info = yf.Ticker(symbol).info
+            float_shares = info.get("floatShares")
+            if float_shares:
+                float_cache[symbol] = (float_shares, now)
+                save_float_cache()
+                print(f"[DEBUG] Cached float from Yahoo for {symbol}: {float_shares}")
+                if symbol in float_cache_none_retry:
+                    del float_cache_none_retry[symbol]
+                return float_shares
+            else:
+                print(f"[DEBUG] Yahoo float error for {symbol}: No floatShares found")
+        except Exception as e:
+            msg = f"[Yahoo float error for {symbol}]: {e}"
+            if logger:
+                logger.debug(msg)
+            else:
+                print(msg)
+
+        # 3. Cache None so we don't retry too often
+        float_cache_none_retry[symbol] = now
         save_float_cache()
-        if "Rate limited" in str(e):
-            time.sleep(10)
-        return float_cache.get(ticker, None)
+        float_cache[symbol] = (None, now)
+        return None
 
 load_float_cache()
 
@@ -176,9 +218,9 @@ logger.info("scanner.py is running!!! --- If you see this, your file is found an
 logger.info("Imports completed successfully.")
 
 # Remove hardcoded API keys for security; rely on environment variables ONLY
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "VmF1boger0pp2M7gV5HboHheRbplmLi5")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","-1002266463234")
 if not POLYGON_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logger.critical("API keys or chat id missing in environment variables! Exiting.")
     sys.exit(1)
@@ -384,7 +426,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         candles[symbol] = deque(candles[symbol], maxlen=20)
     if not isinstance(vwap_candles[symbol], list):
         vwap_candles[symbol] = list(vwap_candles[symbol])
-    float_shares = get_float_shares(symbol)
+    float_shares = get_float_shares(symbol, logger)
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
         logger.debug(f"Skipping {symbol} due to float {float_shares}")
         return
