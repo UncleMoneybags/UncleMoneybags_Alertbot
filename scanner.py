@@ -73,16 +73,16 @@ vol_profile = VolumeProfile()
 
 EMA_PERIODS = [5, 8, 13]
 
-def ema(prices, period):
-    prices = np.asarray(prices, dtype=float)
-    if len(prices) < period:
-        return np.full_like(prices, np.nan)
-    ema_arr = np.zeros_like(prices)
-    alpha = 2 / (period + 1)
-    ema_arr[0] = prices[0]
-    for i in range(1, len(prices)):
-        ema_arr[i] = alpha * prices[i] + (1 - alpha) * ema_arr[i - 1]
-    return ema_arr
+def calculate_emas(prices, periods=[5, 8, 13], window=30):
+    """
+    Returns a dict with EMA values for specified periods, calculated on the last `window` prices.
+    """
+    prices = list(prices)[-window:]  # Use only last `window` candles
+    s = pd.Series(prices)
+    emas = {}
+    for p in periods:
+        emas[f"ema{p}"] = s.ewm(span=p, adjust=False).mean().to_numpy()
+    return emas
 
 def vwap_numpy(prices, volumes):
     prices = np.asarray(prices, dtype=float)
@@ -653,10 +653,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         float_shares <= 10_000_000 and
         len(candles_seq) >= max(EMA_PERIODS)
     ):
-        closes = [c['close'] for c in list(candles_seq)]
-        ema5 = ema(closes, 5)[-1]
-        ema8 = ema(closes, 8)[-1]
-        ema13 = ema(closes, 13)[-1]
+        closes = [c['close'] for c in list(candles_seq)[-30:]]  # last 30 closes for reliable EMAs
+        emas = calculate_emas(closes, periods=[5, 8, 13], window=30)
+        ema5 = emas['ema5'][-1]
+        ema8 = emas['ema8'][-1]
+        ema13 = emas['ema13'][-1]
         vwap_value = vwap_candles_numpy(vwap_candles[symbol])
         ema_stack_criteria = (
             ema5 > ema8 > ema13 and
