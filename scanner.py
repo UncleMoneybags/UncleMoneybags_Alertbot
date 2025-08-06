@@ -20,6 +20,56 @@ import requests
 from bs4 import BeautifulSoup
 import time
 
+# --- Time-of-Day Volume Profile for RVOL Spike Alerts ---
+PROFILE_FILE = "volume_profile.json"
+DAYS_TO_KEEP = 20
+MINUTES_PER_SESSION = 390  # 9:30-16:00
+
+def get_minute_of_day(dt):
+    return (dt.hour - 9) * 60 + (dt.minute - 30)
+
+class VolumeProfile:
+    def __init__(self):
+        self.profile = defaultdict(lambda: defaultdict(list))
+        self._load_profile()
+
+    def _load_profile(self):
+        if os.path.exists(PROFILE_FILE):
+            with open(PROFILE_FILE, "r") as f:
+                self.profile = json.load(f)
+            for sym, by_min in self.profile.items():
+                self.profile[sym] = {int(minidx): vols for minidx, vols in by_min.items()}
+        else:
+            self.profile = defaultdict(lambda: defaultdict(list))
+
+    def _save_profile(self):
+        serializable = {sym: {str(minidx): vols for minidx, vols in by_min.items()} for sym, by_min in self.profile.items()}
+        with open(PROFILE_FILE, "w") as f:
+            json.dump(serializable, f)
+
+    def add_day(self, symbol, daily_candles):
+        for candle in daily_candles:
+            minute_idx = get_minute_of_day(candle['start_time'])
+            vol = candle['volume']
+            if minute_idx < 0 or minute_idx >= MINUTES_PER_SESSION:
+                continue
+            self.profile.setdefault(symbol, {}).setdefault(minute_idx, []).append(vol)
+            if len(self.profile[symbol][minute_idx]) > DAYS_TO_KEEP:
+                self.profile[symbol][minute_idx] = self.profile[symbol][minute_idx][-DAYS_TO_KEEP:]
+        self._save_profile()
+
+    def get_avg(self, symbol, minute_idx):
+        vols = self.profile.get(symbol, {}).get(minute_idx, [])
+        if vols:
+            return sum(vols) / len(vols)
+        return 1
+
+    def get_rvol(self, symbol, minute_idx, curr_volume):
+        avg_volume = self.get_avg(symbol, minute_idx)
+        return curr_volume / avg_volume if avg_volume > 0 else 0
+
+vol_profile = VolumeProfile()
+
 EMA_PERIODS = [5, 8, 13]
 
 def ema(prices, period):
@@ -408,6 +458,26 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         'start_time': start_time
     })
 
+    # --- Time-of-Day RVOL Spike Alert (Pro-level) ---
+    minute_idx = get_minute_of_day(start_time)
+    rvol_tod = vol_profile.get_rvol(symbol, minute_idx, volume)
+    if rvol_tod >= 3.0:
+        if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+            pass  # Cooldown, skip
+        else:
+            price_str = f"{close:.2f}"
+            alert_text = (
+                f"👁️ <b>{escape_html(symbol)}</b> Volume Spike Alert\n"
+                f"Current Price: ${price_str}\n"
+                f"RVOL: {rvol_tod:.2f}"
+            )
+            await send_telegram_async(alert_text)
+            event_time = now
+            log_event("rvol_timeofday_spike", symbol, close, volume, event_time, {
+                "rvol_timeofday": rvol_tod
+            })
+            last_alert_time[symbol] = now
+
     # Warming Up Logic
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
@@ -632,6 +702,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema_stack_was_true[symbol] = True
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
+
+# --- At end of each day, call this to update the time-of-day profile ---
+def update_profile_for_day(symbol, day_candles):
+    vol_profile.add_day(symbol, day_candles)
 
 async def catalyst_news_alert_loop():
     global news_seen
