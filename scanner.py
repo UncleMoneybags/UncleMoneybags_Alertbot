@@ -417,6 +417,112 @@ def get_ny_date():
     now_ny = now_utc.astimezone(ny)
     return now_ny.date()
 
+# --- PERFECT SETUP LOGIC START ---
+
+def is_bullish_engulfing(candles_seq):
+    if len(candles_seq) < 2:
+        return False
+    prev = candles_seq[-2]
+    curr = candles_seq[-1]
+    return (
+        (prev["close"] < prev["open"]) and
+        (curr["close"] > curr["open"]) and
+        (curr["close"] > prev["open"]) and
+        (curr["open"] < prev["close"])
+    )
+
+def calc_macd_hist(closes):
+    # MACD(12,26,9)
+    s = pd.Series(closes)
+    ema12 = s.ewm(span=12, adjust=False).mean()
+    ema26 = s.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    macd_hist = macd - signal
+    return macd_hist.values
+
+async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq, vwap_value):
+    # Use last 30 closes for indicators
+    closes_np = np.array(closes)
+    volumes_np = np.array(volumes)
+    highs_np = np.array(highs)
+    lows_np = np.array(lows)
+
+    emas = calculate_emas(closes, periods=[5, 8, 13], window=30)
+    ema5 = emas["ema5"][-1]
+    ema8 = emas["ema8"][-1]
+    ema13 = emas["ema13"][-1]
+
+    # VWAP (already passed as vwap_value)
+    last_close = closes[-1]
+    last_volume = volumes[-1]
+
+    # RVOL (relative to trailing 20)
+    if len(volumes) >= 20:
+        avg_vol20 = np.mean(volumes[-20:])
+        rvol = last_volume / avg_vol20 if avg_vol20 > 0 else 0
+    else:
+        rvol = 0
+
+    # RSI (14)
+    rsi_vals = rsi(closes, period=14)
+    last_rsi = rsi_vals[-1] if not np.isnan(rsi_vals[-1]) else 0
+
+    # MACD Histogram
+    macd_hist_vals = calc_macd_hist(closes)
+    last_macd_hist = macd_hist_vals[-1]
+
+    # Bullish Engulfing
+    bullish_engulf = is_bullish_engulfing(candles_seq)
+
+    # Perfect setup criteria
+    perfect = (
+        (ema5 > ema8 > ema13)
+        and (ema5 >= 1.015 * ema13)
+        and (last_close > vwap_value)
+        and (ema5 > vwap_value)
+        and (last_volume >= 175000)
+        and (rvol > 2.5)
+        and (last_rsi < 70)
+        and (last_macd_hist > 0)
+        and bullish_engulf
+    )
+
+    if perfect:
+        # CLEAN, MINIMAL ALERT
+        alert_text = (
+            f"🚨 <b>PERFECT SETUP</b> 🚨\n"
+            f"<b>{escape_html(symbol)}</b> | ${last_close:.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
+            f"Trend: EMA5 > EMA8 > EMA13\n"
+            f"{'Above VWAP' if last_close > vwap_value else 'Below VWAP'}"
+            f" | MACD↑"
+            f" | RSI: {int(round(last_rsi))}"
+        )
+        await send_telegram_async(alert_text)
+        # Log as event
+        now = datetime.now(timezone.utc)
+        log_event(
+            "perfect_setup",
+            symbol,
+            last_close,
+            last_volume,
+            now,
+            {
+                "ema5": ema5,
+                "ema8": ema8,
+                "ema13": ema13,
+                "vwap": vwap_value,
+                "rvol": rvol,
+                "rsi14": last_rsi,
+                "macd_hist": last_macd_hist,
+                "bullish_engulfing": bullish_engulf
+            }
+        )
+        # Avoid duplicate alerts (reuse EMA STACK logic flag)
+        ema_stack_was_true[symbol] = True
+
+# --- PERFECT SETUP LOGIC END ---
+
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     global current_session_date
     today_ny = get_ny_date()
@@ -458,6 +564,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         'volume': volume,
         'start_time': start_time
     })
+
+    # --- PERFECT SETUP SCANNER ---
+    if len(candles_seq) >= 30:
+        closes = [c['close'] for c in list(candles_seq)[-30:]]
+        highs = [c['high'] for c in list(candles_seq)[-30:]]
+        lows = [c['low'] for c in list(candles_seq)[-30:]]
+        volumes = [c['volume'] for c in list(candles_seq)[-30:]]
+        vwap_value = vwap_candles_numpy(list(vwap_candles[symbol]))
+        # Only alert if not previously alerted this session
+        if not ema_stack_was_true[symbol]:
+            await alert_perfect_setup(symbol, closes, volumes, highs, lows, list(candles_seq)[-30:], vwap_value)
 
     # --- RVOL spike alert removed ---
 
