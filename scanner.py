@@ -218,9 +218,9 @@ logger.info("scanner.py is running!!! --- If you see this, your file is found an
 logger.info("Imports completed successfully.")
 
 # Remove hardcoded API keys for security; rely on environment variables ONLY
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "VmF1boger0pp2M7gV5HboHheRbplmLi5")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","-1002266463234")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 if not POLYGON_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logger.critical("API keys or chat id missing in environment variables! Exiting.")
     sys.exit(1)
@@ -430,9 +430,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
         logger.debug(f"Skipping {symbol} due to float {float_shares}")
         return
+
+    # PATCH: Skip all alerts for stocks trading under $0.10
+    if close < 0.10:
+        logger.debug(f"Skipping {symbol} due to price under $0.10 (close={close})")
+        return
+
     logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
     if not is_market_scan_time() or close > 20.00:
         return
+
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
