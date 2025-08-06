@@ -1,5 +1,3 @@
-print("Script started!")  # DEBUG: Startup print
-
 import logging
 import asyncio
 import websockets
@@ -22,50 +20,10 @@ import requests
 from bs4 import BeautifulSoup
 import time
 
-# --- NEW: Log system time and timezone at startup ---
-print(f"[DEBUG] System UTC time at startup: {datetime.now(timezone.utc).isoformat()}")
-ny_tz = pytz.timezone("America/New_York")
-print(f"[DEBUG] System NY time at startup: {datetime.now(timezone.utc).astimezone(ny_tz).isoformat()}")
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='[%(asctime)s] %(levelname)s:%(name)s:%(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger("scanner")
-logger.info("Logging is working!")
-
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-assert POLYGON_API_KEY, "POLYGON_API_KEY is missing!"
-assert TELEGRAM_BOT_TOKEN, "TELEGRAM_BOT_TOKEN is missing!"
-assert TELEGRAM_CHAT_ID, "TELEGRAM_CHAT_ID is missing!"
-print("API keys loaded.")  # DEBUG
-
 EMA_PERIODS = [5, 8, 13]
-
-def ensure_deque(obj, maxlen=20):
-    if isinstance(obj, deque):
-        return deque(obj, maxlen=maxlen)
-    elif isinstance(obj, list):
-        return deque(obj, maxlen=maxlen)
-    else:
-        return deque(maxlen=maxlen)
-
-def ensure_list(obj):
-    if isinstance(obj, list):
-        return obj
-    elif isinstance(obj, deque):
-        return list(obj)
-    else:
-        return []
 
 def ema(prices, period):
     prices = np.asarray(prices, dtype=float)
-    if len(prices) == 0:
-        return np.zeros(0)
     ema = np.zeros_like(prices)
     alpha = 2 / (period + 1)
     ema[0] = prices[0]
@@ -79,21 +37,16 @@ def vwap_numpy(prices, volumes):
     return np.sum(prices * volumes) / np.sum(volumes) if np.sum(volumes) > 0 else 0.0
 
 def vwap_candles_numpy(candles):
-    candles = ensure_list(candles)
-    if not candles:
-        return 0.0
-    prices = [(c['high'] + c['low'] + c['close']) / 3 for c in candles if c and 'high' in c and 'low' in c and 'close' in c]
-    volumes = [c['volume'] for c in candles if c and 'volume' in c]
-    return vwap_numpy(prices, volumes) if prices and volumes else 0.0
+    prices = [(c['high'] + c['low'] + c['close']) / 3 for c in candles]
+    volumes = [c['volume'] for c in candles]
+    return vwap_numpy(prices, volumes)
 
 def rsi(prices, period=14):
     prices = np.asarray(prices, dtype=float)
-    if len(prices) < period:
-        return np.zeros_like(prices)
     deltas = np.diff(prices)
     seed = deltas[:period]
-    up = seed[seed > 0].sum() / period if period > 0 else 0
-    down = -seed[seed < 0].sum() / period if period > 0 else 0
+    up = seed[seed > 0].sum() / period
+    down = -seed[seed < 0].sum() / period
     rs = up / down if down != 0 else 0
     rsi = np.zeros_like(prices)
     rsi[:period] = 100. - 100. / (1. + rs)
@@ -110,7 +63,7 @@ def rsi(prices, period=14):
 def bollinger_bands(prices, period=20, num_std=2):
     prices = np.asarray(prices, dtype=float)
     if len(prices) < period:
-        return [None]*len(prices), [None]*len(prices), [None]*len(prices)
+        return None, None, None
     sma = np.convolve(prices, np.ones(period)/period, mode='valid')
     std = np.array([np.std(prices[i-period:i]) for i in range(period, len(prices)+1)])
     upper_band = sma + num_std * std
@@ -127,33 +80,25 @@ def polygon_time_to_utc(ts):
 float_cache = {}
 
 def save_float_cache():
-    try:
-        with open("float_cache.pkl", "wb") as f:
-            pickle.dump(float_cache, f)
-        logger.debug(f"Saved float cache, entries: {len(float_cache)}")
-    except Exception as e:
-        logger.error(f"Failed to save float cache: {e}")
+    with open("float_cache.pkl", "wb") as f:
+        pickle.dump(float_cache, f)
+    print(f"[DEBUG] Saved float cache, entries: {len(float_cache)}")
 
 def load_float_cache():
     global float_cache
-    try:
-        if os.path.exists("float_cache.pkl"):
-            with open("float_cache.pkl", "rb") as f:
-                float_cache = pickle.load(f)
-            logger.debug(f"Loaded float cache, entries: {len(float_cache)}")
-        else:
-            float_cache = {}
-            logger.debug("No float cache found, starting new.")
-    except Exception as e:
+    if os.path.exists("float_cache.pkl"):
+        with open("float_cache.pkl", "rb") as f:
+            float_cache = pickle.load(f)
+        print(f"[DEBUG] Loaded float cache, entries: {len(float_cache)}")
+    else:
         float_cache = {}
-        logger.error(f"Failed to load float cache: {e}")
+        print(f"[DEBUG] No float cache found, starting new.")
 
 def get_float_shares(ticker):
-    print(f"Checking float for ticker: {ticker}")  # DEBUG
     if ticker in float_cache and float_cache[ticker] is not None:
-        logger.debug(f"Cache HIT for {ticker}: {float_cache[ticker]}")
+        print(f"[DEBUG] Cache HIT for {ticker}: {float_cache[ticker]}")
         return float_cache[ticker]
-    logger.debug(f"Cache MISS for {ticker}")
+    print(f"[DEBUG] Cache MISS for {ticker}")
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info
@@ -161,16 +106,13 @@ def get_float_shares(ticker):
         if float_shares is not None:
             float_cache[ticker] = float_shares
             save_float_cache()
-            logger.debug(f"Cached float for {ticker}: {float_shares}")
+            print(f"[DEBUG] Cached float for {ticker}: {float_shares}")
         else:
-            logger.warning(f"No floatShares found for {ticker} (Yahoo returned no info)")
+            print(f"[DEBUG] Yahoo float error for {ticker}: No floatShares found")
         time.sleep(0.5)
         return float_shares
     except Exception as e:
-        print(f"Failed to get float for {ticker}: {e}")  # DEBUG
-        logger.error(f"Yahoo float error for {ticker}: {e}")
-        if "404" in str(e):
-            logger.warning(f"Yahoo Finance 404 for ticker {ticker} (likely delisted or invalid)")
+        print(f"[DEBUG] Yahoo float error for {ticker}: {e}")
         if "Rate limited" in str(e):
             time.sleep(10)
         return float_cache.get(ticker, None)
@@ -185,16 +127,17 @@ def load_news_seen():
             return set(line.strip() for line in f if line.strip())
     except FileNotFoundError:
         return set()
-    except Exception as e:
-        logger.error(f"Error loading news seen file: {e}")
-        return set()
 
 def save_news_id(news_id):
-    try:
-        with open(NEWS_SEEN_FILE, "a") as f:
-            f.write(news_id + "\n")
-    except Exception as e:
-        logger.error(f"Failed to save news id {news_id}: {e}")
+    with open(NEWS_SEEN_FILE, "a") as f:
+        f.write(news_id + "\n")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s:%(name)s:%(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("scanner")
 
 try:
     import yfinance as yf
@@ -203,9 +146,12 @@ except ImportError:
     logger.warning("yfinance not installed. Run 'pip install yfinance' for float filtering.")
     YFINANCE_AVAILABLE = False
 
-logger.info("market_alerts.py is running!!! --- If you see this, your file is found and started.")
+logger.info("scanner.py is running!!! --- If you see this, your file is found and started.")
 logger.info("Imports completed successfully.")
 
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "VmF1boger0pp2M7gV5HboHheRbplmLi5")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1002266463234")
 PRICE_THRESHOLD = 20.00
 MAX_SYMBOLS = 4000
 SCREENER_REFRESH_SEC = 30
@@ -239,14 +185,11 @@ def log_event(event_type, symbol, price, volume, event_time, extra_features=None
     }
     header = list(row.keys())
     write_header = not os.path.exists(EVENT_LOG_FILE) or os.path.getsize(EVENT_LOG_FILE) == 0
-    try:
-        with open(EVENT_LOG_FILE, "a", newline="") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=header)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
-    except Exception as e:
-        logger.error(f"Failed to log event for {symbol}: {e}")
+    with open(EVENT_LOG_FILE, "a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=header)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 try:
     runner_clf = joblib.load("runner_model.joblib")
@@ -312,7 +255,7 @@ async def send_telegram_async(message):
         logger.error(f"[DEBUG] Telegram send error: {e}")
 
 def escape_html(s):
-    return html.escape(str(s) if s is not None else "")
+    return html.escape(s or "")
 
 candles = defaultdict(lambda: deque(maxlen=20))
 trade_candle_builders = defaultdict(list)
@@ -340,9 +283,11 @@ volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
 
+# Cooldown logic for all alerts
 ALERT_COOLDOWN_MINUTES = 10
 last_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
 
+# Edge-trigger state tracking for all alerts
 warming_up_was_true = defaultdict(bool)
 runner_was_true = defaultdict(bool)
 oversold_bounce_was_true = defaultdict(bool)
@@ -368,16 +313,28 @@ def get_session_date(dt):
         return dt_ny.date() - timedelta(days=1)
     return dt_ny.date()
 
-def check_volume_spike(candles_seq, vwap_value, event_close):
-    candles_seq = ensure_list(candles_seq)
+# --- Volume Spike Criteria Function Injected ---
+def check_volume_spike(candles_seq, vwap_value):
+    """
+    Returns True if volume spike criteria is met:
+      - Current 1-min candle trades 125,000 shares or more
+      - Volume ratio (RVOL) is 2.0 or higher
+      - Current candle close is ABOVE VWAP
+    """
     if len(candles_seq) < 4:
         return False
+
     curr_candle = candles_seq[-1]
-    curr_volume = curr_candle.get('volume', 0)
-    trailing_volumes = [c.get('volume', 0) for c in candles_seq[-4:-1]]
-    trailing_avg = sum(trailing_volumes) / 3 if trailing_volumes else 1
+    curr_volume = curr_candle['volume']
+
+    trailing_volumes = [c['volume'] for c in candles_seq[-4:-1]]
+    trailing_avg = sum(trailing_volumes) / 3
+
+    # Calculate RVOL (Relative Volume)
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
-    above_vwap = event_close > vwap_value
+
+    above_vwap = curr_candle['close'] > vwap_value
+
     if (
         curr_volume >= 125000 and
         rvol >= 2.0 and
@@ -385,322 +342,334 @@ def check_volume_spike(candles_seq, vwap_value, event_close):
     ):
         return True
     return False
+# --- End Injected Function ---
 
+# --- SESSION STATE RESET PATCH ---
 current_session_date = None
 
 def get_ny_date():
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(timezone.utc)
     return now_utc.astimezone(ny).date()
-
-# -- prewarm float logic removed --
+# --- END SESSION STATE RESET PATCH ---
 
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
-    # DEBUG PRINT: Show every incoming candle processed
-    print(f"Scanning: {symbol} open={open_} close={close} vol={volume} time={start_time}")
-    try:
-        global current_session_date
-        today_ny = get_ny_date()
-        now = datetime.now(timezone.utc)
-        if current_session_date != today_ny:
-            current_session_date = today_ny
-            alerted_symbols.clear()
-            runner_alerted_today.clear()
-            recent_high.clear()
-            dip_play_seen.clear()
-            halted_symbols.clear()
-            print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
+    global current_session_date
+    today_ny = get_ny_date()
+    now = datetime.now(timezone.utc)
+    if current_session_date != today_ny:
+        current_session_date = today_ny
+        alerted_symbols.clear()
+        runner_alerted_today.clear()
+        recent_high.clear()
+        dip_play_seen.clear()
+        halted_symbols.clear()
+        print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
 
-        candles[symbol] = ensure_deque(candles[symbol], maxlen=20)
-        vwap_candles[symbol] = ensure_list(vwap_candles[symbol])
+    # PATCH: Ensure correct types before slicing/appending
+    if not isinstance(candles[symbol], deque):
+        candles[symbol] = deque(candles[symbol], maxlen=20)
+    if not isinstance(vwap_candles[symbol], list):
+        vwap_candles[symbol] = list(vwap_candles[symbol])
 
-        float_shares = get_float_shares(symbol)
-        if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
-            print(f"[DEBUG] SKIPPING {symbol} due to float {float_shares}")
-            return
-        assert MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES, f"Should not alert for {symbol} with float {float_shares}"
+    float_shares = get_float_shares(symbol)
+    if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
+        logger.debug(f"Skipping {symbol} due to float {float_shares}")
+        return
 
-        logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
-        if not is_market_scan_time() or close > 20.00:
-            return
+    logger.debug(f"on_new_candle: {symbol} - open:{open_}, close:{close}, volume:{volume}")
+    if not is_market_scan_time() or close > 20.00:
+        return
 
-        today = datetime.now(timezone.utc).date()
-        candles_seq = ensure_list(candles[symbol])
-        event_time = datetime.now(timezone.utc)
+    today = datetime.now(timezone.utc).date()
+    candles_seq = candles[symbol]
+    event_time = datetime.now(timezone.utc)
 
-        if len(candles_seq) >= 6:
-            last_6 = candles_seq[-6:]
-            volumes_5 = [c['volume'] for c in last_6[:-1] if c and 'volume' in c]
-            avg_vol_5 = sum(volumes_5) / 5 if volumes_5 else 1
-            volume_wu = volume
-            open_wu = open_
-            close_wu = close
-            price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
-            vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-            dollar_volume_wu = close_wu * volume_wu
-            warming_up_criteria = (
-                volume_wu >= 1.5 * avg_vol_5 and
-                price_move_wu >= 0.03 and
-                0.20 <= close_wu <= 20.00 and
-                close_wu > vwap_wu and
-                dollar_volume_wu >= 100_000
-            )
-            if warming_up_criteria:
-                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                    return
-                log_event("warming_up", symbol, close_wu, volume_wu, event_time, {
-                    "price_move": price_move_wu,
-                    "dollar_volume": dollar_volume_wu
-                })
-                price_str = f"{close_wu:.2f}"
-                alert_text = (
-                    f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
-                    f"Current Price: ${price_str}"
-                )
-                print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-                await send_telegram_async(alert_text)
-                alerted_symbols[symbol] = today
-                last_alert_time[symbol] = now
-
-        if len(candles_seq) >= 6:
-            last_6 = candles_seq[-6:]
-            volumes_5 = [c['volume'] for c in last_6[:-1] if c and 'volume' in c]
-            avg_vol_5 = sum(volumes_5) / 5 if volumes_5 else 1
-            volume_rn = volume
-            open_rn = open_
-            close_rn = close
-            price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
-            vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-            runner_criteria = (
-                volume_rn >= 2 * avg_vol_5 and
-                price_move_rn >= 0.06 and
-                close_rn >= 0.10 and
-                close_rn > vwap_rn
-            )
-            if runner_criteria:
-                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                    return
-                log_event("runner", symbol, close_rn, volume_rn, event_time, {
-                    "price_move": price_move_rn
-                })
-                price_str = f"{close_rn:.2f}"
-                alert_text = (
-                    f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
-                    f"Current Price: ${price_str}"
-                )
-                print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-                await send_telegram_async(alert_text)
-                runner_alerted_today[symbol] = today
-                last_alert_time[symbol] = now
-
-        if (
-            float_shares is not None and
-            float_shares <= 10_000_000 and
-            len(candles_seq) >= 20
-        ):
-            closes = [c['close'] for c in candles_seq if c and 'close' in c]
-            rsi_val = rsi(closes)[-1] if closes else 0
-            lower_band, sma, upper_band = bollinger_bands(closes, period=20, num_std=2)
-            oversold_bounce_criteria = (
-                rsi_val < 30 and
-                lower_band[-1] is not None and
-                close <= lower_band[-1] and
-                close > open_
-            )
-            if oversold_bounce_criteria:
-                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                    return
-                log_event("oversold_bounce", symbol, close, volume, event_time, {
-                    "rsi": rsi_val,
-                    "lower_band": lower_band[-1]
-                })
-                price_str = f"{close:.2f}"
-                alert_text = (
-                    f"🏀 <b>{escape_html(symbol)}</b> Oversold Bounce\n"
-                    f"Current Price: ${price_str}"
-                )
-                print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-                await send_telegram_async(alert_text)
-                alerted_symbols[symbol] = today
-                last_alert_time[symbol] = now
-
-        MIN_DIP_PCT = 0.10
-        DIP_LOOKBACK = 10
-        if len(candles_seq) >= DIP_LOOKBACK:
-            highs = [c["high"] for c in candles_seq[-DIP_LOOKBACK:] if c and 'high' in c]
-            rhigh = max(highs) if highs else 0
-            recent_high[symbol] = rhigh
-        if recent_high[symbol] > 0:
-            dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
-            dip_play_criteria = (
-                dip_pct >= MIN_DIP_PCT and close <= 20.00
-            )
-            if dip_play_criteria and len(candles_seq) >= 3:
-                c1, c2, c3 = candles_seq[-3:]
-                higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
-                rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
-                dip_play_criteria = dip_play_criteria and higher_lows and rising_volume
-                logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
-                if dip_play_criteria:
-                    if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                        return
-                    log_event("dip_play", symbol, close, volume, event_time, {
-                        "dip_pct": dip_pct
-                    })
-                    price_str = f"{close:.2f}"
-                    alert_text = (
-                        f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
-                        f"Current Price: ${price_str}"
-                    )
-                    print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-                    await send_telegram_async(alert_text)
-                    dip_play_seen.add(symbol)
-                    alerted_symbols[symbol] = today
-                    last_alert_time[symbol] = now
-
-        if len(candles_seq) >= 3:
-            c0, c1, c2 = candles_seq[-3:]
-            drop_pct = (c1["close"] - c0["close"]) / c0["close"]
-            bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
-            rug_pull_criteria = (
-                drop_pct <= RUG_PULL_DROP_PCT and bounce_pct < RUG_PULL_BOUNCE_PCT and symbol in alerted_symbols and alerted_symbols[symbol] == today
-            )
-            if rug_pull_criteria:
-                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                    return
-                log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
-                    "drop_pct": drop_pct,
-                    "bounce_pct": bounce_pct
-                })
-                price_str = f"{c2['close']:.2f}"
-                alert_text = (
-                    f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull\n"
-                    f"Current Price: ${price_str}"
-                )
-                print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-                await send_telegram_async(alert_text)
-                last_alert_time[symbol] = now
-
-        if len(candles_seq) >= 2:
-            prev_candle = candles_seq[-2]
-            curr_vwap = vwap_candles_numpy(vwap_candles[symbol])
-            trailing_vols = [c['volume'] for c in candles_seq[:-1] if c and 'volume' in c]
-            rvol = 0
-            if trailing_vols:
-                avg_trailing = sum(trailing_vols[-20:]) / min(len(trailing_vols), 20)
-                rvol = volume / avg_trailing if avg_trailing > 0 else 0
-
-            prev_vwap = vwap_candles_numpy(vwap_candles[symbol][:-1]) if len(vwap_candles[symbol]) >= 2 else None
-            vwap_reclaim_criteria = (
-                prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close']) and
-                close > (curr_vwap if curr_vwap is not None else close) and
-                volume >= 100_000 and
-                rvol >= 2.0
-            )
-            if vwap_reclaim_criteria:
-                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                    return
-                log_event("vwap_reclaim", symbol, close, volume, event_time, {
-                    "rvol": rvol
-                })
-                price_str = f"{close:.2f}"
-                vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
-                vol_str = f"{volume:,}"
-                rvol_str = f"{rvol:.2f}"
-                alert_text = (
-                    f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
-                    f"Price: ${price_str} | VWAP: ${vwap_str}\n"
-                    f"1-min Vol: {vol_str}\n"
-                    f"RVOL: {rvol_str}"
-                )
-                print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
-                await send_telegram_async(alert_text)
-                alerted_symbols[symbol] = today
-                last_alert_time[symbol] = now
-
-        vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-        if check_volume_spike(candles_seq, vwap_value, close):
+    # Warming Up Alert (fires every time criteria met)
+    if len(candles_seq) >= 6:
+        last_6 = list(candles_seq)[-6:]
+        volumes_5 = [c['volume'] for c in last_6[:-1]]
+        avg_vol_5 = sum(volumes_5) / 5
+        last_candle = last_6[-1]
+        open_wu = last_candle['open']
+        close_wu = last_candle['close']
+        volume_wu = last_candle['volume']
+        price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
+        vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+        dollar_volume_wu = close_wu * volume_wu
+        warming_up_criteria = (
+            volume_wu >= 1.5 * avg_vol_5 and
+            price_move_wu >= 0.03 and
+            0.20 <= close_wu <= 20.00 and
+            close_wu > vwap_wu and
+            dollar_volume_wu >= 100_000
+        )
+        if warming_up_criteria:
+            # COOLDOWN CHECK
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            price_str = f"{close:.2f}"
-            print(f"[DEBUG] Volume spike alert for {symbol}: event close={close}, latest candle close={candles_seq[-1]['close'] if candles_seq else 'n/a'}, float={float_shares}")
+            log_event("warming_up", symbol, close_wu, volume_wu, event_time, {
+                "price_move": price_move_wu,
+                "dollar_volume": dollar_volume_wu
+            })
+            price_str = f"{close_wu:.2f}"
             alert_text = (
-                f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
+                f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
                 f"Current Price: ${price_str}"
             )
-            event_time = now
-            log_event("volume_spike", symbol, close, volume, event_time, {
-                "rvol": volume / (sum([c['volume'] for c in candles_seq[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
-                "vwap": vwap_value
-            })
+            await send_telegram_async(alert_text)
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
 
-        if (
-            float_shares is not None and
-            float_shares <= 10_000_000 and
-            len(candles_seq) >= max(EMA_PERIODS)
-        ):
-            closes = [c['close'] for c in candles_seq if c and 'close' in c]
-            ema5 = ema(closes, 5)[-1] if closes else 0
-            ema8 = ema(closes, 8)[-1] if closes else 0
-            ema13 = ema(closes, 13)[-1] if closes else 0
-            vwap_value = vwap_candles_numpy(vwap_candles[symbol])
-            ema_stack_criteria = (
-                ema5 > ema8 > ema13 and
-                ema5 >= 1.015 * ema13 and
-                closes[-1] > vwap_value and
-                ema5 > vwap_value and
-                volume >= 175000
+    # Runner Alert (fires every time criteria met)
+    if len(candles_seq) >= 6:
+        last_6 = list(candles_seq)[-6:]
+        volumes_5 = [c['volume'] for c in last_6[:-1]]
+        avg_vol_5 = sum(volumes_5) / 5
+        last_candle = last_6[-1]
+        open_rn = last_candle['open']
+        close_rn = last_candle['close']
+        volume_rn = last_candle['volume']
+        price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
+        vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+        runner_criteria = (
+            volume_rn >= 2 * avg_vol_5 and
+            price_move_rn >= 0.06 and
+            close_rn >= 0.10 and
+            close_rn > vwap_rn
+        )
+        if runner_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            log_event("runner", symbol, close_rn, volume_rn, event_time, {
+                "price_move": price_move_rn
+            })
+            price_str = f"{close_rn:.2f}"
+            alert_text = (
+                f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
+                f"Current Price: ${price_str}"
             )
-            if ema_stack_criteria:
+            await send_telegram_async(alert_text)
+            runner_alerted_today[symbol] = today
+            last_alert_time[symbol] = now
+
+    # Oversold Bounce Alert (fires every time criteria met)
+    if (
+        float_shares is not None and
+        float_shares <= 10_000_000 and
+        len(candles_seq) >= 20
+    ):
+        closes = [c['close'] for c in candles_seq]
+        rsi_val = rsi(closes)[-1]
+        lower_band, sma, upper_band = bollinger_bands(closes, period=20, num_std=2)
+        last_candle = candles_seq[-1]
+        oversold_bounce_criteria = (
+            rsi_val < 30 and
+            lower_band[-1] is not None and
+            closes[-1] <= lower_band[-1] and
+            last_candle['close'] > last_candle['open']
+        )
+        if oversold_bounce_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            log_event("oversold_bounce", symbol, close, volume, event_time, {
+                "rsi": rsi_val,
+                "lower_band": lower_band[-1]
+            })
+            price_str = f"{close:.2f}"
+            alert_text = (
+                f"🏀 <b>{escape_html(symbol)}</b> Oversold Bounce\n"
+                f"Current Price: ${price_str}"
+            )
+            await send_telegram_async(alert_text)
+            alerted_symbols[symbol] = today
+            last_alert_time[symbol] = now
+
+    # Dip Play Alert (fires every time criteria met)
+    MIN_DIP_PCT = 0.10
+    DIP_LOOKBACK = 10
+    if len(candles_seq) >= DIP_LOOKBACK:
+        highs = [c["high"] for c in list(candles_seq)[-DIP_LOOKBACK:]]
+        rhigh = max(highs)
+        recent_high[symbol] = rhigh
+    if recent_high[symbol] > 0:
+        dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
+        dip_play_criteria = (
+            dip_pct >= MIN_DIP_PCT and close <= 20.00
+        )
+        # Only check for three-candle pattern if basic criteria is met
+        if dip_play_criteria and len(candles_seq) >= 3:
+            c1, c2, c3 = list(candles_seq)[-3:]
+            higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
+            rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2["volume"]
+            dip_play_criteria = dip_play_criteria and higher_lows and rising_volume
+            logger.info(f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}")
+            if dip_play_criteria:
+                # COOLDOWN CHECK
                 if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                     return
-                log_event("ema_stack", symbol, closes[-1], volume, event_time, {
-                    "ema5": ema5,
-                    "ema8": ema8,
-                    "ema13": ema13,
-                    "vwap": vwap_value
+                log_event("dip_play", symbol, close, volume, event_time, {
+                    "dip_pct": dip_pct
                 })
                 price_str = f"{close:.2f}"
                 alert_text = (
-                    f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack\n"
-                    f"Current Price: ${price_str}\n"
-                    f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
+                    f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
+                    f"Current Price: ${price_str}"
                 )
-                print(f"[DEBUG] About to alert for {symbol}. Float: {float_shares}, Allowed: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES}")
                 await send_telegram_async(alert_text)
+                dip_play_seen.add(symbol)
                 alerted_symbols[symbol] = today
                 last_alert_time[symbol] = now
-    except Exception as e:
-        logger.error(f"Error in on_new_candle for {symbol}: {e}")
+
+    # Rug Pull Alert (fires every time criteria met)
+    if len(candles_seq) >= 3:
+        c0, c1, c2 = list(candles_seq)[-3:]
+        drop_pct = (c1["close"] - c0["close"]) / c0["close"]
+        bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
+        rug_pull_criteria = (
+            drop_pct <= RUG_PULL_DROP_PCT and bounce_pct < RUG_PULL_BOUNCE_PCT and symbol in alerted_symbols and alerted_symbols[symbol] == today
+        )
+        if rug_pull_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
+                "drop_pct": drop_pct,
+                "bounce_pct": bounce_pct
+            })
+            price_str = f"{c2['close']:.2f}"
+            alert_text = (
+                f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull\n"
+                f"Current Price: ${price_str}"
+            )
+            await send_telegram_async(alert_text)
+            last_alert_time[symbol] = now
+
+    # VWAP Reclaim Alert (fires every time criteria met)
+    if len(candles_seq) >= 2:
+        prev_candle = candles_seq[-2]
+        curr_candle = candles_seq[-1]
+
+        prev_vwap = vwap_candles_numpy(vwap_candles[symbol][:-1]) if len(vwap_candles[symbol]) >= 2 else None
+        curr_vwap = vwap_candles_numpy(vwap_candles[symbol])
+
+        trailing_vols = [c['volume'] for c in candles_seq[:-1]]
+        rvol = 0
+        if trailing_vols:
+            avg_trailing = sum(trailing_vols[-20:]) / min(len(trailing_vols), 20)
+            rvol = curr_candle['volume'] / avg_trailing if avg_trailing > 0 else 0
+
+        vwap_reclaim_criteria = (
+            prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close']) and
+            curr_candle['close'] > (curr_vwap if curr_vwap is not None else curr_candle['close']) and
+            curr_candle['volume'] >= 100_000 and
+            rvol >= 2.0
+        )
+        if vwap_reclaim_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            log_event("vwap_reclaim", symbol, curr_candle['close'], curr_candle['volume'], event_time, {
+                "rvol": rvol
+            })
+            price_str = f"{curr_candle['close']:.2f}"
+            vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
+            vol_str = f"{curr_candle['volume']:,}"
+            rvol_str = f"{rvol:.2f}"
+            alert_text = (
+                f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
+                f"Price: ${price_str} | VWAP: ${vwap_str}\n"
+                f"1-min Vol: {vol_str}\n"
+                f"RVOL: {rvol_str}"
+            )
+            await send_telegram_async(alert_text)
+            alerted_symbols[symbol] = today
+            last_alert_time[symbol] = now
+
+    # --- Injected Volume Spike Alert [PATCHED] ---
+    vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+    if check_volume_spike(candles_seq, vwap_value):
+        # COOLDOWN CHECK
+        if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+            return
+        price_str = f"{close:.2f}"
+        alert_text = (
+            f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
+            f"Current Price: ${price_str}"
+        )
+        await send_telegram_async(alert_text)
+        event_time = now
+        log_event("volume_spike", symbol, close, volume, event_time, {
+            "rvol": volume / (sum([c['volume'] for c in candles_seq[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
+            "vwap": vwap_value
+        })
+        alerted_symbols[symbol] = today
+        last_alert_time[symbol] = now
+    # --- End Injected Volume Spike Alert [PATCHED] ---
+
+    # EMA Stack Alert (fires every time criteria met)
+    if (
+        float_shares is not None and
+        float_shares <= 10_000_000 and
+        len(candles_seq) >= max(EMA_PERIODS)
+    ):
+        closes = [c['close'] for c in candles_seq]
+        ema5 = ema(closes, 5)[-1]
+        ema8 = ema(closes, 8)[-1]
+        ema13 = ema(closes, 13)[-1]
+        vwap_value = vwap_candles_numpy(vwap_candles[symbol])
+        ema_stack_criteria = (
+            ema5 > ema8 > ema13 and
+            ema5 >= 1.015 * ema13 and
+            closes[-1] > vwap_value and
+            ema5 > vwap_value and
+            candles_seq[-1]['volume'] >= 175000
+        )
+        if ema_stack_criteria:
+            # COOLDOWN CHECK
+            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            log_event("ema_stack", symbol, closes[-1], candles_seq[-1]['volume'], event_time, {
+                "ema5": ema5,
+                "ema8": ema8,
+                "ema13": ema13,
+                "vwap": vwap_value
+            })
+            price_str = f"{closes[-1]:.2f}"
+            alert_text = (
+                f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack\n"
+                f"Current Price: ${price_str}\n"
+                f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
+            )
+            await send_telegram_async(alert_text)
+            alerted_symbols[symbol] = today
+            last_alert_time[symbol] = now
 
 async def catalyst_news_alert_loop():
     global news_seen
     while True:
         tickers = list(get_scanned_tickers())
         for symbol in tickers:
-            try:
-                news_items = await get_ticker_news_yahoo(symbol)
-                for title, link in news_items:
-                    if any(kw.lower() in title.lower() for kw in KEYWORDS):
-                        news_id = f"{symbol}:{title}"
-                        if news_id not in news_seen:
-                            headline_fmt = highlight_keywords(title, KEYWORDS)
-                            msg = (
-                                f"📰 <b>{escape_html(symbol)}</b> {headline_fmt}\n"
-                                f"{link}"
-                            )
-                            await send_telegram_async(msg)
-                            event_time = datetime.now(timezone.utc)
-                            log_event("news_alert", symbol, 0, 0, event_time, {
-                                "headline": title,
-                                "link": link
-                            })
-                            news_seen.add(news_id)
-                            save_news_id(news_id)
-            except Exception as e:
-                logger.error(f"Error in catalyst_news_alert_loop for {symbol}: {e}")
+            news_items = await get_ticker_news_yahoo(symbol)
+            for title, link in news_items:
+                if any(kw.lower() in title.lower() for kw in KEYWORDS):
+                    news_id = f"{symbol}:{title}"
+                    if news_id not in news_seen:
+                        headline_fmt = highlight_keywords(title, KEYWORDS)
+                        msg = (
+                            f"📰 <b>{escape_html(symbol)}</b> {headline_fmt}\n"
+                            f"{link}"
+                        )
+                        await send_telegram_async(msg)
+                        event_time = datetime.now(timezone.utc)
+                        log_event("news_alert", symbol, 0, 0, event_time, {
+                            "headline": title,
+                            "link": link
+                        })
+                        news_seen.add(news_id)
+                        save_news_id(news_id)
         await asyncio.sleep(60)
 
 async def get_premarket_gainers_yahoo():
@@ -713,7 +682,7 @@ async def get_premarket_gainers_yahoo():
                 table = soup.find("table")
                 gainers = []
                 if table and table.find("tbody"):
-                    for row in table.find_all("tr")[:10]:
+                    for row in table.find("tbody").find_all("tr")[:10]:
                         cols = row.find_all("td")
                         if len(cols) >= 5:
                             ticker = cols[0].text.strip()
@@ -729,87 +698,71 @@ async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
     while True:
-        try:
-            now_utc = datetime.now(timezone.utc)
-            now_est = now_utc.astimezone(eastern)
-            if now_est.weekday() in range(0, 5):
-                if now_est.time().hour == 9 and now_est.time().minute == 25 and not sent_today:
-                    gainers = await get_premarket_gainers_yahoo()
-                    gainers_text = "\n".join(gainers)
-                    msg = (
-                        "Market opens in 5 mins...secure the damn bag!\n"
-                        "Heres premarket top gainers list.\n"
-                        f"{gainers_text}"
-                    )
-                    await send_telegram_async(msg)
-                    event_time = datetime.now(timezone.utc)
-                    log_event("premarket_gainers", "PREMARKET", 0, 0, event_time, {"gainers": gainers_text})
-                    sent_today = True
-            else:
-                sent_today = False
-            if now_est.time().hour < 9 or (now_est.time().hour == 9 and now_est.time().minute < 25):
-                sent_today = False
-            await asyncio.sleep(30)
-        except Exception as e:
-            logger.error(f"Error in premarket_gainers_alert_loop: {e}")
+        now_utc = datetime.now(timezone.utc)
+        now_est = now_utc.astimezone(eastern)
+        # Only send once, exactly at 9:25am
+        if now_est.weekday() in range(0, 5):
+            if now_est.time().hour == 9 and now_est.time().minute == 25 and not sent_today:
+                gainers = await get_premarket_gainers_yahoo()
+                gainers_text = "\n".join(gainers)
+                msg = (
+                    "Market opens in 5 mins...secure the damn bag!\n"
+                    "Heres premarket top gainers list.\n"
+                    f"{gainers_text}"
+                )
+                await send_telegram_async(msg)
+                event_time = datetime.now(timezone.utc)
+                log_event("premarket_gainers", "PREMARKET", 0, 0, event_time, {"gainers": gainers_text})
+                sent_today = True
+        else:
+            sent_today = False
+        # Reset sent_today if before 9:25, so you get a fresh alert every day
+        if now_est.time().hour < 9 or (now_est.time().hour == 9 and now_est.time().minute < 25):
+            sent_today = False
+        await asyncio.sleep(30)
 
-# --- PATCH: market_close_alert_loop with tighter timing and debug logging ---
 async def market_close_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
-    SLEEP_SEC = 5  # Reduced from 30s to 5s for tighter timing
     while True:
-        try:
-            now_utc = datetime.now(timezone.utc)
-            now_est = now_utc.astimezone(eastern)
-            logger.debug(f"[MARKET CLOSE LOOP] Current NY time: {now_est.strftime('%Y-%m-%d %H:%M:%S')}, sent_today: {sent_today}")
-            if now_est.weekday() in (0, 1, 2, 3):  # Mon-Thu
-                # Check for first eligible time after 8:00pm (20:01:00)
-                if now_est.time() >= dt_time(20, 1) and not sent_today:
-                    logger.info(f"[MARKET CLOSE LOOP] Triggering market close alert at {now_est.strftime('%Y-%m-%d %H:%M:%S')}")
-                    await send_telegram_async("Market Closed. Reconvene in pre market tomorrow.")
-                    event_time = datetime.now(timezone.utc)
-                    log_event("market_close", "CLOSE", 0, 0, event_time)
-                    sent_today = True
-            else:
-                sent_today = False
-            # Reset sent_today for next day after 8:00pm
-            if now_est.time() < dt_time(20, 0):
-                sent_today = False
-            await asyncio.sleep(SLEEP_SEC)
-        except Exception as e:
-            logger.error(f"Error in market_close_alert_loop: {e}")
+        now_utc = datetime.now(timezone.utc)
+        now_est = now_utc.astimezone(eastern)
+        if now_est.weekday() in (0, 1, 2, 3):
+            if now_est.time() >= dt_time(20, 1) and not sent_today:
+                await send_telegram_async("Market Closed. Reconvene in pre market tomorrow.")
+                event_time = datetime.now(timezone.utc)
+                log_event("market_close", "CLOSE", 0, 0, event_time)
+                sent_today = True
+        else:
+            sent_today = False
+        if now_est.time() < dt_time(20, 0):
+            sent_today = False
+        await asyncio.sleep(30)
 
 async def handle_halt_event(event):
-    try:
-        symbol = event.get("sym")
-        status = event.get("status")
-        reason = event.get("reason", "")
-        scanned = get_scanned_tickers()
-        if symbol in scanned:
-            msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}"
-            await send_telegram_async(msg)
-            event_time = datetime.now(timezone.utc)
-            log_event("halt", symbol, 0, 0, event_time, {"status": status, "reason": reason})
-            halted_symbols.add(symbol)
-            with open(HALT_LOG_FILE, "a") as f:
-                f.write(f"{datetime.now(timezone.utc).isoformat()},{symbol},{status},{reason}\n")
-            logger.info(f"HALT ALERT sent for {symbol}")
-    except Exception as e:
-        logger.error(f"Error in handle_halt_event: {e}")
+    symbol = event.get("sym")
+    status = event.get("status")
+    reason = event.get("reason", "")
+    scanned = get_scanned_tickers()
+    if symbol in scanned:
+        msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}"
+        await send_telegram_async(msg)
+        event_time = datetime.now(timezone.utc)
+        log_event("halt", symbol, 0, 0, event_time, {"status": status, "reason": reason})
+        halted_symbols.add(symbol)
+        with open(HALT_LOG_FILE, "a") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()},{symbol},{status},{reason}\n")
+        logger.info(f"HALT ALERT sent for {symbol}")
 
 async def handle_resume_event(event):
-    try:
-        symbol = event.get("sym")
-        reason = event.get("reason", "")
-        if symbol in halted_symbols:
-            msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}"
-            await send_telegram_async(msg)
-            event_time = datetime.now(timezone.utc)
-            log_event("resume", symbol, 0, 0, event_time, {"reason": reason})
-            halted_symbols.remove(symbol)
-    except Exception as e:
-        logger.error(f"Error in handle_resume_event: {e}")
+    symbol = event.get("sym")
+    reason = event.get("reason", "")
+    if symbol in halted_symbols:
+        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}"
+        await send_telegram_async(msg)
+        event_time = datetime.now(timezone.utc)
+        log_event("resume", symbol, 0, 0, event_time, {"reason": reason})
+        halted_symbols.remove(symbol)
 
 def highlight_keywords(title, keywords):
     words = set(kw.lower() for kw in keywords)
@@ -847,68 +800,59 @@ async def get_ticker_news_yahoo(ticker):
 
 async def ingest_polygon_events():
     url = "wss://socket.polygon.io/stocks"
-    while True:
-        try:
-            async with websockets.connect(url) as ws:
-                await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
-                print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
-                while True:
-                    try:
-                        msg = await ws.recv()
-                        # DEBUG PRINT: Show every message received from Polygon
-                        print(f"[DEBUG] Received from Polygon: {msg}")
-                        data = json.loads(msg)
-                        if isinstance(data, dict) and data.get("ev") == "status":
-                            if data.get("status") == "halt":
-                                await handle_halt_event(data)
-                            elif data.get("status") == "resume":
-                                await handle_resume_event(data)
-                        if not isinstance(data, list):
-                            continue
-                        for event in data:
-                            try:
-                                if event.get("ev") == "AM":
-                                    symbol = event["sym"]
-                                    open_ = event["o"]
-                                    high = event["h"]
-                                    low = event["l"]
-                                    close = event["c"]
-                                    volume = event["v"]
-                                    start_time = polygon_time_to_utc(event["s"])
-                                    await on_new_candle(symbol, open_, high, low, close, volume, start_time)
-                                    candle = {
-                                        "open": open_,
-                                        "high": high,
-                                        "low": low,
-                                        "close": close,
-                                        "volume": volume,
-                                        "start_time": start_time,
-                                    }
-                                    candles[symbol].append(candle)
-                                    session_date = get_session_date(candle['start_time'])
-                                    last_session = vwap_session_date[symbol]
-                                    if last_session != session_date:
-                                        vwap_candles[symbol] = []
-                                        vwap_session_date[symbol] = session_date
-                                    vwap_candles[symbol].append(candle)
-                                    vwap_cum_vol[symbol] += volume
-                                    vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
-                                elif event.get("ev") == "status" and event.get("status") == "halt":
-                                    await handle_halt_event(event)
-                                elif event.get("ev") == "status" and event.get("status") == "resume":
-                                    await handle_resume_event(event)
-                            except Exception as e:
-                                logger.error(f"Error processing Polygon event for {event.get('sym', '')}: {e}")
-                    except Exception as e:
-                        print(f"Error processing message: {e}\nRaw: {msg}")
-        except Exception as e:
-            print(f"[WS ERROR] Polygon websocket disconnected or failed: {e}")
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+        await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
+        print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
+        while True:
+            msg = await ws.recv()
             try:
-                await send_telegram_async("⚠️ Scanner lost connection to Polygon. Attempting to reconnect...")
-            except Exception as tel_e:
-                logger.error(f"Error sending Telegram reconnect message: {tel_e}")
-            await asyncio.sleep(10)
+                data = json.loads(msg)
+                if isinstance(data, dict) and data.get("ev") == "status":
+                    if data.get("status") == "halt":
+                        await handle_halt_event(data)
+                    elif data.get("status") == "resume":
+                        await handle_resume_event(data)
+                if not isinstance(data, list):
+                    continue
+                for event in data:
+                    if event.get("ev") == "AM":
+                        symbol = event["sym"]
+                        open_ = event["o"]
+                        high = event["h"]
+                        low = event["l"]
+                        close = event["c"]
+                        volume = event["v"]
+                        start_time = polygon_time_to_utc(event["s"])
+                        candle = {
+                            "open": open_,
+                            "high": high,
+                            "low": low,
+                            "close": close,
+                            "volume": volume,
+                            "start_time": start_time,
+                        }
+                        # PATCH: Ensure correct types before appending!
+                        if not isinstance(candles[symbol], deque):
+                            candles[symbol] = deque(candles[symbol], maxlen=20)
+                        if not isinstance(vwap_candles[symbol], list):
+                            vwap_candles[symbol] = list(vwap_candles[symbol])
+                        candles[symbol].append(candle)
+                        session_date = get_session_date(candle['start_time'])
+                        last_session = vwap_session_date[symbol]
+                        if last_session != session_date:
+                            vwap_candles[symbol] = []
+                            vwap_session_date[symbol] = session_date
+                        vwap_candles[symbol].append(candle)
+                        vwap_cum_vol[symbol] += volume
+                        vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+                        await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                    elif event.get("ev") == "status" and event.get("status") == "halt":
+                        await handle_halt_event(event)
+                    elif event.get("ev") == "status" and event.get("status") == "resume":
+                        await handle_resume_event(event)
+            except Exception as e:
+                print(f"Error processing message: {e}\nRaw: {msg}")
 
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
