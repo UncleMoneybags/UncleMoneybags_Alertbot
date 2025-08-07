@@ -1011,7 +1011,8 @@ async def ingest_polygon_events():
                             if event.get("ev") == "T":
                                 symbol = event["sym"]
                                 last_trade_price[symbol] = event["p"]
-                                last_trade_volume[symbol] = event["s"]
+                                # PATCH: handle missing 's' field robustly!
+                                last_trade_volume[symbol] = event.get("s", 0)
                                 last_trade_time[symbol] = datetime.now(timezone.utc)
                             if event.get("ev") == "AM":
                                 symbol = event["sym"]
