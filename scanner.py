@@ -523,6 +523,16 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
 
 # --- PERFECT SETUP LOGIC END ---
 
+# --- PREMARKET GAINERS TRACKING (no float filter, tracks ALL symbols) ---
+premarket_open_prices = {}  # symbol -> 4am price
+premarket_last_prices = {}  # symbol -> latest price up to 9:25am
+premarket_volumes = {}      # symbol -> cumulative volume since 4am
+
+def is_premarket(dt):
+    ny = pytz.timezone("America/New_York")
+    dt_ny = dt.astimezone(ny)
+    return dt_time(4, 0) <= dt_ny.time() < dt_time(9, 30)
+
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     global current_session_date
     today_ny = get_ny_date()
@@ -535,6 +545,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         dip_play_seen.clear()
         halted_symbols.clear()
         print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
+
+    # --- Track premarket prices/volumes for gainers list (NO FILTER) ---
+    if is_premarket(start_time):
+        if symbol not in premarket_open_prices:
+            premarket_open_prices[symbol] = open_
+            premarket_volumes[symbol] = 0
+        premarket_last_prices[symbol] = close
+        premarket_volumes[symbol] += volume
+
+    # Regular alerting logic follows (float filter applies only to alerts, not to gainers list)
     if not isinstance(candles[symbol], deque):
         candles[symbol] = deque(candles[symbol], maxlen=20)
     if not isinstance(vwap_candles[symbol], list):
@@ -833,49 +853,49 @@ async def catalyst_news_alert_loop():
                         save_news_id(news_id)
         await asyncio.sleep(60)
 
-async def get_premarket_gainers_yahoo():
-    url = "https://finance.yahoo.com/premarket/"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                html_text = await resp.text()
-                soup = BeautifulSoup(html_text, "html.parser")
-                table = soup.find("table")
-                gainers = []
-                if table and table.find("tbody"):
-                    for row in table.find("tbody").find_all("tr")[:10]:
-                        cols = row.find_all("td")
-                        if len(cols) >= 5:
-                            ticker = cols[0].text.strip()
-                            last_price = cols[2].text.strip()
-                            percent = cols[4].text.strip()
-                            gainers.append(f"<b>{ticker}</b>: {last_price} ({percent})")
-                return gainers if gainers else ["No premarket gainers found."]
-    except Exception as e:
-        logger.error(f"Premarket gainers fetch error: {e}")
-        return ["Error fetching gainers."]
-
+# --- PREMARKET GAINERS ALERT LOOP (NO FLOAT FILTER) ---
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
     while True:
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
+        # Alert at 9:25am ET (use 9:24:55 to ensure delivery before open)
         if now_est.weekday() in range(0, 5):
-            if now_est.time().hour == 9 and now_est.time().minute == 25 and not sent_today:
-                logger.info("Sending premarket gainers alert at 9:25am ET")
-                gainers = await get_premarket_gainers_yahoo()
-                gainers_text = "\n".join(gainers)
+            if (now_est.time().hour == 9 and 
+                now_est.time().minute == 24 and 
+                now_est.time().second >= 55 and not sent_today):
+                logger.info("Sending premarket gainers alert at 9:24:55am ET")
+                # Compute top 5 gainers from 4am open (NO FLOAT FILTER)
+                gainers = []
+                for sym in premarket_open_prices:
+                    if sym in premarket_last_prices and premarket_open_prices[sym] > 0:
+                        pct_gain = (premarket_last_prices[sym] - premarket_open_prices[sym]) / premarket_open_prices[sym] * 100
+                        last_price = premarket_last_prices[sym]
+                        total_vol = premarket_volumes.get(sym, 0)
+                        if last_price <= 20 and total_vol >= 25000:
+                            float_val = float_cache.get(sym)
+                            float_str = f", Float: {float_val/1e6:.1f}M" if float_val else ""
+                            gainers.append((sym, pct_gain, last_price, total_vol, float_str))
+                gainers.sort(key=lambda x: x[1], reverse=True)
+                top5 = gainers[:5]
+                if top5:
+                    gainers_text = "\n".join(
+                        f"<b>{sym}</b>: {last_price:.2f} ({pct_gain:+.1f}%) Vol:{int(total_vol/1000)}K{float_str}"
+                        for sym, pct_gain, last_price, total_vol, float_str in top5
+                    )
+                else:
+                    gainers_text = "No premarket gainers found."
                 msg = (
                     "Market opens in 5 mins...secure the damn bag!\n"
-                    "Heres premarket top gainers list.\n"
+                    "Here are the top 5 premarket gainers (since 4am):\n"
                     f"{gainers_text}"
                 )
                 await send_telegram_async(msg)
                 event_time = datetime.now(timezone.utc)
                 log_event("premarket_gainers", "PREMARKET", 0, 0, event_time, {"gainers": gainers_text})
                 sent_today = True
-            if now_est.time().hour != 9 or now_est.time().minute != 25:
+            if not (now_est.time().hour == 9 and now_est.time().minute == 24):
                 sent_today = False
         else:
             sent_today = False
