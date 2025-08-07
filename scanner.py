@@ -12,6 +12,7 @@ import signal
 import pickle
 import csv
 import os
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 import joblib
 import numpy as np
 import atexit
