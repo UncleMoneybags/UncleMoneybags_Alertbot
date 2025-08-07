@@ -991,6 +991,7 @@ async def ingest_polygon_events():
                 print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
                 while True:
                     msg = await ws.recv()
+                    print("[RAW MSG]", msg)  # <-- Debug print inserted here!
                     try:
                         data = json.loads(msg)
                         if isinstance(data, dict) and data.get("ev") == "status":
