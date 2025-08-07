@@ -24,6 +24,11 @@ from bs4 import BeautifulSoup
 import pandas as pd  
 import time
 
+# --- PATCH: Track the latest real trade price and size for each symbol ---
+last_trade_price = defaultdict(lambda: None)
+last_trade_volume = defaultdict(lambda: 0)
+last_trade_time = defaultdict(lambda: None)
+
 # --- Time-of-Day Volume Profile for RVOL Spike Alerts ---
 PROFILE_FILE = "volume_profile.json"
 DAYS_TO_KEEP = 20
@@ -420,6 +425,11 @@ def get_ny_date():
     now_ny = now_utc.astimezone(ny)
     return now_ny.date()
 
+# --- PATCH: Return most recent trade price (if available) for alerts ---
+def get_display_price(symbol, fallback):
+    price = last_trade_price[symbol]
+    return price if price is not None else fallback
+
 # --- PERFECT SETUP LOGIC START ---
 
 def is_bullish_engulfing(candles_seq):
@@ -445,7 +455,6 @@ def calc_macd_hist(closes):
     return macd_hist.values
 
 async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq, vwap_value):
-    # Use last 30 closes for indicators
     closes_np = np.array(closes)
     volumes_np = np.array(volumes)
     highs_np = np.array(highs)
@@ -456,29 +465,22 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
     ema8 = emas["ema8"][-1]
     ema13 = emas["ema13"][-1]
 
-    # VWAP (already passed as vwap_value)
     last_close = closes[-1]
     last_volume = volumes[-1]
 
-    # RVOL (relative to trailing 20)
     if len(volumes) >= 20:
         avg_vol20 = np.mean(volumes[-20:])
         rvol = last_volume / avg_vol20 if avg_vol20 > 0 else 0
     else:
         rvol = 0
 
-    # RSI (14)
     rsi_vals = rsi(closes, period=14)
     last_rsi = rsi_vals[-1] if not np.isnan(rsi_vals[-1]) else 0
-
-    # MACD Histogram
     macd_hist_vals = calc_macd_hist(closes)
     last_macd_hist = macd_hist_vals[-1]
 
-    # Bullish Engulfing
     bullish_engulf = is_bullish_engulfing(candles_seq)
 
-    # Perfect setup criteria
     perfect = (
         (ema5 > ema8 > ema13)
         and (ema5 >= 1.015 * ema13)
@@ -492,22 +494,20 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
     )
 
     if perfect:
-        # CLEAN, MINIMAL ALERT
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
-            f"<b>{escape_html(symbol)}</b> | ${last_close:.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
+            f"<b>{escape_html(symbol)}</b> | ${get_display_price(symbol, last_close):.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
             f"Trend: EMA5 > EMA8 > EMA13\n"
             f"{'Above VWAP' if last_close > vwap_value else 'Below VWAP'}"
             f" | MACD↑"
             f" | RSI: {int(round(last_rsi))}"
         )
         await send_telegram_async(alert_text)
-        # Log as event
         now = datetime.now(timezone.utc)
         log_event(
             "perfect_setup",
             symbol,
-            last_close,
+            get_display_price(symbol, last_close),
             last_volume,
             now,
             {
@@ -521,7 +521,6 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
                 "bullish_engulfing": bullish_engulf
             }
         )
-        # Avoid duplicate alerts (reuse EMA STACK logic flag)
         ema_stack_was_true[symbol] = True
 
 # --- PERFECT SETUP LOGIC END ---
@@ -595,13 +594,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         lows = [c['low'] for c in list(candles_seq)[-30:]]
         volumes = [c['volume'] for c in list(candles_seq)[-30:]]
         vwap_value = vwap_candles_numpy(list(vwap_candles[symbol]))
-        # Only alert if not previously alerted this session
         if not ema_stack_was_true[symbol]:
             await alert_perfect_setup(symbol, closes, volumes, highs, lows, list(candles_seq)[-30:], vwap_value)
 
-    # --- RVOL spike alert removed ---
-
-    # Warming Up Logic
+    # --- Warming Up Logic with PATCH for accurate price and liquidity ---
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -621,13 +617,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dollar_volume_wu >= 100_000
         )
         if warming_up_criteria and not warming_up_was_true[symbol]:
+            # PATCH: Only alert if recent trade is liquid enough
+            if last_trade_volume[symbol] < 100:
+                logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+                return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("warming_up", symbol, close_wu, volume_wu, event_time, {
+            log_event("warming_up", symbol, get_display_price(symbol, close_wu), volume_wu, event_time, {
                 "price_move": price_move_wu,
                 "dollar_volume": dollar_volume_wu
             })
-            price_str = f"{close_wu:.2f}"
+            price_str = f"{get_display_price(symbol, close_wu):.2f}"
             alert_text = (
                 f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
                 f"Current Price: ${price_str}"
@@ -637,7 +637,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
 
-    # Runner Logic
+    # --- Runner Logic with PATCH for accurate price and liquidity ---
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -655,12 +655,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             close_rn > vwap_rn
         )
         if runner_criteria and not runner_was_true[symbol]:
+            # PATCH: Only alert if recent trade is liquid enough
+            if last_trade_volume[symbol] < 100:
+                logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+                return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("runner", symbol, close_rn, volume_rn, event_time, {
+            log_event("runner", symbol, get_display_price(symbol, close_rn), volume_rn, event_time, {
                 "price_move": price_move_rn
             })
-            price_str = f"{close_rn:.2f}"
+            price_str = f"{get_display_price(symbol, close_rn):.2f}"
             alert_text = (
                 f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
                 f"Current Price: ${price_str}"
@@ -670,7 +674,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
 
-    # DIP PLAY LOGIC
+    # DIP PLAY LOGIC (unchanged, but you can PATCH similarly if needed)
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
     if len(candles_seq) >= DIP_LOOKBACK:
@@ -691,10 +695,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if dip_play_criteria and not dip_play_was_true[symbol]:
                 if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                     return
-                log_event("dip_play", symbol, close, volume, event_time, {
+                log_event("dip_play", symbol, get_display_price(symbol, close), volume, event_time, {
                     "dip_pct": dip_pct
                 })
-                price_str = f"{close:.2f}"
+                price_str = f"{get_display_price(symbol, close):.2f}"
                 alert_text = (
                     f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
                     f"Current Price: ${price_str}"
@@ -716,11 +720,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         if rug_pull_criteria and not rug_pull_was_true[symbol]:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("rug_pull", symbol, c2['close'], c2['volume'], event_time, {
+            log_event("rug_pull", symbol, get_display_price(symbol, c2['close']), c2['volume'], event_time, {
                 "drop_pct": drop_pct,
                 "bounce_pct": bounce_pct
             })
-            price_str = f"{c2['close']:.2f}"
+            price_str = f"{get_display_price(symbol, c2['close']):.2f}"
             alert_text = (
                 f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull\n"
                 f"Current Price: ${price_str}"
@@ -749,10 +753,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("vwap_reclaim", symbol, curr_candle['close'], curr_candle['volume'], event_time, {
+            log_event("vwap_reclaim", symbol, get_display_price(symbol, curr_candle['close']), curr_candle['volume'], event_time, {
                 "rvol": rvol
             })
-            price_str = f"{curr_candle['close']:.2f}"
+            price_str = f"{get_display_price(symbol, curr_candle['close']):.2f}"
             vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
             vol_str = f"{curr_candle['volume']:,}"
             rvol_str = f"{rvol:.2f}"
@@ -767,19 +771,22 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
 
-    # Volume Spike Logic
+    # Volume Spike Logic PATCH
     vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
     if check_volume_spike(candles_seq, vwap_value) and not volume_spike_was_true[symbol]:
+        if last_trade_volume[symbol] < 100:
+            logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+            return
         if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
             return
-        price_str = f"{close:.2f}"
+        price_str = f"{get_display_price(symbol, close):.2f}"
         alert_text = (
             f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
             f"Current Price: ${price_str}"
         )
         await send_telegram_async(alert_text)
         event_time = now
-        log_event("volume_spike", symbol, close, volume, event_time, {
+        log_event("volume_spike", symbol, get_display_price(symbol, close), volume, event_time, {
             "rvol": volume / (sum([c['volume'] for c in list(candles_seq)[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
             "vwap": vwap_value
         })
@@ -787,7 +794,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         alerted_symbols[symbol] = today
         last_alert_time[symbol] = now
 
-    # EMA STACK LOGIC
+    # EMA STACK LOGIC PATCH
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -808,15 +815,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
         logger.info(f"[EMA STACK DEBUG] {symbol}: ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}, vwap={vwap_value:.2f}, close={closes[-1]:.2f}, volume={list(candles_seq)[-1]['volume']}, criteria={ema_stack_criteria}")
         if ema_stack_criteria and not ema_stack_was_true[symbol]:
+            if last_trade_volume[symbol] < 100:
+                logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+                return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("ema_stack", symbol, closes[-1], list(candles_seq)[-1]['volume'], event_time, {
+            log_event("ema_stack", symbol, get_display_price(symbol, closes[-1]), list(candles_seq)[-1]['volume'], event_time, {
                 "ema5": ema5,
                 "ema8": ema8,
                 "ema13": ema13,
                 "vwap": vwap_value
             })
-            price_str = f"{closes[-1]:.2f}"
+            price_str = f"{get_display_price(symbol, closes[-1]):.2f}"
             alert_text = (
                 f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack\n"
                 f"Current Price: ${price_str}\n"
@@ -863,13 +873,11 @@ async def premarket_gainers_alert_loop():
     while True:
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
-        # Alert at 9:25am ET (use 9:24:55 to ensure delivery before open)
         if now_est.weekday() in range(0, 5):
             if (now_est.time().hour == 9 and 
                 now_est.time().minute == 24 and 
                 now_est.time().second >= 55 and not sent_today):
                 logger.info("Sending premarket gainers alert at 9:24:55am ET")
-                # Compute top 5 gainers from 4am open (NO FLOAT FILTER)
                 gainers = []
                 for sym in premarket_open_prices:
                     if sym in premarket_last_prices and premarket_open_prices[sym] > 0:
@@ -981,27 +989,30 @@ async def get_ticker_news_yahoo(ticker):
         logger.error(f"[NEWS SCRAPER ERROR] {ticker}: {e}")
         return []
 
+# --- PATCH: Ingest Polygon T.* trade events for real-time last price/volume ---
 async def ingest_polygon_events():
     url = "wss://socket.polygon.io/stocks"
     while True:
         try:
             async with websockets.connect(url) as ws:
                 await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,status"}))
-                print("Subscribed to: AM.* (all tickers) and status (halts/resumes)")
+                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,T.*,status"}))
+                print("Subscribed to: AM.*, T.* (trades), and status (halts/resumes)")
                 while True:
                     msg = await ws.recv()
-                    print("[RAW MSG]", msg)  # <-- Debug print inserted here!
+                    print("[RAW MSG]", msg)
                     try:
                         data = json.loads(msg)
-                        if isinstance(data, dict) and data.get("ev") == "status":
-                            if data.get("status") == "halt":
-                                await handle_halt_event(data)
-                            elif data.get("status") == "resume":
-                                await handle_resume_event(data)
-                        if not isinstance(data, list):
-                            continue
+                        # PATCH: handle list and dict style events
+                        if isinstance(data, dict):
+                            data = [data]
                         for event in data:
+                            # PATCH: Handle trade event for last trade price/size
+                            if event.get("ev") == "T":
+                                symbol = event["sym"]
+                                last_trade_price[symbol] = event["p"]
+                                last_trade_volume[symbol] = event["s"]
+                                last_trade_time[symbol] = datetime.now(timezone.utc)
                             if event.get("ev") == "AM":
                                 symbol = event["sym"]
                                 open_ = event["o"]
