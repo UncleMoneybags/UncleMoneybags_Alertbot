@@ -82,14 +82,9 @@ vol_profile = VolumeProfile()
 EMA_PERIODS = [5, 8, 13]
 
 def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None):
-    """
-    Returns a dict with EMA values for specified periods, calculated on the last `window` prices.
-    Also logs debug info for EMA input and output arrays.
-    """
     prices = list(prices)[-window:]  # Use only last `window` candles
     s = pd.Series(prices)
     emas = {}
-    # EMA debug logs
     logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | Input closes: {prices}")
     for p in periods:
         emas[f"ema{p}"] = s.ewm(span=p, adjust=False).mean().to_numpy()
@@ -439,15 +434,12 @@ def get_ny_date():
     now_ny = now_utc.astimezone(ny)
     return now_ny.date()
 
-# --- PATCH: Return most recent trade price (if available) for alerts ---
 def get_display_price(symbol, fallback):
     price = last_trade_price[symbol]
     logger.info(
         f"[PRICE DEBUG] {symbol} | Using trade price={price} | Fallback price={fallback}"
     )
     return price if price is not None else fallback
-
-# --- PERFECT SETUP LOGIC START ---
 
 def is_bullish_engulfing(candles_seq):
     if len(candles_seq) < 2:
@@ -462,7 +454,6 @@ def is_bullish_engulfing(candles_seq):
     )
 
 def calc_macd_hist(closes):
-    # MACD(12,26,9)
     s = pd.Series(closes)
     ema12 = s.ewm(span=12, adjust=False).mean()
     ema26 = s.ewm(span=26, adjust=False).mean()
@@ -515,7 +506,13 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
         and bullish_engulf
     )
 
+    # ---- PATCH: enforce ratio at alert time! ----
     if perfect:
+        if ema5 / ema13 < 1.015:
+            logger.error(
+                f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
+            )
+            return
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
             f"<b>{escape_html(symbol)}</b> | ${get_display_price(symbol, last_close):.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
@@ -864,7 +861,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         alerted_symbols[symbol] = today
         last_alert_time[symbol] = now
 
-    # EMA STACK LOGIC PATCH
+    # --- EMA STACK LOGIC PATCH (WITH RATIO ENFORCEMENT) ---
     if (
         float_shares is not None and
         float_shares <= 10_000_000 and
@@ -883,11 +880,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema5 > vwap_value and
             list(candles_seq)[-1]['volume'] >= 175000
         )
-        logger.info(f"[EMA STACK DEBUG] {symbol}: ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}, vwap={vwap_value:.2f}, close={closes[-1]:.2f}, volume={list(candles_seq)[-1]['volume']}, criteria={ema_stack_criteria}")
+        logger.info(f"[EMA STACK DEBUG] {symbol}: ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}, vwap={vwap_value:.2f}, close={closes[-1]:.2f}, volume={list(candles_seq)[-1]['volume']}, ratio={ema5/ema13:.4f}, criteria={ema_stack_criteria}")
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: ema_stack | VWAP={vwap_value:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={closes[-1]} | Candle Volume={list(candles_seq)[-1]['volume']}"
         )
         if ema_stack_criteria and not ema_stack_was_true[symbol]:
+            # PATCH: enforce ratio at alert time!
+            if ema5 / ema13 < 1.015:
+                logger.error(
+                    f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
+                )
+                return
             if last_trade_volume[symbol] < 100:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                 return
