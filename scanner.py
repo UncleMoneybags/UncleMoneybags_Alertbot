@@ -81,15 +81,20 @@ vol_profile = VolumeProfile()
 
 EMA_PERIODS = [5, 8, 13]
 
-def calculate_emas(prices, periods=[5, 8, 13], window=30):
+def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None):
     """
     Returns a dict with EMA values for specified periods, calculated on the last `window` prices.
+    Also logs debug info for EMA input and output arrays.
     """
     prices = list(prices)[-window:]  # Use only last `window` candles
     s = pd.Series(prices)
     emas = {}
+    # EMA debug logs
+    logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | Input closes: {prices}")
     for p in periods:
         emas[f"ema{p}"] = s.ewm(span=p, adjust=False).mean().to_numpy()
+        logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} array: {emas[f'ema{p}']}")
+        logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} latest: {emas[f'ema{p}'][-1]}")
     return emas
 
 def vwap_numpy(prices, volumes):
@@ -472,7 +477,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
     highs_np = np.array(highs)
     lows_np = np.array(lows)
 
-    emas = calculate_emas(closes, periods=[5, 8, 13], window=30)
+    emas = calculate_emas(closes, periods=[5, 8, 13], window=30, symbol=symbol)
     ema5 = emas["ema5"][-1]
     ema8 = emas["ema8"][-1]
     ema13 = emas["ema13"][-1]
@@ -654,6 +659,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: warming_up | VWAP={vwap_wu:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close_wu} | Candle Volume={volume_wu}"
         )
+        emas = calculate_emas([c['close'] for c in last_6], periods=[5, 8, 13], window=6, symbol=symbol)
+        logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
         if warming_up_criteria and not warming_up_was_true[symbol]:
             # PATCH: Only alert if recent trade is liquid enough
             if last_trade_volume[symbol] < 100:
@@ -695,6 +702,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close_rn} | Candle Volume={volume_rn}"
         )
+        emas = calculate_emas([c['close'] for c in last_6], periods=[5, 8, 13], window=6, symbol=symbol)
+        logger.info(f"[EMA DEBUG] {symbol} | Runner | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
         if runner_criteria and not runner_was_true[symbol]:
             # PATCH: Only alert if recent trade is liquid enough
             if last_trade_volume[symbol] < 100:
@@ -736,6 +745,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             logger.info(
                 f"[ALERT DEBUG] {symbol} | Alert Type: dip_play | VWAP={vwap_candles_numpy(vwap_candles[symbol]):.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close} | Candle Volume={volume}"
             )
+            emas = calculate_emas([c['close'] for c in list(candles_seq)[-3:]], periods=[5, 8, 13], window=3, symbol=symbol)
+            logger.info(f"[EMA DEBUG] {symbol} | Dip Play | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
             if dip_play_criteria and not dip_play_was_true[symbol]:
                 if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                     return
@@ -764,6 +775,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: rug_pull | VWAP={vwap_candles_numpy(vwap_candles[symbol]):.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={c2['close']} | Candle Volume={c2['volume']}"
         )
+        emas = calculate_emas([c['close'] for c in list(candles_seq)[-3:]], periods=[5, 8, 13], window=3, symbol=symbol)
+        logger.info(f"[EMA DEBUG] {symbol} | Rug Pull | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
         if rug_pull_criteria and not rug_pull_was_true[symbol]:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
@@ -800,6 +813,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: vwap_reclaim | VWAP={curr_vwap:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={curr_candle['close']} | Candle Volume={curr_candle['volume']}"
         )
+        emas = calculate_emas([c['close'] for c in list(candles_seq)[-2:]], periods=[5, 8, 13], window=2, symbol=symbol)
+        logger.info(f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
         if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
@@ -826,6 +841,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     logger.info(
         f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close} | Candle Volume={volume}"
     )
+    emas = calculate_emas([c['close'] for c in candles_seq], periods=[5, 8, 13], window=len(candles_seq), symbol=symbol)
+    logger.info(f"[EMA DEBUG] {symbol} | Volume Spike | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
     if check_volume_spike(candles_seq, vwap_value) and not volume_spike_was_true[symbol]:
         if last_trade_volume[symbol] < 100:
             logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
@@ -854,7 +871,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         len(candles_seq) >= max(EMA_PERIODS)
     ):
         closes = [c['close'] for c in list(candles_seq)[-30:]]  # last 30 closes for reliable EMAs
-        emas = calculate_emas(closes, periods=[5, 8, 13], window=30)
+        emas = calculate_emas(closes, periods=[5, 8, 13], window=30, symbol=symbol)
         ema5 = emas['ema5'][-1]
         ema8 = emas['ema8'][-1]
         ema13 = emas['ema13'][-1]
