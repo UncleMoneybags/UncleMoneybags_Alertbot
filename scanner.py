@@ -330,6 +330,19 @@ def is_news_alert_time():
     end = dt_time(20, 0)
     return start <= now_ny.time() <= end
 
+def get_session_type(dt):
+    ny = pytz.timezone("America/New_York")
+    dt_ny = dt.astimezone(ny)
+    t = dt_ny.time()
+    if dt_time(4, 0) <= t < dt_time(9, 30):
+        return "premarket"
+    elif dt_time(9, 30) <= t < dt_time(16, 0):
+        return "regular"
+    elif dt_time(16, 0) <= t < dt_time(20, 0):
+        return "afterhours"
+    else:
+        return "closed"
+
 async def send_telegram_async(message):
     logger.debug(f"[DEBUG] send_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -679,7 +692,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
 
-    # --- Runner Logic with PATCH for accurate price and liquidity ---
+    # --- Runner Logic with trend check, upper wick filter, real-time price in alert, and debug logging ---
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -687,20 +700,41 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         last_candle = last_6[-1]
         open_rn = last_candle['open']
         close_rn = last_candle['close']
+        high_rn = last_candle['high']
         volume_rn = last_candle['volume']
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
         vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-        runner_criteria = (
-            volume_rn >= 2 * avg_vol_5 and
-            price_move_rn >= 0.06 and
-            close_rn >= 0.10 and
-            close_rn > vwap_rn
+
+        # Trend check: last 3 closes must be rising
+        closes_for_trend = [c['close'] for c in last_6[-3:]]
+        price_rising_trend = all(x < y for x, y in zip(closes_for_trend, closes_for_trend[1:]))
+
+        # Price not dropping: last 2 closes must be higher than previous
+        price_not_dropping = closes_for_trend[-2] < closes_for_trend[-1]
+
+        # Upper wick filter: close must be at least 95% of high
+        wick_ok = close_rn >= 0.95 * high_rn
+
+        # Debug logging
+        logger.info(
+            f"[RUNNER DEBUG] {symbol} | Closes trend: {closes_for_trend} | price_rising_trend={price_rising_trend} | price_not_dropping={price_not_dropping} | wick_ok={wick_ok}"
         )
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close_rn} | Candle Volume={volume_rn}"
         )
         emas = calculate_emas([c['close'] for c in last_6], periods=[5, 8, 13], window=6, symbol=symbol)
         logger.info(f"[EMA DEBUG] {symbol} | Runner | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
+
+        runner_criteria = (
+            volume_rn >= 2 * avg_vol_5 and
+            price_move_rn >= 0.06 and
+            close_rn >= 0.10 and
+            close_rn > vwap_rn and
+            price_rising_trend and
+            price_not_dropping and
+            wick_ok
+        )
+
         if runner_criteria and not runner_was_true[symbol]:
             # PATCH: Only alert if recent trade is liquid enough
             if last_trade_volume[symbol] < 100:
@@ -708,14 +742,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("runner", symbol, get_display_price(symbol, close_rn), volume_rn, event_time, {
-                "price_move": price_move_rn
+            log_event("runner", symbol, last_trade_price[symbol] if last_trade_price[symbol] is not None else close_rn, volume_rn, event_time, {
+                "price_move": price_move_rn,
+                "trend_closes": closes_for_trend,
+                "wick_ok": wick_ok,
+                "vwap": vwap_rn,
+                "last_trade_price": last_trade_price[symbol]
             })
-            price_str = f"{get_display_price(symbol, close_rn):.2f}"
-            alert_text = (
-                f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
-                f"Current Price: ${price_str}"
-            )
+            price_str = f"{last_trade_price[symbol]:.2f}" if last_trade_price[symbol] is not None else f"{close_rn:.2f}"
+alert_text = (
+    f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
+    f"Current Price: ${price_str}"
+)
             await send_telegram_async(alert_text)
             runner_was_true[symbol] = True
             runner_alerted_today[symbol] = today
@@ -861,57 +899,76 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         alerted_symbols[symbol] = today
         last_alert_time[symbol] = now
 
-    # --- EMA STACK LOGIC PATCH (WITH RATIO ENFORCEMENT) ---
+    # --- EMA STACK LOGIC PATCH (SESSION-AWARE THRESHOLDS) ---
     if (
         float_shares is not None and
-        float_shares <= 10_000_000 and
-        len(candles_seq) >= max(EMA_PERIODS)
+        float_shares <= 10_000_000
     ):
+        session_type = get_session_type(list(candles_seq)[-1]['start_time'])
         closes = [c['close'] for c in list(candles_seq)[-30:]]  # last 30 closes for reliable EMAs
-        emas = calculate_emas(closes, periods=[5, 8, 13], window=30, symbol=symbol)
-        ema5 = emas['ema5'][-1]
-        ema8 = emas['ema8'][-1]
-        ema13 = emas['ema13'][-1]
-        vwap_value = vwap_candles_numpy(vwap_candles[symbol])
-        ema_stack_criteria = (
-            ema5 > ema8 > ema13 and
-            ema5 >= 1.015 * ema13 and
-            closes[-1] > vwap_value and
-            ema5 > vwap_value and
-            list(candles_seq)[-1]['volume'] >= 175000
-        )
-        logger.info(f"[EMA STACK DEBUG] {symbol}: ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}, vwap={vwap_value:.2f}, close={closes[-1]:.2f}, volume={list(candles_seq)[-1]['volume']}, ratio={ema5/ema13:.4f}, criteria={ema_stack_criteria}")
-        logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: ema_stack | VWAP={vwap_value:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={closes[-1]} | Candle Volume={list(candles_seq)[-1]['volume']}"
-        )
-        if ema_stack_criteria and not ema_stack_was_true[symbol]:
-            # PATCH: enforce ratio at alert time!
-            if ema5 / ema13 < 1.015:
-                logger.error(
-                    f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
-                )
-                return
-            if last_trade_volume[symbol] < 100:
-                logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
-                return
-            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                return
-            log_event("ema_stack", symbol, get_display_price(symbol, closes[-1]), list(candles_seq)[-1]['volume'], event_time, {
-                "ema5": ema5,
-                "ema8": ema8,
-                "ema13": ema13,
-                "vwap": vwap_value
-            })
-            price_str = f"{get_display_price(symbol, closes[-1]):.2f}"
-            alert_text = (
-                f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack\n"
-                f"Current Price: ${price_str}\n"
-                f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
+        # Minimum candle count for reliability
+        if len(closes) < 30:
+            logger.info(f"[EMA STACK] {symbol}: Skipping EMA stack alert - not enough candles ({len(closes)}) for {session_type} session.")
+        else:
+            emas = calculate_emas(closes, periods=[5, 8, 13], window=30, symbol=symbol)
+            ema5 = emas['ema5'][-1]
+            ema8 = emas['ema8'][-1]
+            ema13 = emas['ema13'][-1]
+            vwap_value = vwap_candles_numpy(vwap_candles[symbol])
+            last_candle = list(candles_seq)[-1]
+            last_volume = last_candle['volume']
+            price = closes[-1]
+
+            # Session-aware thresholds
+            if session_type in ["premarket", "afterhours"]:
+                min_volume = 250_000
+                min_dollar_volume = 100_000
+            else:
+                min_volume = 175_000
+                min_dollar_volume = 100_000
+
+            dollar_volume = price * last_volume
+
+            ema_stack_criteria = (
+                ema5 > ema8 > ema13 and
+                ema5 >= 1.015 * ema13 and
+                price > vwap_value and
+                ema5 > vwap_value and
+                last_volume >= min_volume and
+                dollar_volume >= min_dollar_volume
             )
-            await send_telegram_async(alert_text)
-            ema_stack_was_true[symbol] = True
-            alerted_symbols[symbol] = today
-            last_alert_time[symbol] = now
+            logger.info(f"[EMA STACK DEBUG] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}, vwap={vwap_value:.2f}, close={price:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}, criteria={ema_stack_criteria}")
+
+            if ema_stack_criteria and not ema_stack_was_true[symbol]:
+                # PATCH: enforce ratio at alert time!
+                if ema5 / ema13 < 1.015:
+                    logger.error(
+                        f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
+                    )
+                    return
+                if last_trade_volume[symbol] < 100:
+                    logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+                    return
+                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                    return
+                log_event("ema_stack", symbol, get_display_price(symbol, price), last_volume, event_time, {
+                    "ema5": ema5,
+                    "ema8": ema8,
+                    "ema13": ema13,
+                    "vwap": vwap_value,
+                    "session": session_type
+                })
+                price_str = f"{get_display_price(symbol, price):.2f}"
+                alert_text = (
+                    f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack [{session_type}]\n"
+                    f"Current Price: ${price_str}\n"
+                    f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}\n"
+                    f"Volume: {last_volume:,} | Dollar Vol: ${dollar_volume:,.0f}"
+                )
+                await send_telegram_async(alert_text)
+                ema_stack_was_true[symbol] = True
+                alerted_symbols[symbol] = today
+                last_alert_time[symbol] = now
 
 # --- At end of each day, call this to update the time-of-day profile ---
 def update_profile_for_day(symbol, day_candles):
