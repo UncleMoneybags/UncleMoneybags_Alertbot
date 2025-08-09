@@ -418,6 +418,7 @@ def get_session_date(dt):
         return dt_ny.date() - timedelta(days=1)
     return dt_ny.date()
 
+# --- PATCH: Volume Spike logic with session-aware threshold and wick filter ---
 def check_volume_spike(candles_seq, vwap_value):
     if len(candles_seq) < 4:
         return False
@@ -427,14 +428,26 @@ def check_volume_spike(candles_seq, vwap_value):
     trailing_avg = sum(trailing_volumes) / 3 if len(trailing_volumes) == 3 else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
     above_vwap = curr_candle['close'] > vwap_value
+
+    # --- PATCH: Session-aware volume threshold ---
+    session_type = get_session_type(curr_candle['start_time'])
+    if session_type in ["premarket", "afterhours"]:
+        min_volume = 200_000
+    else:
+        min_volume = 125_000
+
+    # --- PATCH: Wick filter 0.75 ---
+    wick_ok = curr_candle['close'] >= 0.75 * curr_candle['high']
+
     logger.info(
         f"[DEBUG] {curr_candle.get('symbol', '?')} | Volume Spike Check | "
-        f"Curr Volume={curr_volume}, Trailing Avg={trailing_avg}, RVOL={rvol:.2f}, Above VWAP={above_vwap}, VWAP={vwap_value:.2f}, Candle Close={curr_candle['close']}"
+        f"Curr Volume={curr_volume}, Trailing Avg={trailing_avg}, RVOL={rvol:.2f}, Above VWAP={above_vwap}, VWAP={vwap_value:.2f}, Candle Close={curr_candle['close']}, Wick OK={wick_ok}"
     )
     if (
-        curr_volume >= 125000 and
+        curr_volume >= min_volume and
         rvol >= 2.0 and
-        above_vwap
+        above_vwap and
+        wick_ok
     ):
         return True
     return False
@@ -525,6 +538,9 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
             logger.error(
                 f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
             )
+            return
+        if last_trade_volume[symbol] < 250:
+            logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
             return
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
@@ -673,7 +689,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
         if warming_up_criteria and not warming_up_was_true[symbol]:
             # PATCH: Only alert if recent trade is liquid enough
-            if last_trade_volume[symbol] < 100:
+            if last_trade_volume[symbol] < 250:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                 return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
@@ -712,8 +728,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # Price not dropping: last 2 closes must be higher than previous
         price_not_dropping = closes_for_trend[-2] < closes_for_trend[-1]
 
-        # Upper wick filter: close must be at least 95% of high
-        wick_ok = close_rn >= 0.95 * high_rn
+        # Upper wick filter: close must be at least 75% of high (PATCHED FROM 95%)
+        wick_ok = close_rn >= 0.75 * high_rn
 
         # Debug logging
         logger.info(
@@ -737,7 +753,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
         if runner_criteria and not runner_was_true[symbol]:
             # PATCH: Only alert if recent trade is liquid enough
-            if last_trade_volume[symbol] < 100:
+            if last_trade_volume[symbol] < 250:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                 return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
@@ -786,6 +802,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if dip_play_criteria and not dip_play_was_true[symbol]:
                 if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                     return
+                if last_trade_volume[symbol] < 250:
+                    logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+                    return
                 log_event("dip_play", symbol, get_display_price(symbol, close), volume, event_time, {
                     "dip_pct": dip_pct
                 })
@@ -815,6 +834,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(f"[EMA DEBUG] {symbol} | Rug Pull | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
         if rug_pull_criteria and not rug_pull_was_true[symbol]:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            if last_trade_volume[symbol] < 250:
+                logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                 return
             log_event("rug_pull", symbol, get_display_price(symbol, c2['close']), c2['volume'], event_time, {
                 "drop_pct": drop_pct,
@@ -854,6 +876,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
+            if last_trade_volume[symbol] < 250:
+                logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+                return
             log_event("vwap_reclaim", symbol, get_display_price(symbol, curr_candle['close']), curr_candle['volume'], event_time, {
                 "rvol": rvol
             })
@@ -880,7 +905,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     emas = calculate_emas([c['close'] for c in candles_seq], periods=[5, 8, 13], window=len(candles_seq), symbol=symbol)
     logger.info(f"[EMA DEBUG] {symbol} | Volume Spike | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
     if check_volume_spike(candles_seq, vwap_value) and not volume_spike_was_true[symbol]:
-        if last_trade_volume[symbol] < 100:
+        if last_trade_volume[symbol] < 250:
             logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
             return
         if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
@@ -947,7 +972,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
                     )
                     return
-                if last_trade_volume[symbol] < 100:
+                if last_trade_volume[symbol] < 250:
                     logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                     return
                 if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
