@@ -750,10 +750,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 "last_trade_price": last_trade_price[symbol]
             })
             price_str = f"{last_trade_price[symbol]:.2f}" if last_trade_price[symbol] is not None else f"{close_rn:.2f}"
-alert_text = (
-    f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
-    f"Current Price: ${price_str}"
-)
+            alert_text = (
+                f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
+                f"Current Price: ${price_str}\n"
+                f"Last 3 closes: {', '.join(f'{x:.2f}' for x in closes_for_trend)}"
+            )
             await send_telegram_async(alert_text)
             runner_was_true[symbol] = True
             runner_alerted_today[symbol] = today
