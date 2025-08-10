@@ -29,6 +29,69 @@ last_trade_price = defaultdict(lambda: None)
 last_trade_volume = defaultdict(lambda: 0)
 last_trade_time = defaultdict(lambda: None)
 
+# --- PATCH: FLOAT CACHE patch with negative result retry cooldown and proper persistence ---
+float_cache = {}
+float_cache_none_retry = {}
+FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
+
+def save_float_cache():
+    with open("float_cache.pkl", "wb") as f:
+        pickle.dump(float_cache, f)
+    with open("float_cache_none.pkl", "wb") as f:
+        pickle.dump(float_cache_none_retry, f)
+    print(f"[DEBUG] Saved float cache, entries: {len(float_cache)}, none cache: {len(float_cache_none_retry)}")
+
+def load_float_cache():
+    global float_cache, float_cache_none_retry
+    if os.path.exists("float_cache.pkl"):
+        with open("float_cache.pkl", "rb") as f:
+            float_cache = pickle.load(f)
+        print(f"[DEBUG] Loaded float cache, entries: {len(float_cache)}")
+    else:
+        float_cache = {}
+        print(f"[DEBUG] No float cache found, starting new.")
+    if os.path.exists("float_cache_none.pkl"):
+        with open("float_cache_none.pkl", "rb") as f:
+            float_cache_none_retry = pickle.load(f)
+        print(f"[DEBUG] Loaded float_cache_none_retry, entries: {len(float_cache_none_retry)}")
+    else:
+        float_cache_none_retry = {}
+        print(f"[DEBUG] No float_cache_none_retry found, starting new.")
+
+def get_float_shares(ticker):
+    now = datetime.now(timezone.utc)
+    # Check positive/real float first
+    if ticker in float_cache and float_cache[ticker] is not None:
+        return float_cache[ticker]
+    # Check negative/None cache, only retry every N minutes
+    if ticker in float_cache_none_retry:
+        last_none = float_cache_none_retry[ticker]
+        if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
+            return None
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        float_shares = info.get('floatShares', None)
+        if float_shares is not None:
+            float_cache[ticker] = float_shares
+            save_float_cache()
+            if ticker in float_cache_none_retry:
+                del float_cache_none_retry[ticker]
+        else:
+            float_cache_none_retry[ticker] = now
+            save_float_cache()
+        time.sleep(0.5)
+        return float_shares
+    except Exception as e:
+        float_cache_none_retry[ticker] = now
+        save_float_cache()
+        if "Rate limited" in str(e):
+            time.sleep(10)
+        return float_cache.get(ticker, None)
+
+load_float_cache()
+# --- END FLOAT PATCH ---
+
 # --- Time-of-Day Volume Profile for RVOL Spike Alerts ---
 PROFILE_FILE = "volume_profile.json"
 DAYS_TO_KEEP = 20
@@ -147,68 +210,6 @@ def bollinger_bands(prices, period=20, num_std=2):
 
 def polygon_time_to_utc(ts):
     return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
-
-# --- FLOAT CACHE patch: cache negative results with retry cooldown ---
-float_cache = {}
-float_cache_none_retry = {}
-FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
-
-def save_float_cache():
-    with open("float_cache.pkl", "wb") as f:
-        pickle.dump(float_cache, f)
-    with open("float_cache_none.pkl", "wb") as f:
-        pickle.dump(float_cache_none_retry, f)
-    print(f"[DEBUG] Saved float cache, entries: {len(float_cache)}, none cache: {len(float_cache_none_retry)}")
-
-def load_float_cache():
-    global float_cache, float_cache_none_retry
-    if os.path.exists("float_cache.pkl"):
-        with open("float_cache.pkl", "rb") as f:
-            float_cache = pickle.load(f)
-        print(f"[DEBUG] Loaded float cache, entries: {len(float_cache)}")
-    else:
-        float_cache = {}
-        print(f"[DEBUG] No float cache found, starting new.")
-    if os.path.exists("float_cache_none.pkl"):
-        with open("float_cache_none.pkl", "rb") as f:
-            float_cache_none_retry = pickle.load(f)
-        print(f"[DEBUG] Loaded float_cache_none_retry, entries: {len(float_cache_none_retry)}")
-    else:
-        float_cache_none_retry = {}
-        print(f"[DEBUG] No float_cache_none_retry found, starting new.")
-
-def get_float_shares(ticker):
-    now = datetime.now(timezone.utc)
-    # Check positive/real float first
-    if ticker in float_cache and float_cache[ticker] is not None:
-        return float_cache[ticker]
-    # Check negative/None cache, only retry every N minutes
-    if ticker in float_cache_none_retry:
-        last_none = float_cache_none_retry[ticker]
-        if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
-            return None
-    try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).info
-        float_shares = info.get('floatShares', None)
-        if float_shares is not None:
-            float_cache[ticker] = float_shares
-            save_float_cache()
-            if ticker in float_cache_none_retry:
-                del float_cache_none_retry[ticker]
-        else:
-            float_cache_none_retry[ticker] = now
-            save_float_cache()
-        time.sleep(0.5)
-        return float_shares
-    except Exception as e:
-        float_cache_none_retry[ticker] = now
-        save_float_cache()
-        if "Rate limited" in str(e):
-            time.sleep(10)
-        return float_cache.get(ticker, None)
-
-load_float_cache()
 
 NEWS_SEEN_FILE = "news_seen.txt"
 
