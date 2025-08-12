@@ -145,7 +145,7 @@ vol_profile = VolumeProfile()
 EMA_PERIODS = [5, 8, 13]
 
 def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None):
-    prices = list(prices)[-window:]  # Use only last `window` candles
+    prices = list(prices)[-window:]
     s = pd.Series(prices)
     emas = {}
     logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | Input closes: {prices}")
@@ -366,7 +366,9 @@ async def send_telegram_async(message):
 def escape_html(s):
     return html.escape(s or "")
 
-candles = defaultdict(lambda: deque(maxlen=20))
+CANDLE_MAXLEN = 30
+
+candles = defaultdict(lambda: deque(maxlen=CANDLE_MAXLEN))
 trade_candle_builders = defaultdict(list)
 trade_candle_last_time = {}
 last_alerted_price = {}
@@ -405,7 +407,7 @@ ema_stack_was_true = defaultdict(bool)
 def get_scanned_tickers():
     return set(candles.keys())
 
-vwap_candles = defaultdict(list)
+vwap_candles = defaultdict(lambda: deque(maxlen=CANDLE_MAXLEN))
 vwap_session_date = defaultdict(lambda: None)
 
 def get_session_date(dt):
@@ -426,14 +428,12 @@ def check_volume_spike(candles_seq, vwap_value):
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
     above_vwap = curr_candle['close'] > vwap_value
 
-    # --- PATCH: Session-aware volume threshold ---
     session_type = get_session_type(curr_candle['start_time'])
     if session_type in ["premarket", "afterhours"]:
         min_volume = 200_000
     else:
         min_volume = 125_000
 
-    # --- PATCH: Wick filter 0.75 ---
     wick_ok = curr_candle['close'] >= 0.75 * curr_candle['high']
 
     logger.info(
