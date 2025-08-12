@@ -144,8 +144,11 @@ vol_profile = VolumeProfile()
 
 EMA_PERIODS = [5, 8, 13]
 
-def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None):
+# PATCH: Use latest trade price for the most recent close in EMAs
+def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None, latest_trade_price=None):
     prices = list(prices)[-window:]
+    if latest_trade_price is not None and len(prices) > 0:
+        prices[-1] = latest_trade_price
     s = pd.Series(prices)
     emas = {}
     logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | Input closes: {prices}")
@@ -154,6 +157,8 @@ def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None):
         logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} array: {emas[f'ema{p}']}")
         logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} latest: {emas[f'ema{p}'][-1]}")
     return emas
+
+# ... rest of your file unchanged ...
 
 def vwap_numpy(prices, volumes):
     prices = np.asarray(prices, dtype=float)
@@ -448,7 +453,7 @@ def check_volume_spike(candles_seq, vwap_value):
     ):
         return True
     return False
-
+    
 current_session_date = None
 
 def get_ny_date():
