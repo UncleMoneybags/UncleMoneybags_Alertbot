@@ -158,6 +158,11 @@ def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None, latest_tr
         logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} latest: {emas[f'ema{p}'][-1]}")
     return emas
 
+# When you use calculate_emas in any alert or scan logic, always pass the freshest price as shown above.
+# Example usage:
+# latest_price = last_trade_price[symbol] if last_trade_price[symbol] is not None else closes[-1]
+# emas = calculate_emas(closes, periods=[5, 8, 13], window=30, symbol=symbol, latest_trade_price=latest_price)
+
 def vwap_numpy(prices, volumes):
     prices = np.asarray(prices, dtype=float)
     volumes = np.asarray(volumes, dtype=float)
