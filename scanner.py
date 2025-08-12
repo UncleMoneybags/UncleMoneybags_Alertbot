@@ -1139,7 +1139,7 @@ async def ingest_polygon_events():
                                 last_trade_volume[symbol] = event.get("s", 0)
                                 last_trade_time[symbol] = datetime.now(timezone.utc)
                                 logger.info(
-                                    f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get("s", 0)} | Time={last_trade_time[symbol]}"
+                                    f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
                                 )
                             if event.get("ev") == "AM":
                                 symbol = event["sym"]
