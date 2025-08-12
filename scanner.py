@@ -158,8 +158,6 @@ def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None, latest_tr
         logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} latest: {emas[f'ema{p}'][-1]}")
     return emas
 
-# ... rest of your file unchanged ...
-
 def vwap_numpy(prices, volumes):
     prices = np.asarray(prices, dtype=float)
     volumes = np.asarray(volumes, dtype=float)
