@@ -398,16 +398,12 @@ last_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
 warming_up_was_true = defaultdict(bool)
 runner_was_true = defaultdict(bool)
 dip_play_was_true = defaultdict(bool)
-rug_pull_was_true = defaultdict(bool)
 vwap_reclaim_was_true = defaultdict(bool)
 volume_spike_was_true = defaultdict(bool)
 ema_stack_was_true = defaultdict(bool)
 
 def get_scanned_tickers():
     return set(candles.keys())
-
-RUG_PULL_DROP_PCT = -0.10
-RUG_PULL_BOUNCE_PCT = 0.05
 
 vwap_candles = defaultdict(list)
 vwap_session_date = defaultdict(lambda: None)
@@ -820,38 +816,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 alerted_symbols[symbol] = today
                 last_alert_time[symbol] = now
 
-    # Rug Pull Logic
-    if len(candles_seq) >= 3:
-        c0, c1, c2 = list(candles_seq)[-3:]
-        drop_pct = (c1["close"] - c0["close"]) / c0["close"]
-        bounce_pct = (c2["close"] - c1["close"]) / c1["close"]
-        rug_pull_criteria = (
-            drop_pct <= RUG_PULL_DROP_PCT and bounce_pct < RUG_PULL_BOUNCE_PCT and symbol in alerted_symbols and alerted_symbols[symbol] == today
-        )
-        logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: rug_pull | VWAP={vwap_candles_numpy(vwap_candles[symbol]):.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={c2['close']} | Candle Volume={c2['volume']}"
-        )
-        emas = calculate_emas([c['close'] for c in list(candles_seq)[-3:]], periods=[5, 8, 13], window=3, symbol=symbol)
-        logger.info(f"[EMA DEBUG] {symbol} | Rug Pull | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
-        if rug_pull_criteria and not rug_pull_was_true[symbol]:
-            if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                return
-            if last_trade_volume[symbol] < 250:
-                logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
-                return
-            log_event("rug_pull", symbol, get_display_price(symbol, c2['close']), c2['volume'], event_time, {
-                "drop_pct": drop_pct,
-                "bounce_pct": bounce_pct
-            })
-            price_str = f"{get_display_price(symbol, c2['close']):.2f}"
-            alert_text = (
-                f"⚠️ <b>{escape_html(symbol)}</b> Rug Pull\n"
-                f"Current Price: ${price_str}"
-            )
-            await send_telegram_async(alert_text)
-            rug_pull_was_true[symbol] = True
-            last_alert_time[symbol] = now
-
     # VWAP Reclaim Logic
     if len(candles_seq) >= 2:
         prev_candle = list(candles_seq)[-2]
@@ -1175,7 +1139,7 @@ async def ingest_polygon_events():
                                 last_trade_volume[symbol] = event.get("s", 0)
                                 last_trade_time[symbol] = datetime.now(timezone.utc)
                                 logger.info(
-                                    f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
+                                    f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get("s", 0)} | Time={last_trade_time[symbol]}"
                                 )
                             if event.get("ev") == "AM":
                                 symbol = event["sym"]
