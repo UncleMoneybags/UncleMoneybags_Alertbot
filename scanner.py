@@ -144,18 +144,14 @@ vol_profile = VolumeProfile()
 
 EMA_PERIODS = [5, 8, 13]
 
-# PATCH: Use latest trade price for the most recent close in EMAs
 def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None, latest_trade_price=None):
     prices = list(prices)[-window:]
     if latest_trade_price is not None and len(prices) > 0:
-        prices[-1] = latest_trade_price
+        prices[-1] = latest_trade_price  # PATCH: Use latest trade price for most recent close
     s = pd.Series(prices)
     emas = {}
-    logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | Input closes: {prices}")
     for p in periods:
         emas[f"ema{p}"] = s.ewm(span=p, adjust=False).mean().to_numpy()
-        logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} array: {emas[f'ema{p}']}")
-        logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} latest: {emas[f'ema{p}'][-1]}")
     return emas
 
 def vwap_numpy(prices, volumes):
