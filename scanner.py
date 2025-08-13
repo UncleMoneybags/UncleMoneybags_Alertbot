@@ -1121,19 +1121,47 @@ async def get_ticker_news_yahoo(ticker):
         logger.error(f"[NEWS SCRAPER ERROR] {ticker}: {e}")
         return []
 
-# --- PATCH: Ingest Polygon T.* trade events for real-time last price/volume ---
 async def ingest_polygon_events():
     url = "wss://socket.polygon.io/stocks"
     while True:
+        if not is_market_scan_time():
+            print("[SCAN PAUSED] Market closed (outside 4am-8pm EST, Mon-Fri). Sleeping 60s.")
+            await asyncio.sleep(60)
+            continue
         try:
             async with websockets.connect(url) as ws:
                 await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
                 await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,T.*,status"}))
                 print("Subscribed to: AM.*, T.* (trades), and status (halts/resumes)")
                 while True:
+                    if not is_market_scan_time():
+                        print("[SCAN PAUSED] Market closed during active connection. Sleeping 60s, breaking websocket.")
+                        await asyncio.sleep(60)
+                        break
                     msg = await ws.recv()
                     print("[RAW MSG]", msg)
                     try:
+                        data = json.loads(msg)
+                        if isinstance(data, dict):
+                            data = [data]
+                        for event in data:
+                            # --- Example event processing (customize for your needs) ---
+                            if event.get("ev") == "T":
+                                symbol = event["sym"]
+                                last_trade_price[symbol] = event["p"]
+                                last_trade_volume[symbol] = event.get('s', 0)
+                                last_trade_time[symbol] = datetime.now(timezone.utc)
+                                print(
+                                    f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
+                                )
+                            # You can add more event handling here...
+                    except Exception as e:
+                        print(f"Error processing message: {e}\nRaw: {msg}")
+        except Exception as e:
+            print(f"Websocket error: {e} — reconnecting in 10 seconds...")
+            await asyncio.sleep(10)
+        # --- PATCH: Ingest Polygon T.* trade events for real-time last price/volume ---
+
                         data = json.loads(msg)
                         # PATCH: handle list and dict style events
                         if isinstance(data, dict):
