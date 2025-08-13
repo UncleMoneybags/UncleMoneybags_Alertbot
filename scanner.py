@@ -1161,87 +1161,57 @@ async def ingest_polygon_events():
         except Exception as e:
             print(f"Websocket error: {e} — reconnecting in 10 seconds...")
             await asyncio.sleep(10)
-        # --- PATCH: Ingest Polygon T.* trade events for real-time last price/volume ---
 
-                        data = json.loads(msg)
-                        # PATCH: handle list and dict style events
-                        if isinstance(data, dict):
-                            data = [data]
-                        for event in data:
-                            # PATCH: Handle trade event for last trade price/size
-                            if event.get("ev") == "T":
-                                symbol = event["sym"]
-                                last_trade_price[symbol] = event["p"]
-                                # PATCH: handle missing 's' field robustly!
-                                last_trade_volume[symbol] = event.get('s', 0)
-                                last_trade_time[symbol] = datetime.now(timezone.utc)
-                                logger.info(
-                                    f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
-                                )
-                            if event.get("ev") == "AM":
-                                symbol = event["sym"]
-                                open_ = event["o"]
-                                high = event["h"]
-                                low = event["l"]
-                                close = event["c"]
-                                volume = event["v"]
-                                start_time = polygon_time_to_utc(event["s"])
-                                print(f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}")
-                                candle = {
-                                    "open": open_,
-                                    "high": high,
-                                    "low": low,
-                                    "close": close,
-                                    "volume": volume,
-                                    "start_time": start_time,
-                                }
-                                if not isinstance(candles[symbol], deque):
-                                    candles[symbol] = deque(candles[symbol], maxlen=20)
-                                if not isinstance(vwap_candles[symbol], list):
-                                    vwap_candles[symbol] = list(vwap_candles[symbol])
-                                candles[symbol].append(candle)
-                                session_date = get_session_date(candle['start_time'])
-                                last_session = vwap_session_date[symbol]
-                                if last_session != session_date:
-                                    vwap_candles[symbol] = []
-                                    vwap_session_date[symbol] = session_date
-                                vwap_candles[symbol].append(candle)
-                                vwap_cum_vol[symbol] += volume
-                                vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
-                                await on_new_candle(symbol, open_, high, low, close, volume, start_time)
-                            elif event.get("ev") == "status" and event.get("status") == "halt":
-                                await handle_halt_event(event)
-                            elif event.get("ev") == "status" and event.get("status") == "resume":
-                                await handle_resume_event(event)
-                    except Exception as e:
-                        print(f"Error processing message: {e}\nRaw: {msg}")
-        except Exception as e:
-            print(f"Websocket error: {e} — reconnecting in 10 seconds...")
-            await asyncio.sleep(10)
-
-async def main():
-    print("Main event loop running. Press Ctrl+C to exit.")
-    ingest_task = asyncio.create_task(ingest_polygon_events())
-    close_alert_task = asyncio.create_task(market_close_alert_loop())
-    premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
-    catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())
-    try:
-        while True:
-            await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        print("Main loop cancelled.")
-    finally:
-        ingest_task.cancel()
-        close_alert_task.cancel()
-        premarket_alert_task.cancel()
-        catalyst_news_task.cancel()
-        await ingest_task
-        await close_alert_task
-        await premarket_alert_task
-        await catalyst_news_task
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-      print("Shutting down gracefully...")
+try:
+    data = json.loads(msg)
+    # PATCH: handle list and dict style events
+    if isinstance(data, dict):
+        data = [data]
+    for event in data:
+        # PATCH: Handle trade event for last trade price/size
+        if event.get("ev") == "T":
+            symbol = event["sym"]
+            last_trade_price[symbol] = event["p"]
+            # PATCH: handle missing 's' field robustly!
+            last_trade_volume[symbol] = event.get('s', 0)
+            last_trade_time[symbol] = datetime.now(timezone.utc)
+            logger.info(
+                f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
+            )
+        if event.get("ev") == "AM":
+            symbol = event["sym"]
+            open_ = event["o"]
+            high = event["h"]
+            low = event["l"]
+            close = event["c"]
+            volume = event["v"]
+            start_time = polygon_time_to_utc(event["s"])
+            print(f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}")
+            candle = {
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "start_time": start_time,
+            }
+            if not isinstance(candles[symbol], deque):
+                candles[symbol] = deque(candles[symbol], maxlen=20)
+            if not isinstance(vwap_candles[symbol], list):
+                vwap_candles[symbol] = list(vwap_candles[symbol])
+            candles[symbol].append(candle)
+            session_date = get_session_date(candle['start_time'])
+            last_session = vwap_session_date[symbol]
+            if last_session != session_date:
+                vwap_candles[symbol] = []
+                vwap_session_date[symbol] = session_date
+            vwap_candles[symbol].append(candle)
+            vwap_cum_vol[symbol] += volume
+            vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+            await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+        elif event.get("ev") == "status" and event.get("status") == "halt":
+            await handle_halt_event(event)
+        elif event.get("ev") == "status" and event.get("status") == "resume":
+            await handle_resume_event(event)
+except Exception as e:
+    print(f"Error processing message: {e}\nRaw: {msg}")
