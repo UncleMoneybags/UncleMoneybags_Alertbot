@@ -90,8 +90,6 @@ def get_float_shares(ticker):
 
 load_float_cache()
 # --- END FLOAT PATCH ---
-load_float_cache()
-# --- END FLOAT PATCH ---
 
 # --- Time-of-Day Volume Profile for RVOL Spike Alerts ---
 PROFILE_FILE = "volume_profile.json"
@@ -145,7 +143,6 @@ vol_profile = VolumeProfile()
 
 EMA_PERIODS = [5, 8, 13]
 
-# PATCH: Use latest trade price for the most recent close in EMAs
 def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None, latest_trade_price=None):
     prices = list(prices)[-window:]
     if latest_trade_price is not None and len(prices) > 0:
@@ -158,11 +155,6 @@ def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None, latest_tr
         logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} array: {emas[f'ema{p}']}")
         logger.info(f"[EMA DEBUG] {symbol if symbol else ''} | EMA{p} latest: {emas[f'ema{p}'][-1]}")
     return emas
-
-# When you use calculate_emas in any alert or scan logic, always pass the freshest price as shown above.
-# Example usage:
-# latest_price = last_trade_price[symbol] if last_trade_price[symbol] is not None else closes[-1]
-# emas = calculate_emas(closes, periods=[5, 8, 13], window=30, symbol=symbol, latest_trade_price=latest_price)
 
 def vwap_numpy(prices, volumes):
     prices = np.asarray(prices, dtype=float)
@@ -426,7 +418,6 @@ def get_session_date(dt):
         return dt_ny.date() - timedelta(days=1)
     return dt_ny.date()
 
-# --- PATCH: Volume Spike logic with session-aware threshold and wick filter ---
 def check_volume_spike(candles_seq, vwap_value):
     if len(candles_seq) < 4:
         return False
@@ -694,7 +685,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         emas = calculate_emas([c['close'] for c in last_6], periods=[5, 8, 13], window=6, symbol=symbol)
         logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
         if warming_up_criteria and not warming_up_was_true[symbol]:
-            # PATCH: Only alert if recent trade is liquid enough
             if last_trade_volume[symbol] < 250:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                 return
@@ -727,17 +717,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
         vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
 
-        # Trend check: last 3 closes must be rising
         closes_for_trend = [c['close'] for c in last_6[-3:]]
         price_rising_trend = all(x < y for x, y in zip(closes_for_trend, closes_for_trend[1:]))
-
-        # Price not dropping: last 2 closes must be higher than previous
         price_not_dropping = closes_for_trend[-2] < closes_for_trend[-1]
-
-        # Upper wick filter: close must be at least 75% of high (PATCHED FROM 95%)
         wick_ok = close_rn >= 0.75 * high_rn
 
-        # Debug logging
         logger.info(
             f"[RUNNER DEBUG] {symbol} | Closes trend: {closes_for_trend} | price_rising_trend={price_rising_trend} | price_not_dropping={price_not_dropping} | wick_ok={wick_ok}"
         )
@@ -758,7 +742,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
 
         if runner_criteria and not runner_was_true[symbol]:
-            # PATCH: Only alert if recent trade is liquid enough
             if last_trade_volume[symbol] < 250:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                 return
@@ -782,7 +765,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
 
-    # DIP PLAY LOGIC (unchanged, but you can PATCH similarly if needed)
+    # DIP PLAY LOGIC
     MIN_DIP_PCT = 0.10
     DIP_LOOKBACK = 10
     if len(candles_seq) >= DIP_LOOKBACK:
@@ -919,7 +902,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_volume = last_candle['volume']
             price = closes[-1]
 
-            # Session-aware thresholds
             if session_type in ["premarket", "afterhours"]:
                 min_volume = 250_000
                 min_dollar_volume = 100_000
@@ -940,7 +922,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             logger.info(f"[EMA STACK DEBUG] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}, vwap={vwap_value:.2f}, close={price:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}, criteria={ema_stack_criteria}")
 
             if ema_stack_criteria and not ema_stack_was_true[symbol]:
-                # PATCH: enforce ratio at alert time!
                 if ema5 / ema13 < 1.015:
                     logger.error(
                         f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
@@ -970,7 +951,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 alerted_symbols[symbol] = today
                 last_alert_time[symbol] = now
 
-# --- At end of each day, call this to update the time-of-day profile ---
 def update_profile_for_day(symbol, day_candles):
     vol_profile.add_day(symbol, day_candles)
 
@@ -999,7 +979,6 @@ async def catalyst_news_alert_loop():
                         save_news_id(news_id)
         await asyncio.sleep(60)
 
-# --- PREMARKET GAINERS ALERT LOOP (NO FLOAT FILTER) ---
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
@@ -1146,7 +1125,6 @@ async def ingest_polygon_events():
                         if isinstance(data, dict):
                             data = [data]
                         for event in data:
-                            # --- Example event processing (customize for your needs) ---
                             if event.get("ev") == "T":
                                 symbol = event["sym"]
                                 last_trade_price[symbol] = event["p"]
@@ -1155,63 +1133,70 @@ async def ingest_polygon_events():
                                 print(
                                     f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
                                 )
-                            # You can add more event handling here...
+                            if event.get("ev") == "AM":
+                                symbol = event["sym"]
+                                open_ = event["o"]
+                                high = event["h"]
+                                low = event["l"]
+                                close = event["c"]
+                                volume = event["v"]
+                                start_time = polygon_time_to_utc(event["s"])
+                                print(f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}")
+                                candle = {
+                                    "open": open_,
+                                    "high": high,
+                                    "low": low,
+                                    "close": close,
+                                    "volume": volume,
+                                    "start_time": start_time,
+                                }
+                                if not isinstance(candles[symbol], deque):
+                                    candles[symbol] = deque(candles[symbol], maxlen=20)
+                                if not isinstance(vwap_candles[symbol], list):
+                                    vwap_candles[symbol] = list(vwap_candles[symbol])
+                                candles[symbol].append(candle)
+                                session_date = get_session_date(candle['start_time'])
+                                last_session = vwap_session_date[symbol]
+                                if last_session != session_date:
+                                    vwap_candles[symbol] = []
+                                    vwap_session_date[symbol] = session_date
+                                vwap_candles[symbol].append(candle)
+                                vwap_cum_vol[symbol] += volume
+                                vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+                                await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                            elif event.get("ev") == "status" and event.get("status") == "halt":
+                                await handle_halt_event(event)
+                            elif event.get("ev") == "status" and event.get("status") == "resume":
+                                await handle_resume_event(event)
                     except Exception as e:
                         print(f"Error processing message: {e}\nRaw: {msg}")
         except Exception as e:
             print(f"Websocket error: {e} — reconnecting in 10 seconds...")
             await asyncio.sleep(10)
 
-try:
-    data = json.loads(msg)
-    # PATCH: handle list and dict style events
-    if isinstance(data, dict):
-        data = [data]
-    for event in data:
-        # PATCH: Handle trade event for last trade price/size
-        if event.get("ev") == "T":
-            symbol = event["sym"]
-            last_trade_price[symbol] = event["p"]
-            # PATCH: handle missing 's' field robustly!
-            last_trade_volume[symbol] = event.get('s', 0)
-            last_trade_time[symbol] = datetime.now(timezone.utc)
-            logger.info(
-                f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
-            )
-        if event.get("ev") == "AM":
-            symbol = event["sym"]
-            open_ = event["o"]
-            high = event["h"]
-            low = event["l"]
-            close = event["c"]
-            volume = event["v"]
-            start_time = polygon_time_to_utc(event["s"])
-            print(f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}")
-            candle = {
-                "open": open_,
-                "high": high,
-                "low": low,
-                "close": close,
-                "volume": volume,
-                "start_time": start_time,
-            }
-            if not isinstance(candles[symbol], deque):
-                candles[symbol] = deque(candles[symbol], maxlen=20)
-            if not isinstance(vwap_candles[symbol], list):
-                vwap_candles[symbol] = list(vwap_candles[symbol])
-            candles[symbol].append(candle)
-            session_date = get_session_date(candle['start_time'])
-            last_session = vwap_session_date[symbol]
-            if last_session != session_date:
-                vwap_candles[symbol] = []
-                vwap_session_date[symbol] = session_date
-            vwap_candles[symbol].append(candle)
-            vwap_cum_vol[symbol] += volume
-            vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
-            await on_new_candle(symbol, open_, high, low, close, volume, start_time)
-        elif event.get("ev") == "status" and event.get("status") == "halt":
-            await handle_halt_event(event)
-        elif event.get("ev") == "status" and event.get("status") == "resume":
-            await handle_resume_event(event)
-except Exception as e:
-    print(f"Error processing message: {e}\nRaw: {msg}")
+async def main():
+    print("Main event loop running. Press Ctrl+C to exit.")
+    ingest_task = asyncio.create_task(ingest_polygon_events())
+    close_alert_task = asyncio.create_task(market_close_alert_loop())
+    premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
+    catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        print("Main loop cancelled.")
+    finally:
+        ingest_task.cancel()
+        close_alert_task.cancel()
+        premarket_alert_task.cancel()
+        catalyst_news_task.cancel()
+        await ingest_task
+        await close_alert_task
+        await premarket_alert_task
+        await catalyst_news_task
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down gracefully...")
