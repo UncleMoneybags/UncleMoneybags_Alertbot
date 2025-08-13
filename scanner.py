@@ -14,7 +14,6 @@ import csv
 import os
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 print("POLYGON_API_KEY:", POLYGON_API_KEY)
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 import joblib
 import numpy as np
 import atexit
@@ -89,6 +88,8 @@ def get_float_shares(ticker):
             time.sleep(10)
         return float_cache.get(ticker, None)
 
+load_float_cache()
+# --- END FLOAT PATCH ---
 load_float_cache()
 # --- END FLOAT PATCH ---
 
