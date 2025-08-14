@@ -457,12 +457,19 @@ def get_ny_date():
     now_ny = now_utc.astimezone(ny)
     return now_ny.date()
 
-def get_display_price(symbol, fallback):
+# PATCH: FRESHNESS CHECK for price
+MAX_PRICE_AGE_SECONDS = 60
+def get_display_price(symbol, fallback, max_age_seconds=MAX_PRICE_AGE_SECONDS):
     price = last_trade_price[symbol]
-    logger.info(
-        f"[PRICE DEBUG] {symbol} | Using trade price={price} | Fallback price={fallback}"
-    )
-    return price if price is not None else fallback
+    trade_time = last_trade_time[symbol]
+    now = datetime.now(timezone.utc)
+    if (
+        price is not None
+        and trade_time is not None
+        and (now - trade_time).total_seconds() < max_age_seconds
+    ):
+        return price
+    return fallback
 
 def is_bullish_engulfing(candles_seq):
     if len(candles_seq) < 2:
@@ -484,6 +491,39 @@ def calc_macd_hist(closes):
     signal = macd.ewm(span=9, adjust=False).mean()
     macd_hist = macd - signal
     return macd_hist.values
+
+# PATCH: SESSION RESET FUNCTION
+def reset_symbol_state():
+    for d in [
+        candles,
+        vwap_candles,
+        last_trade_price,
+        last_trade_volume,
+        last_trade_time,
+        recent_high,
+        last_alert_time,
+        warming_up_was_true,
+        runner_was_true,
+        dip_play_was_true,
+        vwap_reclaim_was_true,
+        volume_spike_was_true,
+        ema_stack_was_true,
+        premarket_open_prices,
+        premarket_last_prices,
+        premarket_volumes,
+        alerted_symbols,
+        runner_alerted_today,
+        below_vwap_streak,
+        vwap_reclaimed_once,
+        dip_play_seen,
+        volume_spike_alerted,
+        rvol_spike_alerted,
+        halted_symbols,
+        pending_runner_alert
+    ]:
+        if hasattr(d, "clear"):
+            d.clear()
+    logger.info("Cleared all per-symbol session state for new trading day!")
 
 async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq, vwap_value):
     closes_np = np.array(closes)
@@ -747,14 +787,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("runner", symbol, last_trade_price[symbol] if last_trade_price[symbol] is not None else close_rn, volume_rn, event_time, {
+            log_event("runner", symbol, get_display_price(symbol, close_rn), volume_rn, event_time, {
                 "price_move": price_move_rn,
                 "trend_closes": closes_for_trend,
                 "wick_ok": wick_ok,
                 "vwap": vwap_rn,
                 "last_trade_price": last_trade_price[symbol]
             })
-            price_str = f"{last_trade_price[symbol]:.2f}" if last_trade_price[symbol] is not None else f"{close_rn:.2f}"
+            price_str = f"{get_display_price(symbol, close_rn):.2f}"
             alert_text = (
                 f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
                 f"Current Price: ${price_str}\n"
@@ -1036,6 +1076,7 @@ async def market_close_alert_loop():
                 event_time = datetime.now(timezone.utc)
                 log_event("market_close", "CLOSE", 0, 0, event_time)
                 sent_today = True
+                reset_symbol_state() # PATCH: clear session state after close
         else:
             sent_today = False
         if now_est.time() < dt_time(20, 0):
