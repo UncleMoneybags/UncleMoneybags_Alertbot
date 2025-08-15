@@ -1107,29 +1107,49 @@ async def market_close_alert_loop():
             sent_today = False
         await asyncio.sleep(30)
 
+# PATCHED: HALT/RESUME ALERTS with float/price filter
 async def handle_halt_event(event):
     symbol = event.get("sym")
     status = event.get("status")
     reason = event.get("reason", "")
-    scanned = get_scanned_tickers()
-    if symbol in scanned:
-        msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}"
-        await send_all_alerts(msg)
-        event_time = datetime.now(timezone.utc)
-        log_event("halt", symbol, 0, 0, event_time, {"status": status, "reason": reason})
-        halted_symbols.add(symbol)
-        with open(HALT_LOG_FILE, "a") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()},{symbol},{status},{reason}\n")
-        logger.info(f"HALT ALERT sent for {symbol}")
+
+    # Float filter: 10 million and under
+    float_shares = get_float_shares(symbol)
+    if float_shares is None or not (500_000 <= float_shares <= 10_000_000):
+        return  # Do not alert if float does not match
+
+    # Price filter: $20 and under
+    price = last_trade_price.get(symbol, 0)
+    if price is None or price > 20:
+        return  # Do not alert if price is above $20
+
+    msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}\nFloat: {float_shares:,}\nLast Price: ${price:.2f}"
+    await send_all_alerts(msg)
+    event_time = datetime.now(timezone.utc)
+    log_event("halt", symbol, price, 0, event_time, {"status": status, "reason": reason, "float": float_shares})
+    halted_symbols.add(symbol)
+    with open(HALT_LOG_FILE, "a") as f:
+        f.write(f"{datetime.now(timezone.utc).isoformat()},{symbol},{status},{reason}\n")
+    logger.info(f"HALT ALERT sent for {symbol} (float={float_shares}, price={price})")
 
 async def handle_resume_event(event):
     symbol = event.get("sym")
     reason = event.get("reason", "")
+    # Float filter: 10 million and under
+    float_shares = get_float_shares(symbol)
+    if float_shares is None or not (500_000 <= float_shares <= 10_000_000):
+        return  # Do not alert if float does not match
+
+    # Price filter: $20 and under
+    price = last_trade_price.get(symbol, 0)
+    if price is None or price > 20:
+        return  # Do not alert if price is above $20
+
     if symbol in halted_symbols:
-        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}"
+        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}\nFloat: {float_shares:,}\nLast Price: ${price:.2f}"
         await send_all_alerts(msg)
         event_time = datetime.now(timezone.utc)
-        log_event("resume", symbol, 0, 0, event_time, {"reason": reason})
+        log_event("resume", symbol, price, 0, event_time, {"reason": reason, "float": float_shares})
         halted_symbols.remove(symbol)
 
 def highlight_keywords(title, keywords):
