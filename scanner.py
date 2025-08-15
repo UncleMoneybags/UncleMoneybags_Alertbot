@@ -245,6 +245,10 @@ logger.info("Imports completed successfully.")
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY","VmF1boger0pp2M7gV5HboHheRbplmLi5") 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","-1002266463234") 
+
+# --- DISCORD WEBHOOK (add yours here) ---
+DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1405716607111528600/E-BShgFYwkQadlqYWfeuYCgiFMirI4nSMZ_O7fTtrX29RKhcodeJ7zcXCCUd17EtBOkZ"
+
 if not POLYGON_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logger.critical("API keys or chat id missing in environment variables! Exiting.")
     sys.exit(1)
@@ -363,6 +367,26 @@ async def send_telegram_async(message):
                     logger.error(f"[DEBUG] Telegram send error: {result_text}")
     except Exception as e:
         logger.error(f"[DEBUG] Telegram send error: {e}")
+
+async def send_discord_async(message):
+    if not DISCORD_WEBHOOK_URL:
+        logger.error("No Discord webhook URL set!")
+        return
+    payload = {
+        "content": message
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10) as resp:
+                result = await resp.text()
+                if resp.status not in (200, 204):
+                    logger.error(f"Discord send error: {result}")
+    except Exception as e:
+        logger.error(f"Discord send error: {e}")
+
+async def send_all_alerts(message):
+    await send_telegram_async(message)
+    await send_discord_async(message)
 
 def escape_html(s):
     return html.escape(s or "")
@@ -587,7 +611,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
             f" | MACD↑"
             f" | RSI: {int(round(last_rsi))}"
         )
-        await send_telegram_async(alert_text)
+        await send_all_alerts(alert_text)
         now = datetime.now(timezone.utc)
         log_event(
             "perfect_setup",
@@ -739,7 +763,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
                 f"Current Price: ${price_str}"
             )
-            await send_telegram_async(alert_text)
+            await send_all_alerts(alert_text)
             warming_up_was_true[symbol] = True
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
@@ -800,7 +824,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"Current Price: ${price_str}\n"
                 f"Last 3 closes: {', '.join(f'{x:.2f}' for x in closes_for_trend)}"
             )
-            await send_telegram_async(alert_text)
+            await send_all_alerts(alert_text)
             runner_was_true[symbol] = True
             runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
@@ -842,7 +866,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
                     f"Current Price: ${price_str}"
                 )
-                await send_telegram_async(alert_text)
+                await send_all_alerts(alert_text)
                 dip_play_was_true[symbol] = True
                 dip_play_seen.add(symbol)
                 alerted_symbols[symbol] = today
@@ -889,7 +913,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"1-min Vol: {vol_str}\n"
                 f"RVOL: {rvol_str}"
             )
-            await send_telegram_async(alert_text)
+            await send_all_alerts(alert_text)
             vwap_reclaim_was_true[symbol] = True
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
@@ -912,7 +936,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
             f"Current Price: ${price_str}"
         )
-        await send_telegram_async(alert_text)
+        await send_all_alerts(alert_text)
         event_time = now
         log_event("volume_spike", symbol, get_display_price(symbol, close), volume, event_time, {
             "rvol": volume / (sum([c['volume'] for c in list(candles_seq)[-4:-1]]) / 3 if len(candles_seq) >= 4 else 1),
@@ -986,7 +1010,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}\n"
                     f"Volume: {last_volume:,} | Dollar Vol: ${dollar_volume:,.0f}"
                 )
-                await send_telegram_async(alert_text)
+                await send_all_alerts(alert_text)
                 ema_stack_was_true[symbol] = True
                 alerted_symbols[symbol] = today
                 last_alert_time[symbol] = now
@@ -1009,7 +1033,7 @@ async def catalyst_news_alert_loop():
                             f"📰 <b>{escape_html(symbol)}</b> {headline_fmt}\n"
                             f"{link}"
                         )
-                        await send_telegram_async(msg)
+                        await send_all_alerts(msg)
                         event_time = datetime.now(timezone.utc)
                         log_event("news_alert", symbol, 0, 0, event_time, {
                             "headline": title,
@@ -1054,7 +1078,7 @@ async def premarket_gainers_alert_loop():
                     "Here are the top 5 premarket gainers (since 4am):\n"
                     f"{gainers_text}"
                 )
-                await send_telegram_async(msg)
+                await send_all_alerts(msg)
                 event_time = datetime.now(timezone.utc)
                 log_event("premarket_gainers", "PREMARKET", 0, 0, event_time, {"gainers": gainers_text})
                 sent_today = True
@@ -1072,7 +1096,7 @@ async def market_close_alert_loop():
         now_est = now_utc.astimezone(eastern)
         if now_est.weekday() in (0, 1, 2, 3):
             if now_est.time() >= dt_time(20, 1) and not sent_today:
-                await send_telegram_async("Market Closed. Reconvene in pre market tomorrow.")
+                await send_all_alerts("Market Closed. Reconvene in pre market tomorrow.")
                 event_time = datetime.now(timezone.utc)
                 log_event("market_close", "CLOSE", 0, 0, event_time)
                 sent_today = True
@@ -1090,7 +1114,7 @@ async def handle_halt_event(event):
     scanned = get_scanned_tickers()
     if symbol in scanned:
         msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}"
-        await send_telegram_async(msg)
+        await send_all_alerts(msg)
         event_time = datetime.now(timezone.utc)
         log_event("halt", symbol, 0, 0, event_time, {"status": status, "reason": reason})
         halted_symbols.add(symbol)
@@ -1103,7 +1127,7 @@ async def handle_resume_event(event):
     reason = event.get("reason", "")
     if symbol in halted_symbols:
         msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}"
-        await send_telegram_async(msg)
+        await send_all_alerts(msg)
         event_time = datetime.now(timezone.utc)
         log_event("resume", symbol, 0, 0, event_time, {"reason": reason})
         halted_symbols.remove(symbol)
