@@ -721,16 +721,16 @@ async def main():
         print("Main loop cancelled.")
     finally:
         ingest_task.cancel()
+        nasdaq_halt_task.cancel()
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         catalyst_news_task.cancel()
-        nasdaq_halt_task.cancel()
         await ingest_task
         await nasdaq_halt_task
         await close_alert_task
         await premarket_alert_task
         await catalyst_news_task
-       
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
