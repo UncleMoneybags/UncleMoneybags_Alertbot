@@ -348,7 +348,6 @@ def get_session_type(dt):
         return "afterhours"
     else:
         return "closed"
-
 async def send_telegram_async(message):
     logger.debug(f"[DEBUG] send_telegram_async called. Message: {message}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -441,7 +440,6 @@ def get_session_date(dt):
     if dt_ny.time() < dt_time(4, 0):
         return dt_ny.date() - timedelta(days=1)
     return dt_ny.date()
-
 def check_volume_spike(candles_seq, vwap_value):
     if len(candles_seq) < 4:
         return False
@@ -550,6 +548,10 @@ def reset_symbol_state():
             d.clear()
     logger.info("Cleared all per-symbol session state for new trading day!")
 
+import asyncio
+from datetime import datetime, time as dt_time, timezone
+import pytz
+    
 # ===================== PATCH: NASDAQ HALT SCRAPER =====================
 NASDAQ_HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 CHECK_HALT_INTERVAL = 60  # seconds
