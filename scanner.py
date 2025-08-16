@@ -1285,6 +1285,7 @@ async def market_close_alert_loop():
         if now_est.weekday() in (0, 1, 2, 3):
             if now_est.time() >= dt_time(20, 1) and not sent_today:
                 await send_all_alerts("Market Closed. Reconvene in pre market tomorrow.")
+                # ... etc ...
                 event_time = datetime.now(timezone.utc)
                 log_event("market_close", "CLOSE", 0, 0, event_time)
                 sent_today = True
