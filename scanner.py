@@ -20,7 +20,7 @@ import atexit
 import sys
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd  
+import pandas as pd
 import time
 
 # --- PATCH: Track the latest real trade price and size for each symbol ---
@@ -242,9 +242,9 @@ except ImportError:
 logger.info("scanner.py is running!!! --- If you see this, your file is found and started.")
 logger.info("Imports completed successfully.")
 
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY","VmF1boger0pp2M7gV5HboHheRbplmLi5") 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc") 
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","-1002266463234") 
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY","VmF1boger0pp2M7gV5HboHheRbplmLi5")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","8019146040:AAGRj0hJn2ZUKj1loEEYdy0iuij6KFbSPSc")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","-1002266463234")
 
 # --- DISCORD WEBHOOK (add yours here) ---
 DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1405716607111528600/E-BShgFYwkQadlqYWfeuYCgiFMirI4nSMZ_O7fTtrX29RKhcodeJ7zcXCCUd17EtBOkZ"
@@ -472,7 +472,7 @@ def check_volume_spike(candles_seq, vwap_value):
     ):
         return True
     return False
-    
+
 current_session_date = None
 
 def get_ny_date():
@@ -483,6 +483,7 @@ def get_ny_date():
 
 # PATCH: FRESHNESS CHECK for price
 MAX_PRICE_AGE_SECONDS = 60
+
 def get_display_price(symbol, fallback, max_age_seconds=MAX_PRICE_AGE_SECONDS):
     price = last_trade_price[symbol]
     trade_time = last_trade_time[symbol]
@@ -587,14 +588,7 @@ async def nasdaq_halt_alert_loop():
                         yf_price = yf.Ticker(symbol).info.get('regularMarketPrice', None)
                         price = yf_price
                     except Exception:
-                price = last_trade_price.get(symbol)
-                if price is None:
-                    try:
-                        import yfinance as yf
-                        yf_price = yf.Ticker(symbol).info.get('regularMarketPrice', None)
-                        price = yf_price
-                    except Exception:
-                        price = None
+                        price = last_trade_price.get(symbol)
                 if price is None or price > 20:
                     continue  # Do not alert if price is above $20
                 msg = (
@@ -605,7 +599,7 @@ async def nasdaq_halt_alert_loop():
                 )
                 await send_all_alerts(msg)
                 log_event("halt", symbol, price, 0, datetime.now(timezone.utc), {"reason": reason, "float": float_shares, "status": status, "source": "nasdaq_rss"})
-                seen_halts.add(key)            
+                seen_halts.add(key)
         await asyncio.sleep(CHECK_HALT_INTERVAL)
 # ===================== END PATCH =====================
 
