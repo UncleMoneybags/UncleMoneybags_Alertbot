@@ -549,6 +549,194 @@ def reset_symbol_state():
             d.clear()
     logger.info("Cleared all per-symbol session state for new trading day!")
 
+# ===================== PATCH: NASDAQ HALT SCRAPER =====================
+NASDAQ_HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+CHECK_HALT_INTERVAL = 60  # seconds
+seen_halts = set()
+
+async def fetch_nasdaq_halts():
+    try:
+        r = requests.get(NASDAQ_HALTS_URL, timeout=10)
+        r.raise_for_status()
+        df = pd.read_xml(r.text)
+        return df
+    except Exception as e:
+        print(f"[NASDAQ HALTS ERROR] {e}")
+        return None
+
+async def nasdaq_halt_alert_loop():
+    global seen_halts
+    while True:
+        df = await asyncio.to_thread(fetch_nasdaq_halts)
+        if df is not None:
+            for _, row in df.iterrows():
+                symbol = row['Symbol'].strip().upper()
+                halt_time = row['HaltTime']
+                reason = row.get('Reason', '')
+                status = row.get('Status', '')
+                key = (symbol, halt_time)
+                if key in seen_halts:
+                    continue
+                float_shares = get_float_shares(symbol)
+                if float_shares is None or not (500_000 <= float_shares <= 10_000_000):
+                    continue
+                price = last_trade_price.get(symbol)
+                if price is None:
+                    try:
+                        import yfinance as yf
+                        yf_price = yf.Ticker(symbol).info.get('regularMarketPrice', None)
+                        price = yf_price
+                    except Exception:
+                        price = None
+                if price is None or price > 20:
+                    continue
+                msg = (
+                    f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
+                    f"Reason: {escape_html(str(reason))}\n"
+                    f"Float: {float_shares:,}\n"
+                    f"Last Price: ${price:.2f}\n"
+                    f"Halt Time: {halt_time}"
+                )
+                await send_all_alerts(msg)
+                log_event("halt", symbol, price, 0, datetime.now(timezone.utc), {"reason": reason, "float": float_shares, "status": status, "source": "nasdaq_rss"})
+                seen_halts.add(key)
+        await asyncio.sleep(CHECK_HALT_INTERVAL)
+# ===================== END PATCH =====================
+
+def highlight_keywords(title, keywords):
+    words = set(kw.lower() for kw in keywords)
+    def bold_match(word):
+        for kw in words:
+            pattern = r'\b(' + re.escape(kw) + r')\b'
+            word = re.sub(pattern, r"<b>\1</b>", word, flags=re.IGNORECASE)
+        return word
+    return bold_match(title)
+
+async def get_ticker_news_yahoo(ticker):
+    url = f"https://finance.yahoo.com/quote/{ticker}/news?p={ticker}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                html_text = await resp.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        news_items = []
+        for item in soup.find_all('li', class_='js-stream-content'):
+            headline_tag = item.find('h3')
+            if not headline_tag:
+                continue
+            title = headline_tag.text.strip()
+            link_tag = headline_tag.find('a')
+            if not link_tag or not link_tag.get('href'):
+                continue
+            link = link_tag['href']
+            if not link.startswith('http'):
+                link = f"https://finance.yahoo.com{link}"
+            news_items.append((title, link))
+        return news_items
+    except Exception as e:
+        logger.error(f"[NEWS SCRAPER ERROR] {ticker}: {e}")
+        return []
+
+async def ingest_polygon_events():
+    url = "wss://socket.polygon.io/stocks"
+    while True:
+        if not is_market_scan_time():
+            print("[SCAN PAUSED] Market closed (outside 4am-8pm EST, Mon-Fri). Sleeping 60s.")
+            await asyncio.sleep(60)
+            continue
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
+                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,T.*,status"}))
+                print("Subscribed to: AM.*, T.* (trades), and status (halts/resumes)")
+                while True:
+                    if not is_market_scan_time():
+                        print("[SCAN PAUSED] Market closed during active connection. Sleeping 60s, breaking websocket.")
+                        await asyncio.sleep(60)
+                        break
+                    msg = await ws.recv()
+                    print("[RAW MSG]", msg)
+                    try:
+                        data = json.loads(msg)
+                        if isinstance(data, dict):
+                            data = [data]
+                        for event in data:
+                            if event.get("ev") == "T":
+                                symbol = event["sym"]
+                                last_trade_price[symbol] = event["p"]
+                                last_trade_volume[symbol] = event.get('s', 0)
+                                last_trade_time[symbol] = datetime.now(timezone.utc)
+                                print(
+                                    f"[TRADE EVENT] {symbol} | Price={event['p']} | Size={event.get('s', 0)} | Time={last_trade_time[symbol]}"
+                                )
+                            if event.get("ev") == "AM":
+                                symbol = event["sym"]
+                                open_ = event["o"]
+                                high = event["h"]
+                                low = event["l"]
+                                close = event["c"]
+                                volume = event["v"]
+                                start_time = polygon_time_to_utc(event["s"])
+                                print(f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}")
+                                candle = {
+                                    "open": open_,
+                                    "high": high,
+                                    "low": low,
+                                    "close": close,
+                                    "volume": volume,
+                                    "start_time": start_time,
+                                }
+                                if not isinstance(candles[symbol], deque):
+                                    candles[symbol] = deque(candles[symbol], maxlen=20)
+                                if not isinstance(vwap_candles[symbol], list):
+                                    vwap_candles[symbol] = list(vwap_candles[symbol])
+                                candles[symbol].append(candle)
+                                session_date = get_session_date(candle['start_time'])
+                                last_session = vwap_session_date[symbol]
+                                if last_session != session_date:
+                                    vwap_candles[symbol] = []
+                                    vwap_session_date[symbol] = session_date
+                                vwap_candles[symbol].append(candle)
+                                vwap_cum_vol[symbol] += volume
+                                vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+                                await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                            # DO NOT alert halts/resumes from Polygon, only use NASDAQ halts now
+                    except Exception as e:
+                        print(f"Error processing message: {e}\nRaw: {msg}")
+        except Exception as e:
+            print(f"Websocket error: {e} — reconnecting in 10 seconds...")
+            await asyncio.sleep(10)
+
+async def main():
+    print("Main event loop running. Press Ctrl+C to exit.")
+    ingest_task = asyncio.create_task(ingest_polygon_events())
+    nasdaq_halt_task = asyncio.create_task(nasdaq_halt_alert_loop())
+    close_alert_task = asyncio.create_task(market_close_alert_loop())
+    premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
+    catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        print("Main loop cancelled.")
+    finally:
+        ingest_task.cancel()
+        close_alert_task.cancel()
+        premarket_alert_task.cancel()
+        catalyst_news_task.cancel()
+        nasdaq_halt_task.cancel()
+        await ingest_task
+        await nasdaq_halt_task
+        await close_alert_task
+        await premarket_alert_task
+        await catalyst_news_task
+       
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down gracefully...")
+
 async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq, vwap_value):
     closes_np = np.array(closes)
     volumes_np = np.array(volumes)
