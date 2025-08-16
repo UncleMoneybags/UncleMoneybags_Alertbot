@@ -593,7 +593,6 @@ async def nasdaq_halt_alert_loop():
                 msg = (
                     f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
                     f"Reason: {escape_html(str(reason))}\n"
-                    f"Float: {float_shares:,}\n"
                     f"Last Price: ${price:.2f}\n"
                     f"Halt Time: {halt_time}"
                 )
@@ -1313,9 +1312,8 @@ async def handle_halt_event(event):
     # Price filter: $20 and under
     price = last_trade_price.get(symbol, 0)
     if price is None or price > 20:
-        return  # Do not alert if price is above $20
-
-    msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}\nFloat: {float_shares:,}\nLast Price: ${price:.2f}"
+    return  # Do not alert if price is above $20
+    msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}\nLast Price: ${price:.2f}"
     await send_all_alerts(msg)
     event_time = datetime.now(timezone.utc)
     log_event("halt", symbol, price, 0, event_time, {"status": status, "reason": reason, "float": float_shares})
@@ -1338,7 +1336,7 @@ async def handle_resume_event(event):
         return  # Do not alert if price is above $20
 
     if symbol in halted_symbols:
-        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}\nFloat: {float_shares:,}\nLast Price: ${price:.2f}"
+        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED\nReason: {escape_html(reason)}\nLast Price: ${price:.2f}"
         await send_all_alerts(msg)
         event_time = datetime.now(timezone.utc)
         log_event("resume", symbol, price, 0, event_time, {"reason": reason, "float": float_shares})
