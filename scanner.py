@@ -707,6 +707,24 @@ async def ingest_polygon_events():
             print(f"Websocket error: {e} — reconnecting in 10 seconds...")
             await asyncio.sleep(10)
 
+# Placeholder functions to prevent NameError - actual implementations are defined later in the file
+async def market_close_alert_loop():
+    """Placeholder for market close alert functionality. Full implementation below."""
+    # TODO: Add market close alert logic (actual implementation is defined later)
+    while True:
+        await asyncio.sleep(60)
+
+async def premarket_gainers_alert_loop():
+    """Placeholder for premarket gainers alert functionality. Full implementation below."""
+    # TODO: Add premarket gainers logic (actual implementation is defined later)
+    while True:
+        await asyncio.sleep(60)
+
+async def catalyst_news_alert_loop():
+    """Placeholder for catalyst news alert functionality. Full implementation below."""
+    # TODO: Add catalyst news alert logic (actual implementation is defined later)
+    while True:
+        await asyncio.sleep(60)
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
     ingest_task = asyncio.create_task(ingest_polygon_events())
