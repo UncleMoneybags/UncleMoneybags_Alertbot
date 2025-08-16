@@ -1450,6 +1450,7 @@ async def ingest_polygon_events():
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
     ingest_task = asyncio.create_task(ingest_polygon_events())
+    nasdaq_halt_task = asyncio.create_task(nasdaq_halt_alert_loop())
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())
@@ -1460,10 +1461,12 @@ async def main():
         print("Main loop cancelled.")
     finally:
         ingest_task.cancel()
+        nasdaq_halt_task.cancel()
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         catalyst_news_task.cancel()
         await ingest_task
+        await nasdaq_halt_task
         await close_alert_task
         await premarket_alert_task
         await catalyst_news_task
