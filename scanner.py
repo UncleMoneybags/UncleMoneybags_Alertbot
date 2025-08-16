@@ -587,18 +587,25 @@ async def nasdaq_halt_alert_loop():
                         yf_price = yf.Ticker(symbol).info.get('regularMarketPrice', None)
                         price = yf_price
                     except Exception:
+                price = last_trade_price.get(symbol)
+                if price is None:
+                    try:
+                        import yfinance as yf
+                        yf_price = yf.Ticker(symbol).info.get('regularMarketPrice', None)
+                        price = yf_price
+                    except Exception:
                         price = None
-if price is None or price > 20:
-    return  # Do not alert if price is above $20
-msg = (
-    f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
-    f"Reason: {escape_html(str(reason))}\n"
-    f"Last Price: ${price:.2f}\n"
-    f"Halt Time: {halt_time}"
-)
+                if price is None or price > 20:
+                    continue  # Do not alert if price is above $20
+                msg = (
+                    f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
+                    f"Reason: {escape_html(str(reason))}\n"
+                    f"Last Price: ${price:.2f}\n"
+                    f"Halt Time: {halt_time}"
+                )
                 await send_all_alerts(msg)
                 log_event("halt", symbol, price, 0, datetime.now(timezone.utc), {"reason": reason, "float": float_shares, "status": status, "source": "nasdaq_rss"})
-                seen_halts.add(key)
+                seen_halts.add(key)            
         await asyncio.sleep(CHECK_HALT_INTERVAL)
 # ===================== END PATCH =====================
 
@@ -1313,7 +1320,7 @@ async def handle_halt_event(event):
     # Price filter: $20 and under
     price = last_trade_price.get(symbol, 0)
     if price is None or price > 20:
-    return  # Do not alert if price is above $20
+       return  # Do not alert if price is above $20
     msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED\nReason: {escape_html(reason)}\nLast Price: ${price:.2f}"
     await send_all_alerts(msg)
     event_time = datetime.now(timezone.utc)
