@@ -588,14 +588,14 @@ async def nasdaq_halt_alert_loop():
                         price = yf_price
                     except Exception:
                         price = None
-                if price is None or price > 20:
-                    continue
-                msg = (
-                    f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
-                    f"Reason: {escape_html(str(reason))}\n"
-                    f"Last Price: ${price:.2f}\n"
-                    f"Halt Time: {halt_time}"
-                )
+if price is None or price > 20:
+    return  # Do not alert if price is above $20
+msg = (
+    f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
+    f"Reason: {escape_html(str(reason))}\n"
+    f"Last Price: ${price:.2f}\n"
+    f"Halt Time: {halt_time}"
+)
                 await send_all_alerts(msg)
                 log_event("halt", symbol, price, 0, datetime.now(timezone.utc), {"reason": reason, "float": float_shares, "status": status, "source": "nasdaq_rss"})
                 seen_halts.add(key)
