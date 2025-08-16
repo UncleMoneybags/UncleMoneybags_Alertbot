@@ -1275,6 +1275,9 @@ async def premarket_gainers_alert_loop():
         else:
             sent_today = False
         await asyncio.sleep(1)
+        
+import pytz
+from datetime import datetime, timezone, time as dt_time
 
 async def market_close_alert_loop():
     eastern = pytz.timezone("America/New_York")
