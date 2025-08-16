@@ -707,6 +707,28 @@ async def ingest_polygon_events():
             print(f"Websocket error: {e} — reconnecting in 10 seconds...")
             await asyncio.sleep(10)
 
+async def market_close_alert_loop():
+    eastern = pytz.timezone("America/New_York")
+    sent_today = False
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        now_est = now_utc.astimezone(eastern)
+        # Only Monday through Thursday
+        if now_est.weekday() in (0, 1, 2, 3):
+            # After 8:01pm Eastern and not yet sent
+            if now_est.time() >= dt_time(20, 1) and not sent_today:
+                await send_all_alerts("Market Closed. Reconvene in pre market tomorrow.")
+                event_time = datetime.now(timezone.utc)
+                log_event("market_close", "CLOSE", 0, 0, event_time)
+                sent_today = True
+                reset_symbol_state()
+        else:
+            sent_today = False
+        # Reset sent_today if before 8pm
+        if now_est.time() < dt_time(20, 0):
+            sent_today = False
+        await asyncio.sleep(30)
+
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
     ingest_task = asyncio.create_task(ingest_polygon_events())
@@ -1276,30 +1298,6 @@ async def premarket_gainers_alert_loop():
             sent_today = False
         await asyncio.sleep(1)
 
-from datetime import datetime, time as dt_time, timezone
-import pytz
-
-async def market_close_alert_loop():
-    eastern = pytz.timezone("America/New_York")
-    sent_today = False
-    while True:
-        now_utc = datetime.now(timezone.utc)
-        now_est = now_utc.astimezone(eastern)
-        # Only Monday through Thursday
-        if now_est.weekday() in (0, 1, 2, 3):
-            # After 8:01pm Eastern and not yet sent
-            if now_est.time() >= dt_time(20, 1) and not sent_today:
-                await send_all_alerts("Market Closed. Reconvene in pre market tomorrow.")
-                event_time = datetime.now(timezone.utc)
-                log_event("market_close", "CLOSE", 0, 0, event_time)
-                sent_today = True
-                reset_symbol_state()
-        else:
-            sent_today = False
-        # Reset sent_today if before 8pm
-        if now_est.time() < dt_time(20, 0):
-            sent_today = False
-        await asyncio.sleep(30)
 # PATCHED: HALT/RESUME ALERTS with float/price filter
 async def handle_halt_event(event):
     symbol = event.get("sym")
