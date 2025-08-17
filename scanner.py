@@ -7,6 +7,7 @@ import html
 import re
 from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta, date, time as dt_time
+from email.utils import parsedate_to_datetime
 import pytz
 import signal
 import pickle
@@ -1058,7 +1059,7 @@ async def nasdaq_halt_scraper_loop():
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
 
-            now = datetime.now(eastern)
+           now = datetime.now(eastern)
 
             for item in items:
                 title_tag = item.find("title")
