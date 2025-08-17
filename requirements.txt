@@ -6,3 +6,6 @@ numpy
 pandas
 scikit-learn
 yfinance
+lxml
+beautifulsoup4
+requests
