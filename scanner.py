@@ -1052,16 +1052,49 @@ async def nasdaq_halt_scraper_loop():
                     rss = await resp.text()
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
-            for item in items:
-                # Defensive: check for missing tags
-                title_tag = item.find("title")
-                pubdate_tag = item.find("pubDate")
-                desc_tag = item.find("description")
+            
+import datetime
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo  # Python 3.9+
 
-                if not title_tag or not pubdate_tag or not desc_tag:
-                    logger.warning(f"[NASDAQ HALT SCRAPER] Skipping item due to missing tag: {item}")
-                    continue
+MARKET_OPEN = datetime.time(9, 30)
+MARKET_CLOSE = datetime.time(16, 0)
+eastern = ZoneInfo("America/New_York")
+now = datetime.datetime.now(eastern)  # Current time in US/Eastern
 
+for item in items:
+    title_tag = item.find("title")
+    pubdate_tag = item.find("pubDate") or item.find("pubdate")
+    desc_tag = item.find("description")
+
+    missing = []
+    if not title_tag:
+        missing.append("title")
+    if not pubdate_tag:
+        missing.append("pubDate")
+    if not desc_tag:
+        missing.append("description")
+    if missing:
+        logger.warning(f"[NASDAQ HALT SCRAPER] Skipping item due to missing {', '.join(missing)} tag(s): {item}")
+        continue
+
+    try:
+        # Parse pubDate with timezone info
+        pub_dt = parsedate_to_datetime(pubdate_tag.text.strip())
+        # Convert to US/Eastern
+        pub_dt_eastern = pub_dt.astimezone(eastern)
+    except Exception as e:
+        logger.warning(f"Could not parse or convert pubDate: {pubdate_tag.text} ({e})")
+        continue
+
+    # Compare only date and time in Eastern Time
+    if pub_dt_eastern.date() == now.date() and MARKET_OPEN <= pub_dt_eastern.time() <= MARKET_CLOSE:
+        # ...process the halt
+        pass
+    else:
+        continue  # skip if not during market hours (Eastern)         
+
+    # ...process as normal
                 symbol = title_tag.text.strip()
                 halt_time = pubdate_tag.text.strip()
                 reason = desc_tag.text.strip()
