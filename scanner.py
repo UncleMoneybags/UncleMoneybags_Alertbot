@@ -1053,9 +1053,18 @@ async def nasdaq_halt_scraper_loop():
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
             for item in items:
-                symbol = item.find("title").text.strip()
-                halt_time = item.find("pubDate").text.strip()
-                reason = item.find("description").text.strip()
+                # Defensive: check for missing tags
+                title_tag = item.find("title")
+                pubdate_tag = item.find("pubDate")
+                desc_tag = item.find("description")
+
+                if not title_tag or not pubdate_tag or not desc_tag:
+                    logger.warning(f"[NASDAQ HALT SCRAPER] Skipping item due to missing tag: {item}")
+                    continue
+
+                symbol = title_tag.text.strip()
+                halt_time = pubdate_tag.text.strip()
+                reason = desc_tag.text.strip()
                 uid = f"{symbol}|{halt_time}"
 
                 if uid in seen_halts:
@@ -1085,7 +1094,6 @@ async def nasdaq_halt_scraper_loop():
             logger.error(f"[NASDAQ HALT SCRAPER] Error: {e}")
 
         await asyncio.sleep(60)  # Check every 60 sec
-
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
