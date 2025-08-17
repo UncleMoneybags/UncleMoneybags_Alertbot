@@ -1041,6 +1041,51 @@ async def catalyst_news_alert_loop():
                         save_news_id(news_id)
         await asyncio.sleep(60)
 
+async def nasdaq_halt_scraper_loop():
+    NASDAQ_HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+    seen_halts = set()  # Prevent duplicate alerts per session
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(NASDAQ_HALTS_URL) as resp:
+                    rss = await resp.text()
+            soup = BeautifulSoup(rss, "xml")
+            items = soup.find_all("item")
+            for item in items:
+                symbol = item.find("title").text.strip()
+                halt_time = item.find("pubDate").text.strip()
+                reason = item.find("description").text.strip()
+                uid = f"{symbol}|{halt_time}"
+
+                if uid in seen_halts:
+                    continue
+
+                # Float filter
+                float_val = get_float_shares(symbol)
+                if float_val is None or float_val > 10_000_000:
+                    continue
+
+                # Price filter
+                price = last_trade_price[symbol]
+                if price is None or price > 20:
+                    continue
+
+                # Alert!
+                msg = (
+                    f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
+                    f"Reason: {escape_html(reason)}\n"
+                    f"Float: {float_val/1e6:.2f}M | Price: ${price:.2f}"
+                )
+                await send_all_alerts(msg)
+                logger.info(f"NASDAQ HALT ALERT: {symbol} | {reason} | Float: {float_val} | Price: {price}")
+
+                seen_halts.add(uid)
+        except Exception as e:
+            logger.error(f"[NASDAQ HALT SCRAPER] Error: {e}")
+
+        await asyncio.sleep(60)  # Check every 60 sec
+
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
@@ -1243,6 +1288,7 @@ async def main():
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())
+    nasdaq_halt_task = asyncio.create_task(nasdaq_halt_scraper_loop())
     try:
         while True:
             await asyncio.sleep(60)
@@ -1253,10 +1299,13 @@ async def main():
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         catalyst_news_task.cancel()
+        nasdaq_halt_task.cancel() 
+        
         await ingest_task
         await close_alert_task
         await premarket_alert_task
         await catalyst_news_task
+        await nasdaq_halt_task
 
 if __name__ == "__main__":
     try:
