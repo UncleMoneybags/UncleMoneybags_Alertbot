@@ -1053,13 +1053,12 @@ async def nasdaq_halt_scraper_loop():
 
     while True:
         try:
+            now = datetime.now(eastern)
             async with aiohttp.ClientSession() as session:
                 async with session.get(NASDAQ_HALTS_URL) as resp:
                     rss = await resp.text()
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
-
-           now = datetime.now(eastern)
 
             for item in items:
                 title_tag = item.find("title")
