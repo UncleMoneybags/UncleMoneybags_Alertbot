@@ -1058,7 +1058,7 @@ async def nasdaq_halt_scraper_loop():
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
 
-            now = datetime.datetime.now(eastern)
+            now = datetime.now(eastern)
 
             for item in items:
                 title_tag = item.find("title")
