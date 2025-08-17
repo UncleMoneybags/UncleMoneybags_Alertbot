@@ -21,12 +21,15 @@ from bs4 import BeautifulSoup
 import pandas as pd  
 import time
 
-# --- PATCH: Track the latest real trade price and size for each symbol ---
+MARKET_OPEN = dt_time(4, 0)
+MARKET_CLOSE = dt_time(20, 0)
+eastern = pytz.timezone("America/New_York")  
+logger = logging.getLogger(__name__)
+
 last_trade_price = defaultdict(lambda: None)
 last_trade_volume = defaultdict(lambda: 0)
 last_trade_time = defaultdict(lambda: None)
 
-# --- PATCH: FLOAT CACHE patch with negative result retry cooldown and proper persistence ---
 float_cache = {}
 float_cache_none_retry = {}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
@@ -1043,7 +1046,9 @@ async def catalyst_news_alert_loop():
 
 async def nasdaq_halt_scraper_loop():
     NASDAQ_HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
-    seen_halts = set()  # Prevent duplicate alerts per session
+    seen_halts = set()
+    halted_symbols = set()
+    first_run = True
 
     while True:
         try:
@@ -1052,81 +1057,65 @@ async def nasdaq_halt_scraper_loop():
                     rss = await resp.text()
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
-            
-import datetime
-from email.utils import parsedate_to_datetime
-from zoneinfo import ZoneInfo  # Python 3.9+
 
-MARKET_OPEN = datetime.time(9, 30)
-MARKET_CLOSE = datetime.time(16, 0)
-eastern = ZoneInfo("America/New_York")
-now = datetime.datetime.now(eastern)  # Current time in US/Eastern
+            now = datetime.datetime.now(eastern)
 
-for item in items:
-    title_tag = item.find("title")
-    pubdate_tag = item.find("pubDate") or item.find("pubdate")
-    desc_tag = item.find("description")
+            for item in items:
+                title_tag = item.find("title")
+                pubdate_tag = item.find("pubDate") or item.find("pubdate")
+                desc_tag = item.find("description")
 
-    missing = []
-    if not title_tag:
-        missing.append("title")
-    if not pubdate_tag:
-        missing.append("pubDate")
-    if not desc_tag:
-        missing.append("description")
-    if missing:
-        logger.warning(f"[NASDAQ HALT SCRAPER] Skipping item due to missing {', '.join(missing)} tag(s): {item}")
-        continue
-
-    try:
-        # Parse pubDate with timezone info
-        pub_dt = parsedate_to_datetime(pubdate_tag.text.strip())
-        # Convert to US/Eastern
-        pub_dt_eastern = pub_dt.astimezone(eastern)
-    except Exception as e:
-        logger.warning(f"Could not parse or convert pubDate: {pubdate_tag.text} ({e})")
-        continue
-
-    # Compare only date and time in Eastern Time
-    if pub_dt_eastern.date() == now.date() and MARKET_OPEN <= pub_dt_eastern.time() <= MARKET_CLOSE:
-        # ...process the halt
-        pass
-    else:
-        continue  # skip if not during market hours (Eastern)         
-
-    # ...process as normal
-                symbol = title_tag.text.strip()
-                halt_time = pubdate_tag.text.strip()
-                reason = desc_tag.text.strip()
-                uid = f"{symbol}|{halt_time}"
-
-                if uid in seen_halts:
+                missing = []
+                if not title_tag:
+                    missing.append("title")
+                if not pubdate_tag:
+                    missing.append("pubDate")
+                if not desc_tag:
+                    missing.append("description")
+                if missing:
+                    logger.warning(f"[NASDAQ HALT SCRAPER] Skipping item due to missing {', '.join(missing)} tag(s): {item}")
                     continue
 
-                # Float filter
-                float_val = get_float_shares(symbol)
-                if float_val is None or float_val > 10_000_000:
+                try:
+                    pub_dt = parsedate_to_datetime(pubdate_tag.text.strip())
+                    pub_dt_eastern = pub_dt.astimezone(eastern)
+                except Exception as e:
+                    logger.warning(f"Could not parse or convert pubDate: {pubdate_tag.text} ({e})")
                     continue
 
-                # Price filter
-                price = last_trade_price[symbol]
-                if price is None or price > 20:
-                    continue
+                # Only today's halts during market hours
+                if pub_dt_eastern.date() == now.date() and MARKET_OPEN <= pub_dt_eastern.time() <= MARKET_CLOSE:
+                    symbol = title_tag.text.strip()
+                    halt_time = pubdate_tag.text.strip()
+                    reason = desc_tag.text.strip()
+                    uid = f"{symbol}|{halt_time}"
 
-                # Alert!
-                msg = (
-                    f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\n"
-                    f"Reason: {escape_html(reason)}\n"
-                    f"Float: {float_val/1e6:.2f}M | Price: ${price:.2f}"
-                )
-                await send_all_alerts(msg)
-                logger.info(f"NASDAQ HALT ALERT: {symbol} | {reason} | Float: {float_val} | Price: {price}")
+                    if first_run:
+                        # Don't alert on old items at startup, just record them
+                        seen_halts.add(uid)
+                        if reason.lower().startswith("halt"):
+                            halted_symbols.add(symbol)
+                        continue
 
-                seen_halts.add(uid)
-        except Exception as e:
-            logger.error(f"[NASDAQ HALT SCRAPER] Error: {e}")
+                    if uid in seen_halts:
+                        continue  # skip duplicates
 
-        await asyncio.sleep(60)  # Check every 60 sec
+                    seen_halts.add(uid)
+                    if reason.lower().startswith("halt"):
+                        print(f"🛑 {symbol} HALTED: {reason}")
+                        halted_symbols.add(symbol)
+                        # TODO: call your alert/log functions here
+                    elif reason.lower().startswith("resume") and symbol in halted_symbols:
+                        print(f"🟢 {symbol} RESUMED: {reason}")
+                        halted_symbols.remove(symbol)
+                        # TODO: call your alert/log functions here
+
+            first_run = False
+
+        except Exception as main_e:
+            logger.error(f"Error in main loop: {main_e}")
+        await asyncio.sleep(5)
+        
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
