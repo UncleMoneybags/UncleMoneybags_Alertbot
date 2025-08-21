@@ -1060,6 +1060,10 @@ async def nasdaq_halt_scraper_loop():
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
 
+async def main():
+    while True:
+        try:
+            # Fetch or define 'items' here, e.g. items = get_nasdaq_halt_feed()
             for item in items:
                 title_tag = item.find("title")
                 pubdate_tag = item.find("pubDate") or item.find("pubdate")
@@ -1101,21 +1105,37 @@ async def nasdaq_halt_scraper_loop():
                         continue  # skip duplicates
 
                     seen_halts.add(uid)
+
+                    # ---- BEGIN FILTERS PATCH ----
+                    float_shares = get_float_shares(symbol)
+                    if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
+                        logger.info(f"[HALT DEBUG] Skipping {symbol}: float {float_shares} not in allowed range.")
+                        continue
+                    price = last_trade_price.get(symbol, None)
+                    if price is None or not (0.10 <= price <= 20.00):
+                        logger.info(f"[HALT DEBUG] Skipping {symbol}: price {price} not in $0.10-$20.00 range or unknown.")
+                        continue
+                    # ---- END FILTERS PATCH ----
+
                     if reason.lower().startswith("halt"):
                         print(f"🛑 {symbol} HALTED: {reason}")
                         halted_symbols.add(symbol)
-                        # TODO: call your alert/log functions here
+                        msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\nReason: {escape_html(reason)}"
+                        await send_all_alerts(msg)
+                        event_time = datetime.now(timezone.utc)
+                        log_event("halt", symbol, price, 0, event_time, {"source": "nasdaq_scraper", "reason": reason})
                     elif reason.lower().startswith("resume") and symbol in halted_symbols:
                         print(f"🟢 {symbol} RESUMED: {reason}")
                         halted_symbols.remove(symbol)
-                        # TODO: call your alert/log functions here
-
-            first_run = False
+                        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED (NASDAQ)\nReason: {escape_html(reason)}"
+                        await send_all_alerts(msg)
+                        event_time = datetime.now(timezone.utc)
+                        log_event("resume", symbol, price, 0, event_time, {"source": "nasdaq_scraper", "reason": reason})
 
         except Exception as main_e:
             logger.error(f"Error in main loop: {main_e}")
         await asyncio.sleep(5)
-        
+
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
