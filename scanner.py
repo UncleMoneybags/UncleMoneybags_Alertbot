@@ -1357,6 +1357,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(nasdaq_halt_scraper_loop())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("Shutting down gracefully...")
