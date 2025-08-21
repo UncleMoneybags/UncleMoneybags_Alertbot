@@ -1060,15 +1060,11 @@ async def nasdaq_halt_scraper_loop():
             soup = BeautifulSoup(rss, "lxml")
             items = soup.find_all("item")
 
-async def main():
-    while True:
-        try:
-            # Fetch or define 'items' here, e.g. items = get_nasdaq_halt_feed()
             for item in items:
                 title_tag = item.find("title")
                 pubdate_tag = item.find("pubDate") or item.find("pubdate")
                 desc_tag = item.find("description")
-
+              
                 missing = []
                 if not title_tag:
                     missing.append("title")
@@ -1131,6 +1127,8 @@ async def main():
                         await send_all_alerts(msg)
                         event_time = datetime.now(timezone.utc)
                         log_event("resume", symbol, price, 0, event_time, {"source": "nasdaq_scraper", "reason": reason})
+            if first_run:
+                first_run = False
 
         except Exception as main_e:
             logger.error(f"Error in main loop: {main_e}")
@@ -1359,6 +1357,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(nasdaq_halt_scraper_loop())
     except KeyboardInterrupt:
         print("Shutting down gracefully...")
