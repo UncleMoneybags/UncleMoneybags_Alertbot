@@ -334,17 +334,246 @@ rvol_history = defaultdict(lambda: deque(maxlen=20))
 RVOL_MIN = 2.0
 
 EVENT_LOG_FILE = "event_log.csv"
+OUTCOME_LOG_FILE = "outcome_log.csv"
+
+# --- AUTO ML TRAINING SYSTEM ---
+recent_alerts = {}  # symbol -> alert_time
+alert_prices = {}   # symbol -> entry_price
+alert_types = {}    # symbol -> alert_type
+market_context_cache = {}  # Cache market data
+
+def get_market_context():
+    """Collect broader market data for ML training"""
+    now = datetime.now(timezone.utc)
+    
+    # Cache market data for 1 minute to avoid excessive API calls
+    if 'last_update' in market_context_cache:
+        if (now - market_context_cache['last_update']).total_seconds() < 60:
+            return market_context_cache['data']
+    
+    try:
+        # Get market metrics (simplified version - expand as needed)
+        ny_time = now.astimezone(pytz.timezone("America/New_York"))
+        market_open = dt_time(9, 30)
+        
+        if ny_time.time() >= market_open:
+            minutes_since_open = (ny_time.hour - 9) * 60 + (ny_time.minute - 30)
+        else:
+            minutes_since_open = 0
+            
+        context = {
+            "minutes_since_open": minutes_since_open,
+            "day_of_week": ny_time.weekday(),
+            "hour_of_day": ny_time.hour,
+            "is_power_hour": 15 <= ny_time.hour < 16,
+            "is_opening_hour": 9 <= ny_time.hour < 11,
+            "total_symbols_tracked": len(candles),
+            "active_alerts_count": len(recent_alerts)
+        }
+        
+        # Cache the result
+        market_context_cache['data'] = context
+        market_context_cache['last_update'] = now
+        
+        return context
+        
+    except Exception as e:
+        logger.warning(f"Error getting market context: {e}")
+        return {
+            "minutes_since_open": 0,
+            "day_of_week": 0,
+            "hour_of_day": 12,
+            "is_power_hour": False,
+            "is_opening_hour": False,
+            "total_symbols_tracked": 0,
+            "active_alerts_count": 0
+        }
+
+def track_alert_for_outcome(symbol, alert_type, price):
+    """Track new alert for outcome monitoring"""
+    now = datetime.now(timezone.utc)
+    recent_alerts[symbol] = now
+    alert_prices[symbol] = price
+    alert_types[symbol] = alert_type
+    logger.info(f"[OUTCOME TRACKING] Started tracking {symbol} {alert_type} at ${price:.2f}")
+
+def auto_label_success(symbol, entry_price, current_price, minutes_elapsed):
+    """Automatically determine if alert was profitable"""
+    if entry_price <= 0:
+        return {"return_pct": 0, "is_successful": False, "quality_score": 0}
+        
+    return_pct = (current_price - entry_price) / entry_price
+    
+    # Different success thresholds based on timeframe
+    if minutes_elapsed <= 5:
+        success_threshold = 0.015  # 1.5% in 5 minutes
+    elif minutes_elapsed <= 15:
+        success_threshold = 0.025  # 2.5% in 15 minutes
+    elif minutes_elapsed <= 30:
+        success_threshold = 0.035  # 3.5% in 30 minutes
+    else:
+        success_threshold = 0.05   # 5% in 1 hour+
+    
+    is_successful = return_pct >= success_threshold
+    quality_score = min(max(return_pct * 100, 0), 100)  # 0-100 scale
+    
+    return {
+        "return_pct": return_pct,
+        "is_successful": is_successful,
+        "quality_score": quality_score,
+        "success_threshold": success_threshold
+    }
+
+async def check_alert_outcomes():
+    """Check outcomes of recent alerts and log results"""
+    now = datetime.now(timezone.utc)
+    completed_alerts = []
+    
+    for symbol, alert_time in recent_alerts.items():
+        minutes_elapsed = (now - alert_time).total_seconds() / 60
+        
+        # Check outcomes at 5, 15, 30, and 60 minute marks
+        check_times = [5, 15, 30, 60]
+        for check_minutes in check_times:
+            if minutes_elapsed >= check_minutes and symbol in alert_prices:
+                current_price = last_trade_price.get(symbol)
+                if current_price:
+                    entry_price = alert_prices[symbol]
+                    alert_type = alert_types.get(symbol, "unknown")
+                    
+                    outcome = auto_label_success(symbol, entry_price, current_price, check_minutes)
+                    
+                    # Log the outcome
+                    log_outcome(symbol, alert_type, entry_price, current_price, 
+                               alert_time, check_minutes, outcome)
+                    
+                    logger.info(f"[OUTCOME] {symbol} {alert_type} @ {check_minutes}min: "
+                              f"{outcome['return_pct']*100:.1f}% {'SUCCESS' if outcome['is_successful'] else 'FAIL'}")
+        
+        # Remove alerts older than 2 hours
+        if minutes_elapsed > 120:
+            completed_alerts.append(symbol)
+    
+    # Clean up completed alerts
+    for symbol in completed_alerts:
+        recent_alerts.pop(symbol, None)
+        alert_prices.pop(symbol, None)
+        alert_types.pop(symbol, None)
+
+def log_outcome(symbol, alert_type, entry_price, current_price, alert_time, minutes_elapsed, outcome):
+    """Log alert outcome for ML training"""
+    row = {
+        "symbol": symbol,
+        "alert_type": alert_type,
+        "entry_price": entry_price,
+        "current_price": current_price,
+        "alert_time_utc": alert_time.isoformat(),
+        "check_time_utc": datetime.now(timezone.utc).isoformat(),
+        "minutes_elapsed": minutes_elapsed,
+        **outcome,
+        **get_market_context()
+    }
+    
+    header = list(row.keys())
+    write_header = not os.path.exists(OUTCOME_LOG_FILE) or os.path.getsize(OUTCOME_LOG_FILE) == 0
+    
+    with open(OUTCOME_LOG_FILE, "a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=header)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+async def retrain_model_if_needed():
+    """Retrain ML model with new outcome data"""
+    try:
+        if not os.path.exists(OUTCOME_LOG_FILE):
+            return
+            
+        # Check if we have enough new data
+        outcome_df = pd.read_csv(OUTCOME_LOG_FILE)
+        if len(outcome_df) < 50:  # Need at least 50 outcomes
+            return
+            
+        # Load event log
+        if not os.path.exists(EVENT_LOG_FILE):
+            return
+            
+        event_df = pd.read_csv(EVENT_LOG_FILE)
+        
+        # Merge event and outcome data
+        merged_df = pd.merge(event_df, outcome_df, 
+                           left_on=['symbol', 'event_type'], 
+                           right_on=['symbol', 'alert_type'], 
+                           how='inner')
+        
+        if len(merged_df) < 30:
+            return
+            
+        # Prepare features for training
+        feature_columns = ['price', 'volume', 'rvol', 'minutes_since_open', 
+                          'day_of_week', 'is_power_hour', 'is_opening_hour']
+        
+        # Fill missing features with defaults
+        for col in feature_columns:
+            if col not in merged_df.columns:
+                if col == 'rvol':
+                    merged_df[col] = 2.0
+                elif col in ['minutes_since_open', 'day_of_week']:
+                    merged_df[col] = 0
+                else:
+                    merged_df[col] = False
+        
+        X = merged_df[feature_columns].fillna(0)
+        y = merged_df['is_successful'].astype(int)
+        
+        if len(X) >= 30 and y.sum() > 5:  # At least 30 samples and 5 successes
+            from sklearn.ensemble import RandomForestClassifier
+            
+            # Train new model
+            new_model = RandomForestClassifier(n_estimators=100, random_state=42)
+            new_model.fit(X, y)
+            
+            # Save updated model
+            joblib.dump(new_model, "runner_model_updated.joblib")
+            
+            # Update global model
+            global runner_clf
+            runner_clf = new_model
+            
+            logger.info(f"[ML UPDATE] Model retrained with {len(X)} samples, "
+                       f"{y.sum()} successes ({y.mean()*100:.1f}% success rate)")
+            
+            # Archive old outcome data to prevent memory issues
+            if len(outcome_df) > 1000:
+                archive_file = f"outcome_archive_{datetime.now().strftime('%Y%m%d')}.csv"
+                outcome_df.iloc[:-200].to_csv(archive_file, index=False)
+                outcome_df.iloc[-200:].to_csv(OUTCOME_LOG_FILE, index=False)
+                logger.info(f"[ML UPDATE] Archived old outcomes to {archive_file}")
+                
+    except Exception as e:
+        logger.error(f"[ML UPDATE] Error retraining model: {e}")
 
 def log_event(event_type, symbol, price, volume, event_time, extra_features=None):
     extra_features = extra_features or {}
+    
+    # Auto-add market context to all events
+    market_context = get_market_context()
+    
     row = {
         "event_type": event_type,
         "symbol": symbol,
         "price": price,
         "volume": volume,
         "event_time_utc": event_time.isoformat(),
-        **extra_features
+        **extra_features,
+        **market_context  # AUTO-ADD market context
     }
+    
+    # Track alerts for outcome monitoring
+    alert_types_list = ["perfect_setup", "runner", "volume_spike", "ema_stack", "warming_up", "dip_play"]
+    if event_type in alert_types_list:
+        track_alert_for_outcome(symbol, event_type, price)
+    
     header = list(row.keys())
     write_header = not os.path.exists(EVENT_LOG_FILE) or os.path.getsize(EVENT_LOG_FILE) == 0
     with open(EVENT_LOG_FILE, "a", newline="") as csvfile:
@@ -768,7 +997,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
         alert_data = {
             'rvol': rvol,
             'volume': last_volume,
-            'price_move': (last_close - opens[-1]) / opens[-1] if opens[-1] > 0 else 0
+            'price_move': (last_close - candles_seq[-1]['open']) / candles_seq[-1]['open'] if candles_seq[-1]['open'] > 0 else 0
         }
         score = get_alert_score("perfect_setup", symbol, alert_data)
         
@@ -922,7 +1151,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
-        logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
+        logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas['ema5']}, EMA8={emas['ema8']}, EMA13={emas['ema13']}")
         if warming_up_criteria and not warming_up_was_true[symbol]:
             if last_trade_volume[symbol] < 250:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
@@ -1123,7 +1352,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
         # Use stored EMAs 
         emas = get_stored_emas(symbol, [5, 8, 13])
-        logger.info(f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas['ema5'][-1]}, EMA8={emas['ema8'][-1]}, EMA13={emas['ema13'][-1]}")
+        logger.info(f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas['ema5']}, EMA8={emas['ema8']}, EMA13={emas['ema13']}")
         if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
@@ -1656,6 +1885,23 @@ async def ingest_polygon_events():
             print(f"Websocket error: {e} — reconnecting in 10 seconds...")
             await asyncio.sleep(10)
 
+async def ml_training_loop():
+    """Background task for ML training and outcome tracking"""
+    while True:
+        try:
+            # Check alert outcomes every 5 minutes
+            await check_alert_outcomes()
+            
+            # Retrain model once per day at market close
+            ny_time = datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
+            if ny_time.hour == 20 and ny_time.minute < 5:  # 8:00-8:05 PM ET
+                await retrain_model_if_needed()
+                
+        except Exception as e:
+            logger.error(f"[ML TRAINING] Error in ML training loop: {e}")
+            
+        await asyncio.sleep(300)  # 5 minutes
+
 async def main():
     print("Main event loop running. Press Ctrl+C to exit.")
     ingest_task = asyncio.create_task(ingest_polygon_events())
@@ -1663,6 +1909,7 @@ async def main():
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())
     nasdaq_halt_task = asyncio.create_task(nasdaq_halt_scraper_loop())
+    ml_training_task = asyncio.create_task(ml_training_loop())  # NEW: ML training
     try:
         while True:
             await asyncio.sleep(60)
@@ -1673,13 +1920,15 @@ async def main():
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         catalyst_news_task.cancel()
-        nasdaq_halt_task.cancel() 
+        nasdaq_halt_task.cancel()
+        ml_training_task.cancel()  # NEW: Cancel ML training task
         
         await ingest_task
         await close_alert_task
         await premarket_alert_task
         await catalyst_news_task
         await nasdaq_halt_task
+        await ml_training_task  # NEW: Await ML training task
 
 if __name__ == "__main__":
     try:
