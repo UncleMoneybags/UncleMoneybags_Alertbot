@@ -303,7 +303,7 @@ except ImportError:
 logger.info("scanner.py is running!!! --- If you see this, your file is found and started.")
 logger.info("Imports completed successfully.")
 
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY","VmF1boger0pp2M7gV5HboHheRbplmLi5") 
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY","e0m1UiAaR4426tNCHHkDYflvpG1Qd3XN") 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","8019146040:AAGwaTuYBj8n7iNpnGF8m4wn9KpdZA0kbfA") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","-1002266463234") 
 
@@ -613,247 +613,255 @@ def is_market_scan_time():
     ny = pytz.timezone("America/New_York")
     now_utc = datetime.now(timezone.utc)
     now_ny = now_utc.astimezone(ny)
+    market_start = dt_time(4, 0)
+    market_end = dt_time(20, 0)
+    is_weekday = now_ny.weekday() < 5
+    return is_weekday and market_start <= now_ny.time() <= market_end
+
+def get_ny_date():
+    ny = pytz.timezone("America/New_York")
+    now_utc = datetime.now(timezone.utc)
+    now_ny = now_utc.astimezone(ny)
+    return now_ny.date()
+
+# Price freshness optimization: 5 seconds for real-time alerts
+PRICE_FRESHNESS_SECONDS = 5
+
+def get_display_price(symbol, fallback_price):
+    now = datetime.now(timezone.utc)
+    trade_time = last_trade_time.get(symbol)
     
-    # Skip weekends
-    if now_ny.weekday() >= 5:  # Saturday = 5, Sunday = 6
-        return False
+    # If we have a very recent trade (within 5 seconds), use that price
+    if trade_time and (now - trade_time).total_seconds() <= PRICE_FRESHNESS_SECONDS:
+        return last_trade_price[symbol]
     
-    current_time = now_ny.time()
-    return MARKET_OPEN <= current_time <= MARKET_CLOSE
+    # Otherwise use the fallback (candle close)
+    return fallback_price
 
 def escape_html(text):
     return html.escape(str(text))
 
-def get_display_price(symbol, price):
-    if last_trade_price[symbol] is not None:
-        now = datetime.now(timezone.utc)
-        if last_trade_time[symbol] and (now - last_trade_time[symbol]).total_seconds() <= 5:  # Reduced from 60 to 5 seconds for real-time alerts
-            return last_trade_price[symbol]
-    return price
-
-def get_ny_date():
-    return datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York")).date()
-
-def get_session_type(dt):
-    """Return session type: 'premarket', 'regular', or 'afterhours'"""
-    ny = pytz.timezone("America/New_York")
-    dt_ny = dt.astimezone(ny)
-    current_time = dt_ny.time()
-    
-    if dt_time(4, 0) <= current_time < dt_time(9, 30):
-        return "premarket"
-    elif dt_time(9, 30) <= current_time < dt_time(16, 0):
-        return "regular"
-    else:
-        return "afterhours"
-
 async def send_telegram_alert(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
+        payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
-            "parse_mode": "HTML"
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
         }
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=data) as response:
-                if response.status != 200:
-                    logger.error(f"Telegram API error: {response.status}")
-                    logger.error(await response.text())
+            async with session.post(url, json=payload) as resp:
+                resp_text = await resp.text()
+                if resp.status != 200:
+                    logger.error(f"Telegram API error: {resp_text}")
+                else:
+                    logger.info("Telegram alert sent successfully")
     except Exception as e:
-        logger.error(f"Error sending Telegram alert: {e}")
+        logger.error(f"Failed to send Telegram alert: {e}")
 
 async def send_discord_alert(message):
+    if not DISCORD_WEBHOOK_URL:
+        return
     try:
-        # Replace HTML tags with Discord markdown
-        discord_message = message.replace("<b>", "**").replace("</b>", "**")
-        
-        data = {
-            "content": discord_message,
-            "username": "Stock Scanner"
-        }
-        
+        message_clean = re.sub(r'<[^>]+>', '', message)
+        payload = {"content": message_clean}
         async with aiohttp.ClientSession() as session:
-            async with session.post(DISCORD_WEBHOOK_URL, json=data) as response:
-                if response.status not in [200, 204]:
-                    logger.error(f"Discord API error: {response.status}")
-                    logger.error(await response.text())
+            async with session.post(DISCORD_WEBHOOK_URL, json=payload) as resp:
+                if resp.status == 204:
+                    logger.info("Discord alert sent successfully")
+                else:
+                    logger.error(f"Discord webhook error: {resp.status}")
     except Exception as e:
-        logger.error(f"Error sending Discord alert: {e}")
+        logger.error(f"Failed to send Discord alert: {e}")
 
 async def send_all_alerts(message):
-    """Send alert to both Telegram and Discord"""
     await asyncio.gather(
         send_telegram_alert(message),
-        send_discord_alert(message),
-        return_exceptions=True
+        send_discord_alert(message)
     )
 
-def macd(prices, fast=12, slow=26, signal=9):
-    prices = np.asarray(prices, dtype=float)
-    if len(prices) < slow:
-        return None, None, None
-    ema_fast = pd.Series(prices).ewm(span=fast).mean().to_numpy()
-    ema_slow = pd.Series(prices).ewm(span=slow).mean().to_numpy()
-    macd_line = ema_fast - ema_slow
-    signal_line = pd.Series(macd_line).ewm(span=signal).mean().to_numpy()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+# --- PENDING ALERTS SYSTEM WITH SCORING ---
+pending_alerts = defaultdict(list)  # symbol -> [{'type': str, 'score': float, 'message': str}]
+ALERT_COOLDOWN_MINUTES = 2
 
-# --- GLOBAL VARS ---
-candles = defaultdict(lambda: deque(maxlen=50))
-vwap_candles = defaultdict(list)
-alerted_symbols = {}
-warming_up_was_true = defaultdict(bool)
-runner_was_true = defaultdict(bool)
-dip_play_was_true = defaultdict(bool)
-ema_stack_was_true = defaultdict(bool)
-vwap_reclaim_was_true = defaultdict(bool)
-volume_spike_was_true = defaultdict(bool)
-recent_high = defaultdict(float)
-current_session_date = None
-runner_alerted_today = {}
-dip_play_seen = set()
-volume_spike_alerted = set()
-rvol_spike_alerted = set()
-halted_symbols = set()
-
-ALERT_COOLDOWN_MINUTES = 2  # Reduced from 5 to 2 minutes for faster day trading alerts
-last_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
-
-# --- ALERT PRIORITIZATION SYSTEM ---
-ALERT_PRIORITIES = {
-    'perfect_setup': 5,
-    'runner': 4,
-    'volume_spike': 3,
-    'ema_stack': 2,
-    'warming_up': 1,
-    'dip_play': 1,
-    'vwap_reclaim': 1
-}
-
-# Store pending alerts by symbol
-pending_alerts = defaultdict(list)  # Store multiple alerts per symbol
-
-async def send_best_alert(symbol):
-    """Send only the highest scoring alert for a symbol"""
-    if symbol == "OCTO":
-        logger.info(f"[🚨 OCTO DEBUG] send_best_alert called, pending alerts: {len(pending_alerts.get(symbol, []))}")
-    
-    if symbol not in pending_alerts or not pending_alerts[symbol]:
-        if symbol == "OCTO":
-            logger.info(f"[🚨 OCTO DEBUG] No pending alerts for {symbol}")
-        return
-    
-    # Find highest scoring alert
-    best_alert = max(pending_alerts[symbol], key=lambda x: x['score'])
-    
-    if symbol == "OCTO":
-        logger.info(f"[🚨 OCTO DEBUG] Best alert: {best_alert['type']} | Score: {best_alert['score']}")
-    
-    # Only send if score is high enough (LOWERED for faster alerts)
-    if best_alert['score'] >= 50:
-        await send_all_alerts(best_alert['message'])
-        logger.info(f"[ALERT SENT] {symbol} | {best_alert['type']} | Score: {best_alert['score']}")
-    else:
-        logger.info(f"[ALERT SKIPPED] {symbol} | Best score: {best_alert['score']} (threshold: 50)")
-    
-    # Clear pending alerts for this symbol
-    pending_alerts[symbol].clear()
-
+# Enhanced scoring with more factors
 def get_alert_score(alert_type, symbol, alert_data):
-    """Calculate alert score based on multiple factors"""
-    base_score = ALERT_PRIORITIES.get(alert_type, 1) * 10
-    
-    # RVOL bonus
-    rvol = alert_data.get('rvol', 1.0)
-    rvol_bonus = min(rvol * 5, 25)  # Max 25 points
-    
-    # Volume bonus  
-    volume = alert_data.get('volume', 0)
-    volume_bonus = min(volume / 10000, 20)  # Max 20 points
-    
-    # Price move bonus
-    price_move = abs(alert_data.get('price_move', 0))
-    move_bonus = min(price_move * 100, 15)  # Max 15 points
-    
-    total_score = base_score + rvol_bonus + volume_bonus + move_bonus
-    
-    # ML bonus if available
-    if runner_clf is not None:
-        try:
-            ml_score = score_event_ml(alert_type, symbol, 
-                                    alert_data.get('price', 1.0),
-                                    volume, rvol, False) * 30  # Max 30 points
-            total_score += ml_score
-        except Exception as e:
-            logger.warning(f"ML scoring error for {symbol}: {e}")
-    
-    return min(total_score, 100)  # Cap at 100
-
-def check_volume_spike(candles_seq, vwap_value):
-    if len(candles_seq) < 6:
-        return False, {}
-    
-    recent_6 = list(candles_seq)[-6:]
-    last_candle = recent_6[-1]
-    prev_5_avg = sum(c['volume'] for c in recent_6[:-1]) / 5
-    
-    rvol = last_candle['volume'] / prev_5_avg if prev_5_avg > 0 else 0
-    price_move = (last_candle['close'] - last_candle['open']) / last_candle['open'] if last_candle['open'] > 0 else 0
-    
-    spike_data = {
-        'volume': last_candle['volume'],
-        'rvol': rvol,
-        'above_vwap': last_candle['close'] > vwap_value,
-        'price_move': price_move
+    """Calculate priority score for alert (higher = better)"""
+    base_scores = {
+        'volume_spike': 80,
+        'runner': 75,
+        'perfect_setup': 90,
+        'ema_stack': 70,
+        'warming_up': 60,
+        'dip_play': 65
     }
     
-    spike_detected = (
-        rvol >= 2.5 and
-        last_candle['volume'] >= 100_000 and
-        last_candle['close'] > vwap_value and
-        price_move >= 0.02
+    score = base_scores.get(alert_type, 50)
+    
+    # Volume factor (more volume = higher score)
+    volume = alert_data.get('volume', 0)
+    if volume > 1_000_000:
+        score += 15
+    elif volume > 500_000:
+        score += 10
+    elif volume > 100_000:
+        score += 5
+    
+    # RVOL factor
+    rvol = alert_data.get('rvol', 1.0)
+    if rvol > 5.0:
+        score += 15
+    elif rvol > 3.0:
+        score += 10
+    elif rvol > 2.0:
+        score += 5
+    
+    # Price movement factor
+    price_move = abs(alert_data.get('price_move', 0))
+    if price_move > 0.10:  # 10%+ move
+        score += 15
+    elif price_move > 0.05:  # 5%+ move
+        score += 10
+    elif price_move > 0.03:  # 3%+ move
+        score += 5
+    
+    # Exception symbols get priority boost
+    if symbol in FLOAT_EXCEPTION_SYMBOLS:
+        score += 10
+    
+    return min(score, 100)  # Cap at 100
+
+async def send_best_alert(symbol):
+    """Send the highest scoring alert for a symbol and clear the queue"""
+    if symbol not in pending_alerts or not pending_alerts[symbol]:
+        return
+    
+    # Find the alert with the highest score
+    best_alert = max(pending_alerts[symbol], key=lambda x: x['score'])
+    
+    # Send the best alert
+    await send_all_alerts(best_alert['message'])
+    
+    # Log which alert was chosen
+    logger.info(f"[BEST ALERT] {symbol} | Sent {best_alert['type']} alert with score {best_alert['score']}")
+    if len(pending_alerts[symbol]) > 1:
+        other_types = [a['type'] for a in pending_alerts[symbol] if a != best_alert]
+        logger.info(f"[BEST ALERT] {symbol} | Skipped lower-priority alerts: {other_types}")
+    
+    # Clear all pending alerts for this symbol
+    pending_alerts[symbol].clear()
+
+# State tracking
+candles = defaultdict(deque)
+vwap_candles = defaultdict(list)
+ema_stack_was_true = defaultdict(bool)
+warming_up_was_true = defaultdict(bool)
+runner_was_true = defaultdict(bool)
+volume_spike_was_true = defaultdict(bool)
+vwap_reclaim_was_true = defaultdict(bool)
+dip_play_was_true = defaultdict(bool)
+alerted_symbols = defaultdict(date)
+runner_alerted_today = defaultdict(date)
+recent_high = defaultdict(float)
+dip_play_seen = set()
+halted_symbols = set()
+last_alert_time = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+current_session_date = None
+
+# Session reset logic - called every minute by the hour 0 logic
+def reset_session_state():
+    global current_session_date
+    today_ny = get_ny_date()
+    
+    if current_session_date != today_ny:
+        logger.info(f"[SESSION RESET] New trading day detected: {today_ny}")
+        
+        # Reset alert state
+        ema_stack_was_true.clear()
+        warming_up_was_true.clear() 
+        runner_was_true.clear()
+        volume_spike_was_true.clear()
+        vwap_reclaim_was_true.clear()
+        dip_play_was_true.clear()
+        alerted_symbols.clear()
+        runner_alerted_today.clear()
+        recent_high.clear()
+        dip_play_seen.clear()
+        halted_symbols.clear()
+        pending_alerts.clear()
+        
+        # Reset stored EMAs for all symbols
+        for symbol in list(stored_emas.keys()):
+            reset_stored_emas(symbol)
+        
+        # Clear candle data
+        candles.clear()
+        vwap_candles.clear()
+        
+        current_session_date = today_ny
+        logger.info(f"[SESSION RESET] All state reset for new session: {today_ny}")
+
+def check_volume_spike(candles_seq, vwap_value, min_candles=3):
+    if len(candles_seq) < min_candles:
+        return False, {}
+    
+    latest = candles_seq[-1]
+    recent = list(candles_seq)[-(min_candles+1):-1]
+    
+    avg_vol = sum(c['volume'] for c in recent) / len(recent)
+    rvol = latest['volume'] / avg_vol if avg_vol > 0 else 0
+    
+    price_move = (latest['close'] - latest['open']) / latest['open'] if latest['open'] > 0 else 0
+    above_vwap = latest['close'] > vwap_value if vwap_value > 0 else True
+    
+    criteria = (
+        rvol >= 2.0 and
+        latest['volume'] >= 100_000 and
+        price_move >= 0.02 and
+        above_vwap
     )
     
-    return spike_detected, spike_data
+    spike_data = {
+        'rvol': rvol,
+        'volume': latest['volume'],
+        'price_move': price_move,
+        'above_vwap': above_vwap
+    }
+    
+    return criteria, spike_data
 
-async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq, vwap_value):
-    if ema_stack_was_true[symbol]:
-        return
-    
+# --- PERFECT SETUP LOGIC ---
+async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles, vwap_value):
     now = datetime.now(timezone.utc)
-    if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-        return
     
-    prices = np.asarray(closes[-30:], dtype=float)
-    
-    # Use stored EMAs instead of calculating from scratch
+    # Use stored EMAs instead of calculating 
     emas = get_stored_emas(symbol, [5, 8, 13])
-    ema5 = emas.get('ema5')
-    ema8 = emas.get('ema8') 
-    ema13 = emas.get('ema13')
+    if not all(emas[f"ema{p}"] is not None for p in [5, 8, 13]):
+        return  # Need all EMAs initialized
+        
+    ema5 = emas['ema5']
+    ema8 = emas['ema8'] 
+    ema13 = emas['ema13']
     
-    # Skip if EMAs not ready
-    if None in [ema5, ema8, ema13]:
-        return
-    
-    rsi_arr = rsi(prices)
-    last_rsi = rsi_arr[-1] if len(rsi_arr) > 0 and not np.isnan(rsi_arr[-1]) else 50
-    macd_line, macd_signal, macd_hist = macd(prices)
-    last_macd_hist = macd_hist[-1] if macd_hist is not None else 0
     last_close = closes[-1]
     last_volume = volumes[-1]
+    last_high = highs[-1]
+    last_low = lows[-1]
+    last_rsi = rsi(closes)[-1] if len(closes) >= 15 else 50
     
-    # Volume-based RVOL calculation
-    recent_vols = volumes[-20:] if len(volumes) >= 20 else volumes
-    avg_vol = sum(recent_vols[:-1]) / len(recent_vols[:-1]) if len(recent_vols) > 1 else 1
-    rvol = last_volume / avg_vol if avg_vol > 0 else 0
+    # MACD calculation 
+    exp1 = pd.Series(closes).ewm(span=12).mean()
+    exp2 = pd.Series(closes).ewm(span=26).mean()
+    macd_line = exp1 - exp2
+    signal_line = macd_line.ewm(span=9).mean()
+    histogram = macd_line - signal_line
+    last_macd_hist = histogram.iloc[-1] if len(histogram) > 0 else 0
     
-    # Bullish engulfing
-    if len(candles_seq) >= 2:
-        prev_candle = candles_seq[-2]
-        curr_candle = candles_seq[-1]
+    # Bullish engulfing pattern
+    if len(candles) >= 2:
+        prev_candle = candles[-2]
+        curr_candle = candles[-1]
         bullish_engulf = (
             prev_candle['close'] < prev_candle['open'] and
             curr_candle['close'] > curr_candle['open'] and
@@ -907,6 +915,9 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
             'score': score,
             'message': alert_text
         })
+        
+        # Send the best alert for this symbol
+        await send_best_alert(symbol)
         
         now = datetime.now(timezone.utc)
         log_event(
@@ -985,6 +996,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # OCTO-specific debug for successful processing
     if symbol == "OCTO":
         logger.info(f"[🚨 OCTO DEBUG] PASSED float filter ({float_shares}), processing candle: {open_}/{high}/{low}/{close}/{volume}")
+    # DEBUG: Show why symbols might be filtered
+    if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"]:
+        logger.info(f"[🔥 FILTER DEBUG] {symbol} | market_scan_time={is_market_scan_time()} | price={close} | price_ok={close <= 20.00}")
+    
     if not is_market_scan_time() or close > 20.00:
         return
     today = datetime.now(timezone.utc).date()
@@ -1093,6 +1108,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 'message': alert_text
             })
             
+            # Send the best alert for this symbol
+            await send_best_alert(symbol)
+            
             warming_up_was_true[symbol] = True
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
@@ -1177,6 +1195,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 'message': alert_text
             })
             
+            # Send the best alert for this symbol
+            await send_best_alert(symbol)
+            
             runner_was_true[symbol] = True
             runner_alerted_today[symbol] = today
             last_alert_time[symbol] = now
@@ -1233,6 +1254,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     'score': score,
                     'message': alert_text
                 })
+                
+                # Send the best alert for this symbol
+                await send_best_alert(symbol)
                 
                 dip_play_was_true[symbol] = True
                 dip_play_seen.add(symbol)
@@ -1335,6 +1359,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             'message': alert_text
         })
         
+        # Send the best alert for this symbol
+        await send_best_alert(symbol)
+        
         event_time = now
         log_event("volume_spike", symbol, get_display_price(symbol, close), volume, event_time, {
             "rvol": spike_data['rvol'],
@@ -1346,318 +1373,281 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         alerted_symbols[symbol] = today
         last_alert_time[symbol] = now
 
-    # --- EMA STACK LOGIC PATCH (SESSION-AWARE THRESHOLDS) ---
-    if (
-        float_shares is not None and
-        float_shares <= 10_000_000
-    ):
-        session_type = get_session_type(list(candles_seq)[-1]['start_time'])
-        closes = [c['close'] for c in list(candles_seq)]  # Use all available candles
+    # EMA Stack Detection 
+    if len(vwap_candles[symbol]) >= 12:  # Need enough candles for EMA calculation
+        is_afterhours = not (dt_time(9, 30) <= datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York")).time() <= dt_time(16, 0))
+        required_candles = 4 if is_afterhours else 12  # Lower requirement for afterhours
         
-        # Session-aware minimum candle requirements
-        if session_type == "premarket":
-            min_candles = 15  # 15 minutes after 4am start
-        elif session_type == "regular":
-            min_candles = 20  # 20 minutes after 9:30am start  
-        else:  # afterhours
-            min_candles = 12  # 12 minutes after 4pm start
-        
-        logger.info(f"[EMA STACK] {symbol}: Skipping - need {min_candles} candles, have {len(closes)} for {session_type}")
-        
-        if len(closes) >= min_candles and not ema_stack_was_true[symbol]:
-            # Use stored EMAs for stack checking 
+        if len(vwap_candles[symbol]) >= required_candles:
             emas = get_stored_emas(symbol, [5, 8, 13])
-            ema5 = emas.get('ema5')
-            ema8 = emas.get('ema8')
-            ema13 = emas.get('ema13')
             
-            # Skip if EMAs not ready
-            if None in [ema5, ema8, ema13]:
-                logger.info(f"[EMA STACK] {symbol}: EMAs not ready - EMA5={ema5}, EMA8={ema8}, EMA13={ema13}")
-                return
-            
-            # Session-aware thresholds
-            if session_type == "premarket":
-                volume_threshold = 25_000
-                gap_threshold = 1.008  # 0.8%
-            elif session_type == "regular":
-                volume_threshold = 100_000
-                gap_threshold = 1.015  # 1.5%
-            else:  # afterhours
-                volume_threshold = 15_000
-                gap_threshold = 1.005  # 0.5%
-            
-            vwap_val = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
-            last_close = closes[-1]
-            
-            ema_stack_criteria = (
-                ema5 > ema8 > ema13 and
-                ema5 >= gap_threshold * ema13 and
-                last_close > vwap_val and
-                volume >= volume_threshold
-            )
-            
-            logger.info(f"[EMA STACK DEBUG] {symbol} | {session_type} | EMA5={ema5:.4f} > EMA8={ema8:.4f} > EMA13={ema13:.4f} | gap_ok={ema5 >= gap_threshold * ema13} | above_vwap={last_close > vwap_val} | vol_ok={volume >= volume_threshold}")
-            logger.info(
-                f"[ALERT DEBUG] {symbol} | Alert Type: ema_stack | VWAP={vwap_val:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={last_close} | Candle Volume={volume}"
-            )
-            logger.info(f"[EMA DEBUG] {symbol} | EMA Stack | EMA5={ema5:.4f}, EMA8={ema8:.4f}, EMA13={ema13:.4f}")
-            
-            if ema_stack_criteria:
-                if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                    return
-                if last_trade_volume[symbol] < 250:
-                    logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
-                    return
-                    
-                event_time = now
-                log_event("ema_stack", symbol, get_display_price(symbol, last_close), volume, event_time, {
-                    "session_type": session_type,
-                    "volume_threshold": volume_threshold,
-                    "gap_threshold": gap_threshold,
-                    "ema5": ema5,
-                    "ema8": ema8,
-                    "ema13": ema13,
-                    "vwap": vwap_val
-                })
+            if all(emas[f"ema{p}"] is not None for p in [5, 8, 13]):
+                ema5 = emas['ema5']
+                ema8 = emas['ema8'] 
+                ema13 = emas['ema13']
                 
-                price_str = f"{get_display_price(symbol, last_close):.2f}"
-                alert_text = (
-                    f"📊 <b>{escape_html(symbol)}</b> EMA Stack ({session_type.capitalize()})\n"
-                    f"Price: ${price_str} | Vol: {int(volume/1000)}K"
+                # EMA stack criteria
+                ema_stack_criteria = (
+                    ema5 > ema8 > ema13 and
+                    close > ema5 and  # Price above EMA5
+                    volume >= 75_000  # Lower volume for EMA stack
                 )
                 
-                # Calculate alert score and add to pending alerts
-                alert_data = {
-                    'rvol': 2.0,  # Assume decent RVOL
-                    'volume': volume,
-                    'price_move': 0.02  # Small price move assumption
-                }
-                score = get_alert_score("ema_stack", symbol, alert_data)
+                logger.info(f"[EMA STACK] {symbol}: ema5={ema5:.2f} > ema8={ema8:.2f} > ema13={ema13:.2f} | price={close:.2f} > ema5 | vol={volume} | criteria={ema_stack_criteria}")
+                logger.info(
+                    f"[ALERT DEBUG] {symbol} | Alert Type: ema_stack | VWAP={vwap_value:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close} | Candle Volume={volume}"
+                )
+                # Use stored EMAs for EMA Stack
+                logger.info(f"[STORED EMA] {symbol} | EMA Stack | EMA5={ema5}, EMA8={ema8}, EMA13={ema13}")
                 
-                # Add to pending alerts instead of sending immediately
-                pending_alerts[symbol].append({
-                    'type': 'ema_stack',
-                    'score': score,
-                    'message': alert_text
-                })
-                
-                ema_stack_was_true[symbol] = True
-                alerted_symbols[symbol] = today
-                last_alert_time[symbol] = now
-
-    # Process pending alerts for this symbol
-    if pending_alerts[symbol]:
-        await send_best_alert(symbol)
-
-async def trade_stream():
-    try:
-        url = f"wss://socket.polygon.io/stocks"
-        async with websockets.connect(url) as websocket:
-            auth_data = {"action": "auth", "params": POLYGON_API_KEY}
-            await websocket.send(json.dumps(auth_data))
-            response = await websocket.recv()
-            print(f"[POLYGON AUTH] {response}")
-            
-            subscription_msg = {"action": "subscribe", "params": "T.*"}
-            await websocket.send(json.dumps(subscription_msg))
-            response = await websocket.recv()
-            print(f"[POLYGON TRADE SUB] {response}")
-            
-            async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    for item in data:
-                        if item.get("ev") == "T":
-                            symbol = item.get("sym")
-                            price = item.get("p")
-                            size = item.get("s")
-                            timestamp = item.get("t")
-                            if symbol and price and size and timestamp:
-                                time_obj = polygon_time_to_utc(timestamp)
-                                last_trade_price[symbol] = price
-                                last_trade_volume[symbol] = size
-                                last_trade_time[symbol] = time_obj
-                                print(f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={time_obj}")
-                except Exception as e:
-                    logger.error(f"Error processing trade message: {e}")
-    except Exception as e:
-        logger.error(f"Trade stream error: {e}")
-        await asyncio.sleep(10)
-
-def get_polygon_tickers():
-    try:
-        import requests
-        url = "https://api.polygon.io/v3/reference/tickers"
-        params = {
-            "apikey": POLYGON_API_KEY,
-            "active": "true",
-            "market": "stocks",
-            "limit": 1000,
-            "sort": "ticker"
-        }
-        
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            tickers = [result["ticker"] for result in data.get("results", [])]
-            return tickers
+                if ema_stack_criteria and not ema_stack_was_true[symbol]:
+                    if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                        return
+                    if last_trade_volume[symbol] < 250:
+                        logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
+                        return
+                    
+                    log_event("ema_stack", symbol, get_display_price(symbol, close), volume, event_time, {
+                        "ema5": ema5,
+                        "ema8": ema8,
+                        "ema13": ema13,
+                        "vwap": vwap_value
+                    })
+                    
+                    price_str = f"{get_display_price(symbol, close):.2f}"
+                    alert_text = (
+                        f"📊 <b>{escape_html(symbol)}</b> EMA Stack\n"
+                        f"Current Price: ${price_str}\n"
+                        f"EMA Trend: 5 > 8 > 13"
+                    )
+                    
+                    # Calculate alert score and add to pending alerts
+                    alert_data = {
+                        'rvol': 2.0,  # Assume decent RVOL for EMA stack
+                        'volume': volume,
+                        'price_move': 0.02  # Assume 2% move for EMA stack
+                    }
+                    score = get_alert_score("ema_stack", symbol, alert_data)
+                    
+                    # Add to pending alerts instead of sending immediately
+                    pending_alerts[symbol].append({
+                        'type': 'ema_stack',
+                        'score': score,
+                        'message': alert_text
+                    })
+                    
+                    # Send the best alert for this symbol
+                    await send_best_alert(symbol)
+                    
+                    ema_stack_was_true[symbol] = True
+                    alerted_symbols[symbol] = today
+                    last_alert_time[symbol] = now
+            else:
+                logger.info(f"[EMA STACK] {symbol}: EMAs not ready yet - EMA5={emas.get('ema5')}, EMA8={emas.get('ema8')}, EMA13={emas.get('ema13')}")
         else:
-            logger.error(f"Error fetching tickers: {response.status_code}")
-            return []
-    except Exception as e:
-        logger.error(f"Error in get_polygon_tickers: {e}")
-        return []
+            logger.info(f"[EMA STACK] {symbol}: Skipping - need {required_candles} candles, have {len(vwap_candles[symbol])} for {'afterhours' if is_afterhours else 'market hours'}")
 
-async def agg_ingest_loop():
-    url = f"wss://socket.polygon.io/stocks"
+def update_profile_for_day(symbol, day_candles):
+    vol_profile.add_day(symbol, day_candles)
+
+async def on_new_trade(symbol, price, size, timestamp):
+    """Handle individual trade updates for real-time price tracking"""
+    print(f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={timestamp}")
     
+    # Update last trade info for real-time pricing
+    last_trade_price[symbol] = price
+    last_trade_volume[symbol] = size
+    last_trade_time[symbol] = timestamp
+
+async def ingest_polygon_events():
+    """Main ingestion function for Polygon WebSocket"""
     while True:
         try:
-            logger.info(f"[POLYGON] Connecting to {url}")
-            async with websockets.connect(url) as websocket:
-                auth_data = {"action": "auth", "params": POLYGON_API_KEY}
-                await websocket.send(json.dumps(auth_data))
-                response = await websocket.recv()
-                logger.info(f"[POLYGON AUTH] {response}")
-                
-                subscription_msg = {"action": "subscribe", "params": "AM.*"}
-                await websocket.send(json.dumps(subscription_msg))
-                response = await websocket.recv()
-                logger.info(f"[POLYGON AGG SUB] {response}")
-                
-                last_outcome_check = datetime.now(timezone.utc)
-                last_model_check = datetime.now(timezone.utc)
-                
-                async for message in websocket:
-                    try:
-                        print(f"[RAW MSG] {message}")
-                        data = json.loads(message)
-                        
-                        for item in data:
-                            if item.get("ev") == "AM":
-                                symbol = item.get("sym")
-                                if not symbol:
-                                    continue
-                                
-                                open_price = item.get("o")
-                                high_price = item.get("h")
-                                low_price = item.get("l")
-                                close_price = item.get("c")
-                                volume = item.get("v")
-                                start_time_ms = item.get("s")
-                                
-                                if all(v is not None for v in [open_price, high_price, low_price, close_price, volume, start_time_ms]):
-                                    start_time = polygon_time_to_utc(start_time_ms)
-                                    print(f"[POLYGON] {symbol} {start_time} o:{open_price} h:{high_price} l:{low_price} c:{close_price} v:{volume}")
-                                    await on_new_candle(symbol, open_price, high_price, low_price, close_price, volume, start_time)
-                        
-                        # Periodic checks
-                        now = datetime.now(timezone.utc)
-                        
-                        # Check alert outcomes every 5 minutes
-                        if (now - last_outcome_check).total_seconds() > 300:
-                            await check_alert_outcomes()
-                            last_outcome_check = now
-                        
-                        # Check model retraining every 30 minutes
-                        if (now - last_model_check).total_seconds() > 1800:
-                            await retrain_model_if_needed()
-                            last_model_check = now
-                            
-                    except Exception as e:
-                        logger.error(f"Error processing message: {e}")
-                        continue
-                        
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("[POLYGON] Connection closed, reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+            await _ingest_polygon_events()
         except Exception as e:
-            logger.error(f"[POLYGON] Connection error: {e}, reconnecting in 10 seconds...")
+            logger.error(f"Websocket error: {e} — reconnecting in 10 seconds...")
             await asyncio.sleep(10)
+
+async def _ingest_polygon_events():
+    uri = "wss://socket.polygon.io/stocks"
+    
+    async with websockets.connect(uri) as websocket:
+        logger.info(f"[POLYGON] Connecting to {uri}")
+        
+        # Authenticate
+        auth_msg = {"action": "auth", "params": POLYGON_API_KEY}
+        await websocket.send(json.dumps(auth_msg))
+        auth_response = await websocket.recv()
+        logger.info(f"[POLYGON AUTH] {auth_response}")
+        
+        # Subscribe to aggregates (minute candles)
+        subscribe_agg_msg = {"action": "subscribe", "params": "AM.*"}
+        await websocket.send(json.dumps(subscribe_agg_msg))
+        
+        # Subscribe to trades for real-time pricing
+        subscribe_trades_msg = {"action": "subscribe", "params": "T.*"}
+        await websocket.send(json.dumps(subscribe_trades_msg))
+        
+        sub_response = await websocket.recv()
+        logger.info(f"[POLYGON AGG SUB] {sub_response}")
+        
+        async for message in websocket:
+            try:
+                print(f"[RAW MSG] {message}")
+                
+                events = json.loads(message)
+                for event in events:
+                    if event["ev"] == "AM":  # Minute aggregate (candle)
+                        symbol = event["sym"]
+                        start_time = polygon_time_to_utc(event["s"])
+                        open_price = event["o"]
+                        high_price = event["h"]
+                        low_price = event["l"]
+                        close_price = event["c"]
+                        volume = event["v"]
+                        
+                        print(f"[POLYGON] {symbol} {start_time} o:{open_price} h:{high_price} l:{low_price} c:{close_price} v:{volume}")
+                        
+                        await on_new_candle(symbol, open_price, high_price, low_price, close_price, volume, start_time)
+                    
+                    elif event["ev"] == "T":  # Trade
+                        symbol = event["sym"]
+                        price = event["p"]
+                        size = event["s"]
+                        timestamp = polygon_time_to_utc(event["t"])
+                        
+                        await on_new_trade(symbol, price, size, timestamp)
+                        
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse JSON: {message}")
+            except Exception as e:
+                logger.error(f"Error processing event: {e}")
 
 async def market_close_alert_loop():
+    """Send close alerts with premarket gainers"""
     while True:
         try:
-            ny_tz = pytz.timezone("America/New_York")
-            now_ny = datetime.now(ny_tz)
+            now_ny = datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
             
-            # Only send on weekdays
-            if now_ny.weekday() < 5:  # Monday = 0, Friday = 4
-                # 8:01 PM alert
-                target_time = now_ny.replace(hour=20, minute=1, second=0, microsecond=0)
-                if abs((now_ny - target_time).total_seconds()) < 30:
-                    await send_all_alerts("📊 <b>Market Closed</b> | 8:01 PM EST | Processing complete.")
-                    await asyncio.sleep(60)
-            
-            await asyncio.sleep(30)
+            # Reset session state every hour at minute 0 (for new session detection)
+            if now_ny.minute == 0:
+                reset_session_state()
+                await asyncio.sleep(60)  # Sleep for a minute to avoid multiple resets
+                continue
+                
+            # Send alert at 8:01 PM EST (after market close)
+            if now_ny.hour == 20 and now_ny.minute == 1:
+                
+                # Get top gainers from today
+                gainers = []
+                for symbol, open_price in premarket_open_prices.items():
+                    if symbol in premarket_last_prices:
+                        last_price = premarket_last_prices[symbol]
+                        pct_change = ((last_price - open_price) / open_price) * 100 if open_price > 0 else 0
+                        volume = premarket_volumes.get(symbol, 0)
+                        
+                        if pct_change > 5 and volume > 10000:  # Only include meaningful moves
+                            gainers.append({
+                                'symbol': symbol,
+                                'pct_change': pct_change,
+                                'open_price': open_price,
+                                'last_price': last_price,
+                                'volume': volume
+                            })
+                
+                # Sort by percentage change and take top 10
+                gainers.sort(key=lambda x: x['pct_change'], reverse=True)
+                top_gainers = gainers[:10]
+                
+                if top_gainers:
+                    alert_text = "🏁 <b>Market Closed - Top Gainers Today</b>\n\n"
+                    for i, gainer in enumerate(top_gainers, 1):
+                        alert_text += f"{i}. <b>{escape_html(gainer['symbol'])}</b> +{gainer['pct_change']:.1f}% | ${gainer['last_price']:.2f} | Vol: {int(gainer['volume']/1000)}K\n"
+                    
+                    await send_all_alerts(alert_text)
+                    logger.info(f"Sent market close alert with {len(top_gainers)} gainers")
+                else:
+                    await send_all_alerts("🏁 <b>Market Closed</b>\n\nNo significant gainers found today.")
+                    
+                # Clear premarket data for next day
+                premarket_open_prices.clear()
+                premarket_last_prices.clear()
+                premarket_volumes.clear()
+                
+                await asyncio.sleep(3600)  # Sleep for an hour to avoid sending multiple alerts
+                
         except Exception as e:
-            logger.error(f"Market close alert error: {e}")
-            await asyncio.sleep(60)
+            logger.error(f"Error in market close alert loop: {e}")
+            
+        await asyncio.sleep(60)  # Check every minute
 
 async def premarket_gainers_alert_loop():
+    """Send premarket gainers alert at 9:24:55 AM"""
     while True:
         try:
-            ny_tz = pytz.timezone("America/New_York")
-            now_ny = datetime.now(ny_tz)
+            now_ny = datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
             
-            # Only send on weekdays
-            if now_ny.weekday() < 5:
-                # 9:24:55 AM alert
-                target_time = now_ny.replace(hour=9, minute=24, second=55, microsecond=0)
-                if abs((now_ny - target_time).total_seconds()) < 10:
-                    await send_premarket_gainers_alert()
-                    await asyncio.sleep(60)
-            
-            await asyncio.sleep(10)
-        except Exception as e:
-            logger.error(f"Premarket gainers alert error: {e}")
-            await asyncio.sleep(60)
-
-async def send_premarket_gainers_alert():
-    try:
-        gainers = []
-        for symbol, open_price in premarket_open_prices.items():
-            if symbol in premarket_last_prices and open_price > 0:
-                last_price = premarket_last_prices[symbol]
-                gain_pct = ((last_price - open_price) / open_price) * 100
-                volume = premarket_volumes.get(symbol, 0)
+            # Send alert at 9:24:55 AM EST (5 seconds before market open)
+            if now_ny.hour == 9 and now_ny.minute == 24 and now_ny.second >= 55:
                 
-                if gain_pct >= 10 and volume >= 10000:
-                    gainers.append({
-                        'symbol': symbol,
-                        'gain_pct': gain_pct,
-                        'volume': volume,
-                        'price': last_price
-                    })
-        
-        gainers.sort(key=lambda x: x['gain_pct'], reverse=True)
-        gainers = gainers[:10]
-        
-        if gainers:
-            alert_text = "🚀 <b>Premarket Gainers (10%+)</b>\n\n"
-            for g in gainers:
-                alert_text += f"<b>{escape_html(g['symbol'])}</b> +{g['gain_pct']:.1f}% | ${g['price']:.2f} | Vol: {int(g['volume']/1000)}K\n"
+                # Get premarket gainers
+                gainers = []
+                for symbol, open_price in premarket_open_prices.items():
+                    if symbol in premarket_last_prices:
+                        last_price = premarket_last_prices[symbol]
+                        pct_change = ((last_price - open_price) / open_price) * 100 if open_price > 0 else 0
+                        volume = premarket_volumes.get(symbol, 0)
+                        
+                        if pct_change > 5 and volume > 10000:  # Only include meaningful moves
+                            gainers.append({
+                                'symbol': symbol,
+                                'pct_change': pct_change,
+                                'open_price': open_price,
+                                'last_price': last_price,
+                                'volume': volume
+                            })
+                
+                # Sort by percentage change and take top 10
+                gainers.sort(key=lambda x: x['pct_change'], reverse=True)
+                top_gainers = gainers[:10]
+                
+                if top_gainers:
+                    alert_text = "🌅 <b>Premarket Gainers - Market Opening Soon!</b>\n\n"
+                    for i, gainer in enumerate(top_gainers, 1):
+                        alert_text += f"{i}. <b>{escape_html(gainer['symbol'])}</b> +{gainer['pct_change']:.1f}% | ${gainer['last_price']:.2f} | Vol: {int(gainer['volume']/1000)}K\n"
+                    
+                    await send_all_alerts(alert_text)
+                    logger.info(f"Sent premarket gainers alert with {len(top_gainers)} gainers")
+                else:
+                    await send_all_alerts("🌅 <b>Market Opening Soon!</b>\n\nNo significant premarket gainers found.")
+                    
+                await asyncio.sleep(60)  # Sleep for a minute to avoid sending multiple alerts
+                
+        except Exception as e:
+            logger.error(f"Error in premarket gainers alert loop: {e}")
             
-            await send_all_alerts(alert_text)
-        
-        # Clear premarket data for next session
-        premarket_open_prices.clear()
-        premarket_last_prices.clear()
-        premarket_volumes.clear()
-        
-    except Exception as e:
-        logger.error(f"Error sending premarket gainers alert: {e}")
+        await asyncio.sleep(1)  # Check every second around market open time
+
+async def ml_training_loop():
+    """Background task for ML training and outcome tracking"""
+    while True:
+        try:
+            # Check alert outcomes every 5 minutes
+            await check_alert_outcomes()
+            
+            # Retrain model once per day at market close
+            ny_time = datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
+            if ny_time.hour == 20 and ny_time.minute < 5:  # 8:00-8:05 PM ET
+                await retrain_model_if_needed()
+                
+        except Exception as e:
+            logger.error(f"[ML TRAINING] Error in ML training loop: {e}")
+            
+        await asyncio.sleep(300)  # 5 minutes
 
 async def main():
-    logger.info("Starting Stock Market Scanner...")
-    
-    if not is_market_scan_time():
-        logger.info("Outside market hours (4am-8pm EST, Mon-Fri). Monitoring market schedule...")
-    
-    ingest_task = asyncio.create_task(agg_ingest_loop())
-    # trade_task = asyncio.create_task(trade_stream())  # ❌ DISABLED to prevent connection limit issues
-    
+    print("Main event loop running. Press Ctrl+C to exit.")
+    ingest_task = asyncio.create_task(ingest_polygon_events())
     # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
