@@ -1775,14 +1775,14 @@ async def ingest_polygon_events():
             if not symbols:
                 logger.warning("[POLYGON] No symbols from screener, using fallback list")
                 symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]  # Fallback
-            
+
             # Subscribe to ALL symbols for comprehensive scanning
             subscriptions = []
             subscriptions.extend([f"AM.{symbol}" for symbol in symbols])  # Minute aggregates
             subscriptions.extend([f"T.{symbol}" for symbol in symbols])    # Trades
-            
+
             logger.info(f"[POLYGON] Subscribing to {len(subscriptions)} streams for {len(symbols)} symbols")
-            
+
             uri = f"wss://socket.polygon.io/stocks"
             async with websockets.connect(uri) as websocket:
                 # Authenticate
@@ -1790,13 +1790,13 @@ async def ingest_polygon_events():
                 await websocket.send(json.dumps(auth_message))
                 response = await websocket.recv()
                 auth_response = json.loads(response)
-                
+
                 # PATCH: Correct authentication success check
-               if not (isinstance(auth_response, list) and auth_response and auth_response[0].get("status") == "connected"):
-                   logger.error(f"[POLYGON] Authentication failed: {auth_response}")
-                   await asyncio.sleep(30)
-                   continue
-                
+                if not (isinstance(auth_response, list) and auth_response and auth_response[0].get("status") == "connected"):
+                    logger.error(f"[POLYGON] Authentication failed: {auth_response}")
+                    await asyncio.sleep(30)
+                    continue
+
                 logger.info("[POLYGON] Authenticated successfully")
                 
                 # Subscribe in chunks to avoid rate limits
