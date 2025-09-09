@@ -1792,10 +1792,10 @@ async def ingest_polygon_events():
                 auth_response = json.loads(response)
                 
                 # PATCH: Correct authentication success check
-                if not (isinstance(auth_response, list) and auth_response and auth_response[0].get("status") == "connected"):
-                    logger.error(f"[POLYGON] Authentication failed: {auth_response}")
-                    await asyncio.sleep(30)
-                    continue
+               if not (isinstance(auth_response, list) and auth_response and auth_response[0].get("status") == "connected"):
+                   logger.error(f"[POLYGON] Authentication failed: {auth_response}")
+                   await asyncio.sleep(30)
+                   continue
                 
                 logger.info("[POLYGON] Authenticated successfully")
                 
