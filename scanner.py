@@ -1791,7 +1791,8 @@ async def ingest_polygon_events():
                 response = await websocket.recv()
                 auth_response = json.loads(response)
                 
-                if auth_response[0]["status"] != "auth_success":
+                # PATCH: Correct authentication success check
+                if not (isinstance(auth_response, list) and auth_response and auth_response[0].get("status") == "connected"):
                     logger.error(f"[POLYGON] Authentication failed: {auth_response}")
                     await asyncio.sleep(30)
                     continue
@@ -1808,6 +1809,7 @@ async def ingest_polygon_events():
                 
                 logger.info(f"[POLYGON] Subscribed to all data streams")
                 
+               
                 # Process incoming messages
                 async for message in websocket:
                     try:
