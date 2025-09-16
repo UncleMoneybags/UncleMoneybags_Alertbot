@@ -1303,7 +1303,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dollar_volume_wu = close_wu * volume_wu
         warming_up_criteria = (
-            volume_wu >= 1.5 * avg_vol_5 and
+            volume_wu >= 1.2 * avg_vol_5 and
             price_move_wu >= 0.03 and
             0.20 <= close_wu <= 20.00 and
             close_wu > vwap_wu and
@@ -1387,7 +1387,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
         
         runner_criteria = (
-            volume_rn >= 1.8 * avg_vol_5 and  # Lower volume requirement
+            volume_rn >= 1.6 * avg_vol_5 and  # Lower volume requirement
             price_move_rn >= 0.03 and        # 3% instead of 6% - CATCH EARLIER
             close_rn >= 0.10 and
             close_rn > vwap_rn and
@@ -1676,7 +1676,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Base EMA stack criteria (5,8,13)
             base_ema_criteria = (
                 ema5 > ema8 > ema13 and
-                ema5 >= 1.015 * ema13 and
+                ema5 >= 1.010 * ema13 and
                 price > vwap_value and
                 ema5 > vwap_value and
                 last_volume >= min_volume and
