@@ -1676,7 +1676,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Base EMA stack criteria (5,8,13)
             base_ema_criteria = (
                 ema5 > ema8 > ema13 and
-                ema5 >= 1.015 * ema13 and
+                ema5 >= 1.013 * ema13 and
                 price > vwap_value and
                 ema5 > vwap_value and
                 last_volume >= min_volume and
