@@ -59,7 +59,7 @@ def load_float_cache():
         float_cache_none_retry = {}
         print(f"[DEBUG] No float_cache_none_retry found, starting new.")
 
-async def get_float_shares(ticker):
+def get_float_shares(ticker):
     now = datetime.now(timezone.utc)
     # Check positive/real float first
     if ticker in float_cache and float_cache[ticker] is not None:
@@ -81,57 +81,29 @@ async def get_float_shares(ticker):
         else:
             float_cache_none_retry[ticker] = now
             save_float_cache()
-        await asyncio.sleep(0.5)
+        time.sleep(0.5)
         return float_shares
     except Exception as e:
         float_cache_none_retry[ticker] = now
         save_float_cache()
         if "Rate limited" in str(e):
-            # Adaptive backoff for API rate limits - VPS optimization
-            await asyncio.sleep(5)  # Start with 5s for VPS
+            time.sleep(10)
         return float_cache.get(ticker, None)
 
 load_float_cache()
 # --- END FLOAT PATCH ---
 
-# Filtering counters for debugging
-filter_counts = defaultdict(int)
-
 def is_eligible(symbol, last_price, float_shares):
     """Check if symbol meets filtering criteria: price <= $10 AND float <= 10M"""
     # Price check - ALL symbols must be <= $10 (no exceptions!)
-    if last_price is None:
-        filter_counts["price_none"] += 1
-        if filter_counts["price_none"] % 100 == 1:  # Log every 100th occurrence
-            logger.info(f"[FILTER DEBUG] {symbol} filtered: price is None (count: {filter_counts['price_none']})")
-        return False
-    elif last_price > PRICE_THRESHOLD:
-        filter_counts["price_too_high"] += 1
-        if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"] or filter_counts["price_too_high"] % 50 == 1:
-            logger.info(f"[FILTER DEBUG] {symbol} filtered: price ${last_price:.2f} > ${PRICE_THRESHOLD} (count: {filter_counts['price_too_high']})")
+    if last_price is None or last_price > PRICE_THRESHOLD:
         return False
         
     # Float check - exception symbols bypass ONLY float filter
     if symbol not in FLOAT_EXCEPTION_SYMBOLS:
         # FAIL-CLOSED: must have valid float data AND be <= 10M
-        if float_shares is None:
-            filter_counts["float_none"] += 1
-            if symbol in ["OCTO", "GRND", "EQS"] or filter_counts["float_none"] % 100 == 1:
-                logger.info(f"[FILTER DEBUG] {symbol} filtered: float_shares is None (count: {filter_counts['float_none']})")
+        if float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
             return False
-        elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
-            filter_counts["float_out_of_range"] += 1  
-            if symbol in ["OCTO", "GRND", "EQS"] or filter_counts["float_out_of_range"] % 50 == 1:
-                logger.info(f"[FILTER DEBUG] {symbol} filtered: float_shares {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M (count: {filter_counts['float_out_of_range']})")
-            return False
-    else:
-        # Log exception symbols that are passing filter
-        logger.info(f"[FILTER EXCEPTION] {symbol} bypassing float filter (float: {float_shares/1e6:.1f}M if known)")
-        
-    # Symbol passed all filters
-    filter_counts["passed"] += 1
-    if symbol in ["OCTO", "GRND", "EQS"] or filter_counts["passed"] % 100 == 1:
-        logger.info(f"[FILTER PASS] {symbol} eligible: price=${last_price:.2f}, float={float_shares/1e6:.1f}M (total passed: {filter_counts['passed']})")
         
     return True
 
@@ -185,80 +157,6 @@ class VolumeProfile:
 
 vol_profile = VolumeProfile()
 
-# --- BACKFILL FOR MISSED ALERTS ---
-async def perform_connection_backfill():
-    """Fetch missed minute bars during disconnection and run alert logic"""
-    try:
-        now = datetime.now(timezone.utc)
-        eastern = pytz.timezone("America/New_York")
-        now_et = now.astimezone(eastern)
-        
-        # Only backfill during market hours
-        if not is_market_scan_time():
-            print("[BACKFILL] Outside market hours, skipping backfill")
-            return
-            
-        # Get last 10 minutes of data for active symbols
-        backfill_minutes = 10
-        end_time = now_et
-        start_time = end_time - timedelta(minutes=backfill_minutes)
-        
-        # Get list of symbols that have recent activity
-        active_symbols = []
-        for symbol in list(last_trade_time.keys())[:50]:  # Limit to 50 most recent
-            if symbol in last_trade_time and last_trade_time[symbol]:
-                time_since_last = (now - last_trade_time[symbol]).total_seconds()
-                if time_since_last < 1800:  # Active in last 30 minutes
-                    active_symbols.append(symbol)
-        
-        print(f"[BACKFILL] Checking {len(active_symbols)} active symbols for missed alerts...")
-        
-        # Fetch recent minute bars for active symbols (batch request)
-        for symbol in active_symbols[:20]:  # Limit to 20 to avoid API limits
-            try:
-                start_date = start_time.strftime('%Y-%m-%d')
-                end_date = end_time.strftime('%Y-%m-%d')
-                
-                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start_date}/{end_date}"
-                params = {
-                    'adjusted': 'true',
-                    'sort': 'asc',
-                    'limit': backfill_minutes,
-                    'apikey': POLYGON_API_KEY
-                }
-                
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            if data.get('status') == 'OK' and data.get('results'):
-                                candles = data['results']
-                                print(f"[BACKFILL] {symbol}: Processing {len(candles)} missed candles")
-                                
-                                # Process each missed candle through alert logic
-                                for candle_data in candles:
-                                    candle_time = polygon_time_to_utc(candle_data['t'])
-                                    await on_new_candle(
-                                        symbol,
-                                        candle_data['o'],  # open
-                                        candle_data['h'],  # high  
-                                        candle_data['l'],  # low
-                                        candle_data['c'],  # close
-                                        candle_data['v'],  # volume
-                                        candle_time
-                                    )
-                                    await send_best_alert(symbol)
-                                    
-                await asyncio.sleep(0.1)  # Rate limiting
-                
-            except Exception as e:
-                print(f"[BACKFILL ERROR] {symbol}: {e}")
-                
-        print(f"[BACKFILL] Completed catch-up analysis")
-        
-    except Exception as e:
-        print(f"[BACKFILL ERROR] General error: {e}")
-
 # --- STORED EMA SYSTEM ---
 class RunningEMA:
     def __init__(self, period):
@@ -302,7 +200,7 @@ def update_stored_emas(symbol, price):
         ema_value = stored_emas[symbol][period].update(price)
         emas[f"ema{period}"] = ema_value
     
-    # Removed verbose logging for performance - EMAs update thousands of times per second
+    logger.info(f"[STORED EMA] {symbol} | Price: {price:.4f} | EMA5: {emas['ema5']:.4f} | EMA8: {emas['ema8']:.4f} | EMA13: {emas['ema13']:.4f} | EMA200: {emas['ema200']:.4f}")
     return emas
 
 def get_stored_emas(symbol, periods=[5, 8, 13]):
@@ -484,21 +382,15 @@ except ImportError:
 logger.info("scanner.py is running!!! --- If you see this, your file is found and started.")
 logger.info("Imports completed successfully.")
 
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") 
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") 
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY","e0m1UiAaR4426tNCHHkDYflvpG1Qd3XN") 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","8019146040:AAGwaTuYBj8n7iNpnGF8m4wn9KpdZA0kbfA") 
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","-1002266463234") 
 
-# --- DISCORD WEBHOOK ---
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+# --- DISCORD WEBHOOK (add yours here) ---
+DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1405716607111528600/E-BShgFYwkQadlqYWfeuYCgiFMirI4nSMZ_O7fTtrX29RKhcodeJ7zcXCCUd17EtBOkZ"
 
-if not POLYGON_API_KEY:
-    logger.critical("POLYGON_API_KEY environment variable is required! Set it and restart.")
-    sys.exit(1)
-if not TELEGRAM_BOT_TOKEN:
-    logger.critical("TELEGRAM_BOT_TOKEN environment variable is required! Set it and restart.")
-    sys.exit(1)
-if not TELEGRAM_CHAT_ID:
-    logger.critical("TELEGRAM_CHAT_ID environment variable is required! Set it and restart.")
+if not POLYGON_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    logger.critical("API keys or chat id missing in environment variables! Exiting.")
     sys.exit(1)
 
 PRICE_THRESHOLD = 10.00
@@ -850,7 +742,7 @@ async def send_telegram_async(message):
 
 async def send_discord_async(message):
     if not DISCORD_WEBHOOK_URL:
-        logger.debug("No Discord webhook URL configured, skipping Discord notification")
+        logger.error("No Discord webhook URL set!")
         return
     payload = {
         "content": message
@@ -858,14 +750,11 @@ async def send_discord_async(message):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10) as resp:
-                if resp.status in (200, 204):
-                    logger.debug("Discord alert sent successfully")
-                else:
-                    result = await resp.text()
-                    logger.warning(f"Discord send failed: HTTP {resp.status} - {result}")
+                result = await resp.text()
+                if resp.status not in (200, 204):
+                    logger.error(f"Discord send error: {result}")
     except Exception as e:
-        logger.warning(f"Discord send error: {e}")
-        # Don't let Discord failures crash the scanner
+        logger.error(f"Discord send error: {e}")
 
 async def send_all_alerts(message):
     await send_telegram_async(message)
@@ -1204,7 +1093,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
 
     perfect = (
         (ema5 > ema8 > ema13)
-        and (ema5 >= 1.013 * ema13)
+        and (ema5 >= 1.015 * ema13)
         and (last_close > vwap_value)
         and (ema5 > vwap_value)
         and (last_volume >= 175000)
@@ -1216,9 +1105,9 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
 
     # ---- PATCH: enforce ratio at alert time! ----
     if perfect:
-        if ema5 / ema13 < 1.013:
+        if ema5 / ema13 < 1.015:
             logger.error(
-                f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.013)"
+                f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
             )
             return
         if last_trade_volume[symbol] < 250:
@@ -1322,7 +1211,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         candles[symbol] = deque(candles[symbol], maxlen=20)
     if not isinstance(vwap_candles[symbol], list):
         vwap_candles[symbol] = list(vwap_candles[symbol])
-    float_shares = await get_float_shares(symbol)
+    float_shares = get_float_shares(symbol)
     # Check exception list first, then float range
     if symbol not in FLOAT_EXCEPTION_SYMBOLS and (float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)):
         if symbol == "OCTO":
@@ -1373,7 +1262,23 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         'start_time': start_time
     })
 
-    # Removed verbose debug logging for performance - only log critical events
+    # --- Debug: Print session candles and price info ---
+    logger.info(
+        f"[DEBUG] {symbol} | Session candles: {len(vwap_candles[symbol])} | Candle times: "
+        f"{vwap_candles[symbol][0]['start_time'] if vwap_candles[symbol] else 'n/a'} - "
+        f"{vwap_candles[symbol][-1]['start_time'] if vwap_candles[symbol] else 'n/a'}"
+    )
+    logger.info(
+        f"[DEBUG] {symbol} | VWAP={vwap_candles_numpy(vwap_candles[symbol]):.4f} | "
+        f"Last Trade Price={last_trade_price[symbol]} | Last Trade Volume={last_trade_volume[symbol]} | "
+        f"Last Trade Time={last_trade_time[symbol]} | Candle Close={close}"
+    )
+    logger.info(
+        f"[DEBUG] {symbol} | All candle closes: {[c['close'] for c in vwap_candles[symbol]]}"
+    )
+    logger.info(
+        f"[DEBUG] {symbol} | All candle volumes: {[c['volume'] for c in vwap_candles[symbol]]}"
+    )
 
     # --- PERFECT SETUP SCANNER ---
     if len(candles_seq) >= 30:
@@ -1721,9 +1626,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         
         # Session-aware minimum candle requirements
         if session_type == "premarket":
-            min_candles = 8   # 8 minutes after 4am start - faster premarket alerts
+            min_candles = 15  # 15 minutes after 4am start
         elif session_type == "regular":
-            min_candles = 15  # 15 minutes after 9:30am start  
+            min_candles = 20  # 20 minutes after 9:30am start  
         else:  # afterhours
             min_candles = 12  # 12 minutes after 4pm start
         
@@ -1771,7 +1676,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Base EMA stack criteria (5,8,13)
             base_ema_criteria = (
                 ema5 > ema8 > ema13 and
-                ema5 >= 1.013 * ema13 and
+                ema5 >= 1.015 * ema13 and
                 price > vwap_value and
                 ema5 > vwap_value and
                 last_volume >= min_volume and
@@ -1784,13 +1689,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             else:
                 ema_stack_criteria = base_ema_criteria
             ema200_str = f", ema200={ema200:.2f}" if ema200 is not None else ""
-            # Only log EMA stack info when alert actually fires (performance optimization)
-            
+            logger.info(f"[EMA STACK DEBUG] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, close={price:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}, criteria={ema_stack_criteria}")
+
             if ema_stack_criteria and not ema_stack_was_true[symbol]:
-                logger.info(f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, close={price:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}")
-                if ema5 / ema13 < 1.013:
+                if ema5 / ema13 < 1.015:
                     logger.error(
-                        f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.013)"
+                        f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.015)"
                     )
                     return
                 if last_trade_volume[symbol] < 250:
@@ -1838,6 +1742,119 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 def update_profile_for_day(symbol, day_candles):
     vol_profile.add_day(symbol, day_candles)
 
+async def catalyst_news_alert_loop():
+    global news_seen
+    while True:
+        tickers = list(get_scanned_tickers())
+        for symbol in tickers:
+            news_items = await get_ticker_news_yahoo(symbol)
+            for title, link in news_items:
+                if any(kw.lower() in title.lower() for kw in KEYWORDS):
+                    news_id = f"{symbol}:{title}"
+                    if news_id not in news_seen:
+                        headline_fmt = highlight_keywords(title, KEYWORDS)
+                        msg = (
+                            f"📰 <b>{escape_html(symbol)}</b> {headline_fmt}\n"
+                            f"{link}"
+                        )
+                        await send_all_alerts(msg)
+                        event_time = datetime.now(timezone.utc)
+                        log_event("news_alert", symbol, 0, 0, event_time, {
+                            "headline": title,
+                            "link": link
+                        })
+                        news_seen.add(news_id)
+                        save_news_id(news_id)
+        await asyncio.sleep(60)
+
+async def nasdaq_halt_scraper_loop():
+    NASDAQ_HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+    seen_halts = set()
+    halted_symbols = set()
+    first_run = True
+
+    while True:
+        try:
+            now = datetime.now(eastern)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(NASDAQ_HALTS_URL) as resp:
+                    rss = await resp.text()
+            soup = BeautifulSoup(rss, "lxml")
+            items = soup.find_all("item")
+
+            for item in items:
+                title_tag = item.find("title")
+                pubdate_tag = item.find("pubDate") or item.find("pubdate")
+                desc_tag = item.find("description")
+              
+                missing = []
+                if not title_tag:
+                    missing.append("title")
+                if not pubdate_tag:
+                    missing.append("pubDate")
+                if not desc_tag:
+                    missing.append("description")
+                if missing:
+                    logger.warning(f"[NASDAQ HALT SCRAPER] Skipping item due to missing {', '.join(missing)} tag(s): {item}")
+                    continue
+
+                try:
+                    pub_dt = parsedate_to_datetime(pubdate_tag.text.strip())
+                    pub_dt_eastern = pub_dt.astimezone(eastern)
+                except Exception as e:
+                    logger.warning(f"Could not parse or convert pubDate: {pubdate_tag.text} ({e})")
+                    continue
+
+                # Only today's halts during market hours
+                if pub_dt_eastern.date() == now.date() and MARKET_OPEN <= pub_dt_eastern.time() <= MARKET_CLOSE:
+                    symbol = title_tag.text.strip()
+                    halt_time = pubdate_tag.text.strip()
+                    reason = desc_tag.text.strip()
+                    uid = f"{symbol}|{halt_time}"
+
+                    if first_run:
+                        # Don't alert on old items at startup, just record them
+                        seen_halts.add(uid)
+                        if reason.lower().startswith("halt"):
+                            halted_symbols.add(symbol)
+                        continue
+
+                    if uid in seen_halts:
+                        continue  # skip duplicates
+
+                    seen_halts.add(uid)
+
+                    # ---- BEGIN FILTERS PATCH ----
+                    float_shares = get_float_shares(symbol)
+                    if symbol not in FLOAT_EXCEPTION_SYMBOLS and (float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)):
+                        logger.info(f"[HALT DEBUG] Skipping {symbol}: float {float_shares} not in allowed range.")
+                        continue
+                    price = last_trade_price.get(symbol, None)
+                    if price is None or not (0.10 <= price <= 20.00):
+                        logger.info(f"[HALT DEBUG] Skipping {symbol}: price {price} not in $0.10-$20.00 range or unknown.")
+                        continue
+                    # ---- END FILTERS PATCH ----
+
+                    if reason.lower().startswith("halt"):
+                        print(f"🛑 {symbol} HALTED: {reason}")
+                        halted_symbols.add(symbol)
+                        msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED (NASDAQ)\nReason: {escape_html(reason)}"
+                        await send_all_alerts(msg)
+                        event_time = datetime.now(timezone.utc)
+                        log_event("halt", symbol, price, 0, event_time, {"source": "nasdaq_scraper", "reason": reason})
+                    elif reason.lower().startswith("resume") and symbol in halted_symbols:
+                        print(f"🟢 {symbol} RESUMED: {reason}")
+                        halted_symbols.remove(symbol)
+                        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED (NASDAQ)\nReason: {escape_html(reason)}"
+                        await send_all_alerts(msg)
+                        event_time = datetime.now(timezone.utc)
+                        log_event("resume", symbol, price, 0, event_time, {"source": "nasdaq_scraper", "reason": reason})
+            if first_run:
+                first_run = False
+
+        except Exception as main_e:
+            logger.error(f"Error in main loop: {main_e}")
+        await asyncio.sleep(5)
 
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
@@ -1912,49 +1929,102 @@ async def market_close_alert_loop():
             
         await asyncio.sleep(30)
 
+async def handle_halt_event(event):
+    symbol = event.get("sym")
+    status = event.get("status")
+    reason = event.get("reason", "")
+    
+    # Apply float and price filters (same as your other halt system)
+    float_shares = get_float_shares(symbol)
+    if symbol not in FLOAT_EXCEPTION_SYMBOLS and (float_shares is None or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)):
+        logger.info(f"[POLYGON HALT] Skipping {symbol}: float {float_shares} not in allowed range.")
+        return
+    
+    price = last_trade_price.get(symbol, None)
+    if price is None or not (0.10 <= price <= 20.00):
+        logger.info(f"[POLYGON HALT] Skipping {symbol}: price {price} not in $0.10-$20.00 range or unknown.")
+        return
+    
+    # Send halt alert for qualifying stocks
+    msg = f"🛑 <b>{escape_html(symbol)}</b> HALTED (Polygon)\nPrice: ${price:.2f} | Float: {float_shares/1e6:.1f}M\nReason: {escape_html(reason)}"
+    await send_all_alerts(msg)
+    event_time = datetime.now(timezone.utc)
+    log_event("halt", symbol, price, 0, event_time, {"status": status, "reason": reason, "source": "polygon"})
+    halted_symbols.add(symbol)
+    with open(HALT_LOG_FILE, "a") as f:
+        f.write(f"{datetime.now(timezone.utc).isoformat()},{symbol},{status},{reason},polygon\n")
+    logger.info(f"[POLYGON HALT] Alert sent for {symbol} at ${price:.2f}")
 
+async def handle_resume_event(event):
+    symbol = event.get("sym")
+    reason = event.get("reason", "")
+    
+    # Only resume stocks that were halted and meet criteria
+    if symbol in halted_symbols:
+        price = last_trade_price.get(symbol, None)
+        price_str = f"${price:.2f}" if price else "Unknown"
+        
+        msg = f"🟢 <b>{escape_html(symbol)}</b> RESUMED (Polygon)\nPrice: {price_str}\nReason: {escape_html(reason)}"
+        await send_all_alerts(msg)
+        event_time = datetime.now(timezone.utc)
+        log_event("resume", symbol, price or 0, 0, event_time, {"reason": reason, "source": "polygon"})
+        halted_symbols.remove(symbol)
+        logger.info(f"[POLYGON RESUME] Alert sent for {symbol} at {price_str}")
+    else:
+        logger.info(f"[POLYGON RESUME] Ignoring {symbol} resume - not in halted_symbols or didn't meet criteria")
 
+def highlight_keywords(title, keywords):
+    words = set(kw.lower() for kw in keywords)
+    def bold_match(word):
+        for kw in words:
+            pattern = r'\b(' + re.escape(kw) + r')\b'
+            word = re.sub(pattern, r"<b>\1</b>", word, flags=re.IGNORECASE)
+        return word
+    return bold_match(title)
 
-# Connection manager with exponential backoff
-connection_backoff_delay = 15  # Start with 15 seconds
-max_backoff_delay = 300  # Max 5 minutes
-connection_attempts = 0
+async def get_ticker_news_yahoo(ticker):
+    url = f"https://finance.yahoo.com/quote/{ticker}/news?p={ticker}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                html_text = await resp.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        news_items = []
+        for item in soup.find_all('li', class_='js-stream-content'):
+            headline_tag = item.find('h3')
+            if not headline_tag:
+                continue
+            title = headline_tag.text.strip()
+            link_tag = headline_tag.find('a')
+            if not link_tag or not link_tag.get('href'):
+                continue
+            link = link_tag['href']
+            if not link.startswith('http'):
+                link = f"https://finance.yahoo.com{link}"
+            news_items.append((title, link))
+        return news_items
+    except Exception as e:
+        logger.error(f"[NEWS SCRAPER ERROR] {ticker}: {e}")
+        return []
 
 async def ingest_polygon_events():
-    global connection_backoff_delay, connection_attempts
     url = "wss://socket.polygon.io/stocks"
-    
     while True:
         if not is_market_scan_time():
             print("[SCAN PAUSED] Market closed (outside 4am-8pm EST, Mon-Fri). Sleeping 60s.")
             await asyncio.sleep(60)
             continue
-            
         try:
-            print(f"[CONNECTION] Connecting to Polygon WebSocket... (attempt {connection_attempts + 1})")
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                print("[CONNECTION] Successfully connected to Polygon WebSocket")
-                
-                # Perform catch-up backfill if this is a reconnection
-                if connection_attempts > 0:
-                    print("[BACKFILL] Performing catch-up analysis for missed data...")
-                    await perform_connection_backfill()
-                
-                # Reset backoff on successful connection (after backfill check)
-                connection_backoff_delay = 15
-                connection_attempts = 0
-                
+            async with websockets.connect(url) as ws:
                 await ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
-                # Subscribe to ALL active stocks - full market scanning for dynamic discovery  
-                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,T.*"}))
-                print("Subscribed to: AM.* (minute bars), T.* (trades) - NO status/halt monitoring")
-                
+                # Subscribe to ALL active stocks - full market scanning for dynamic discovery
+                await ws.send(json.dumps({"action": "subscribe", "params": "AM.*,T.*,status"}))
+                print("Subscribed to: AM.*, T.* (trades), and status (halts/resumes)")
                 while True:
                     if not is_market_scan_time():
                         print("[SCAN PAUSED] Market closed during active connection. Sleeping 60s, breaking websocket.")
                         await asyncio.sleep(60)
                         break
-                        
                     msg = await ws.recv()
                     print("[RAW MSG]", msg)
                     
@@ -1968,20 +2038,13 @@ async def ingest_polygon_events():
                         if isinstance(data, dict):
                             data = [data]
                         for event in data:
-                            # Handle connection limit status messages FIRST
-                            if event.get("ev") == "status" and event.get("status") == "max_connections":
-                                print(f"[🚨 CONNECTION LIMIT] Polygon API connection limit exceeded!")
-                                print(f"[🚨 CONNECTION LIMIT] Message: {event.get('message', 'No details')}")
-                                # Treat as throttling signal - trigger exponential backoff
-                                raise ConnectionError("max_connections_exceeded")
-                                
-                            elif event.get("ev") == "T":
+                            if event.get("ev") == "T":
                                 symbol = event["sym"]
                                 price = event["p"]
                                 size = event.get('s', 0)
                                 
                                 # Check eligibility BEFORE processing/logging
-                                float_shares = await get_float_shares(symbol)
+                                float_shares = get_float_shares(symbol)
                                 if not is_eligible(symbol, price, float_shares):
                                     continue  # Skip ineligible symbols completely
                                 
@@ -1991,7 +2054,7 @@ async def ingest_polygon_events():
                                 print(
                                     f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={last_trade_time[symbol]}"
                                 )
-                            elif event.get("ev") == "AM":
+                            if event.get("ev") == "AM":
                                 symbol = event["sym"]
                                 open_ = event["o"]
                                 high = event["h"]
@@ -2033,41 +2096,24 @@ async def ingest_polygon_events():
                                 if symbol == "OCTO":
                                     logger.info(f"[🚨 OCTO DEBUG] About to call send_best_alert for {symbol}")
                                 await send_best_alert(symbol)
+                            elif event.get("ev") == "status" and event.get("status") == "halt":
+                                await handle_halt_event(event)
+                            elif event.get("ev") == "status" and event.get("status") == "resume":
+                                await handle_resume_event(event)
                     except Exception as e:
                         print(f"Error processing message: {e}\nRaw: {msg}")
-                        
         except Exception as e:
-            connection_attempts += 1
-            print(f"[CONNECTION ERROR] Websocket error: {e}")
-            
-            # Handle connection limit errors with exponential backoff
-            if ("max_connections" in str(e).lower() or 
-                "connection" in str(e).lower() or 
-                "limit" in str(e).lower() or
-                "policy violation" in str(e).lower() or
-                "1008" in str(e)):
-                
-                print(f"[🚨 CONNECTION LIMIT] Connection limit/policy violation detected!")
-                print(f"[🚨 CONNECTION LIMIT] Backing off for {connection_backoff_delay} seconds...")
-                
-                # Send alert about connection issues
-                alert_msg = f"🚨 <b>SCANNER CONNECTION ISSUE</b>\n\nPolygon connection limit exceeded. Backing off for {connection_backoff_delay}s.\nAttempt: {connection_attempts}"
-                try:
-                    await send_all_alerts(alert_msg)
-                except:
-                    pass  # Don't fail on alert send
-                
-                await asyncio.sleep(connection_backoff_delay)
-                
-                # Exponential backoff: 15s → 30s → 60s → 120s → 300s (max 5min)
-                connection_backoff_delay = min(connection_backoff_delay * 2, max_backoff_delay)
-                
-            elif "keepalive" in str(e).lower() or "ping" in str(e).lower() or "1011" in str(e):
-                print("[CONNECTION] Keepalive/ping timeout - reconnecting in 10 seconds...")
-                await asyncio.sleep(10)
-            else:
-                print(f"[CONNECTION] General error - reconnecting in 30 seconds...")
+            print(f"Websocket error: {e}")
+            # Check if it's a connection limit error - wait longer to avoid rapid reconnects
+            if "connection" in str(e).lower() or "limit" in str(e).lower():
+                print("Connection limit detected - waiting 30 seconds before reconnecting...")
                 await asyncio.sleep(30)
+            elif "keepalive" in str(e).lower() or "ping" in str(e).lower() or "1011" in str(e):
+                print("Keepalive/ping timeout - reconnecting immediately...")
+                await asyncio.sleep(1)  # Immediate reconnection for ping timeouts
+            else:
+                print("General error - reconnecting in 3 seconds...")
+                await asyncio.sleep(3)  # Much faster general reconnection
 
 async def ml_training_loop():
     """Background task for ML training and outcome tracking"""
@@ -2092,6 +2138,8 @@ async def main():
     # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
+    # catalyst_news_task = asyncio.create_task(catalyst_news_alert_loop())  # ❌ DISABLED - causes connection limit
+    # nasdaq_halt_task = asyncio.create_task(nasdaq_halt_scraper_loop())  # ❌ DISABLED - causes connection limit
     try:
         while True:
             await asyncio.sleep(60)
@@ -2101,10 +2149,14 @@ async def main():
         ingest_task.cancel()
         close_alert_task.cancel()
         premarket_alert_task.cancel()
+        # catalyst_news_task.cancel()  # DISABLED - causes connection limit
+        # nasdaq_halt_task.cancel()  # DISABLED - causes connection limit
         
         await ingest_task
         await close_alert_task
         await premarket_alert_task
+        # await catalyst_news_task  # DISABLED - causes connection limit  
+        # await nasdaq_halt_task  # DISABLED - causes connection limit
 
 if __name__ == "__main__":
     try:
