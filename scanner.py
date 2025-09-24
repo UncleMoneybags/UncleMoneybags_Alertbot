@@ -1368,7 +1368,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         closes_for_trend = [c['close'] for c in last_6[-3:]]
         price_rising_trend = all(x < y for x, y in zip(closes_for_trend, closes_for_trend[1:]))
         price_not_dropping = closes_for_trend[-2] < closes_for_trend[-1]
-        wick_ok = close_rn >= 0.75 * high_rn
+        wick_ok = close_rn >= 0.65 * high_rn
 
         logger.info(
             f"[RUNNER DEBUG] {symbol} | Closes trend: {closes_for_trend} | price_rising_trend={price_rising_trend} | price_not_dropping={price_not_dropping} | wick_ok={wick_ok}"
