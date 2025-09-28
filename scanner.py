@@ -496,8 +496,8 @@ MIN_3MIN_VOLUME = 25000
 MIN_PER_CANDLE_VOL = 25000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
-RVOL_SPIKE_THRESHOLD = 2.5
-RVOL_SPIKE_MIN_VOLUME = 25000
+RVOL_SPIKE_THRESHOLD = 2.0
+RVOL_SPIKE_MIN_VOLUME = 75000
 
 MIN_FLOAT_SHARES = 500_000
 MAX_FLOAT_SHARES = 10_000_000
@@ -991,11 +991,8 @@ def check_volume_spike(candles_seq, vwap_value):
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
     above_vwap = curr_candle['close'] > vwap_value
 
-    session_type = get_session_type(curr_candle['start_time'])
-    if session_type in ["premarket", "afterhours"]:
-        min_volume = 200_000
-    else:
-        min_volume = 125_000
+    # Use the defined constants for consistency
+    min_volume = RVOL_SPIKE_MIN_VOLUME  # 25,000 shares
 
     wick_ok = curr_candle['close'] >= 0.75 * curr_candle['high']
     
@@ -1003,11 +1000,11 @@ def check_volume_spike(candles_seq, vwap_value):
     price_momentum = (curr_candle['close'] - curr_candle['open']) / curr_candle['open'] if curr_candle['open'] > 0 else 0
     prev_momentum = (curr_candle['close'] - prev_candle['close']) / prev_candle['close'] if prev_candle['close'] > 0 else 0
     
-    # Must have STRONG positive movement - eliminates flat stocks but catches early runners
-    is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.035  # At least 3.5% green candle (BALANCED)
-    rising_from_prev = curr_candle['close'] > prev_candle['close'] and prev_momentum >= 0.02  # At least 2% above previous (BALANCED)
+    # Simplified upward movement requirement - volume spike with any positive price action
+    is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.01  # Any green candle (1%+)
+    rising_from_prev = curr_candle['close'] > prev_candle['close']  # Above previous close
     
-    # ONLY POSITIVE MOVEMENT ALERTS
+    # ONLY POSITIVE MOVEMENT ALERTS (simplified for volume focus)
     bullish_momentum = is_green_candle and rising_from_prev
 
     symbol = curr_candle.get('symbol', '?')
@@ -1035,7 +1032,7 @@ def check_volume_spike(candles_seq, vwap_value):
     
     # Debug each condition individually
     vol_ok = curr_volume >= min_volume
-    rvol_ok = rvol >= 1.8
+    rvol_ok = rvol >= RVOL_SPIKE_THRESHOLD  # 2.5x for true spikes
     vwap_ok = above_vwap
     wick_check = wick_ok
     momentum_ok = bullish_momentum
@@ -1050,7 +1047,7 @@ def check_volume_spike(candles_seq, vwap_value):
     logger.info(
         f"[SPIKE DEBUG] {curr_candle.get('symbol', '?')} | "
         f"vol_ok={vol_ok} ({curr_volume}>={min_volume}), "
-        f"rvol_ok={rvol_ok} ({rvol:.2f}>=1.8), "
+        f"rvol_ok={rvol_ok} ({rvol:.2f}>={RVOL_SPIKE_THRESHOLD}), "
         f"vwap_ok={vwap_ok}, wick_ok={wick_check}, momentum_ok={momentum_ok}, "
         f"FINAL: spike_detected={spike_detected}"
     )
