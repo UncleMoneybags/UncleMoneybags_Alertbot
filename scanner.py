@@ -2187,7 +2187,7 @@ async def main():
     # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
-    # NASDAQ halt monitoring now handled via Polygon WebSocket (C.* subscription) - much more reliable!
+    # NASDAQ halt monitoring now handled via Polygon WebSocket (LULD.* subscription) - much more reliable!
     try:
         while True:
             await asyncio.sleep(60)
