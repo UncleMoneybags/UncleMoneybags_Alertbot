@@ -2085,6 +2085,95 @@ async def ingest_polygon_events():
                 print(f"[CONNECTION] General error - reconnecting in 30 seconds...")
                 await asyncio.sleep(30)
 
+async def nasdaq_halt_monitor():
+    """Background task for monitoring NASDAQ halts and filtering by price/float criteria"""
+    last_halts = set()
+    
+    while True:
+        try:
+            if not is_market_scan_time():
+                await asyncio.sleep(60)
+                continue
+                
+            # Scrape NASDAQ halt page
+            url = "https://www.nasdaqtrader.com/trader.aspx?id=tradehalts"
+            
+            async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with session.get(url, timeout=timeout) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        
+                        # Parse halt data (simple HTML parsing)
+                        import re
+                        # Look for halt table rows with symbol, time, halt code, and resumption info
+                        halt_pattern = r'<td[^>]*>([A-Z]{2,5})</td>[^<]*<td[^>]*>([^<]+)</td>[^<]*<td[^>]*>([^<]+)</td>[^<]*<td[^>]*>([^<]*)</td>'
+                        matches = re.findall(halt_pattern, html)
+                        
+                        current_halts = set()
+                        
+                        for symbol, halt_time, halt_code, resumption_time in matches:
+                            symbol = symbol.strip()
+                            halt_time = halt_time.strip()
+                            halt_code = halt_code.strip()
+                            resumption_time = resumption_time.strip()
+                            
+                            # Skip if already processed or if resumption time exists (halt lifted)
+                            halt_key = f"{symbol}_{halt_time}_{halt_code}"
+                            if halt_key in last_halts or resumption_time:
+                                continue
+                                
+                            current_halts.add(halt_key)
+                            
+                            # Get current price and float for filtering
+                            try:
+                                import yfinance as yf
+                                ticker_info = yf.Ticker(symbol).info
+                                current_price = ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
+                                float_shares = await get_float_shares(symbol)
+                                
+                                # Apply price and float filtering
+                                if is_eligible(symbol, current_price, float_shares):
+                                    float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                                    # Format halt alert
+                                    alert_msg = f"""🛑 <b>TRADING HALT ALERT</b>
+                                    
+<b>Symbol:</b> ${symbol}
+<b>Price:</b> ${current_price:.2f}
+<b>Float:</b> {float_display} shares
+<b>Halt Time:</b> {halt_time}
+<b>Halt Code:</b> {halt_code}
+<b>Status:</b> HALTED ⏸️
+
+💡 <i>Meets your criteria: ≤$10 & 0.5M-10M float</i>"""
+                                    
+                                    await send_all_alerts(alert_msg)
+                                    
+                                    # Log halt event
+                                    log_event("halt_alert", symbol, current_price, 0, datetime.now(timezone.utc), {
+                                        "halt_time": halt_time,
+                                        "halt_code": halt_code,
+                                        "float_shares": float_shares
+                                    })
+                                    
+                                    logger.info(f"[HALT ALERT] {symbol} @ ${current_price:.2f} - {halt_code}")
+                                else:
+                                    logger.debug(f"[HALT FILTERED] {symbol} @ ${current_price:.2f} - doesn't meet criteria")
+                                    
+                                await asyncio.sleep(1)  # Rate limit between symbol lookups
+                                
+                            except Exception as e:
+                                logger.error(f"[HALT ERROR] Error processing {symbol}: {e}")
+                                continue
+                        
+                        # Update last_halts to prevent duplicate alerts
+                        last_halts.update(current_halts)
+                        
+        except Exception as e:
+            logger.error(f"[HALT MONITOR] Error in halt monitoring: {e}")
+            
+        await asyncio.sleep(30)  # Check every 30 seconds during market hours
+
 async def ml_training_loop():
     """Background task for ML training and outcome tracking"""
     while True:
@@ -2108,6 +2197,8 @@ async def main():
     # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
+    # Add NASDAQ halt monitoring with price/float filtering
+    halt_monitor_task = asyncio.create_task(nasdaq_halt_monitor())
     try:
         while True:
             await asyncio.sleep(60)
@@ -2117,10 +2208,12 @@ async def main():
         ingest_task.cancel()
         close_alert_task.cancel()
         premarket_alert_task.cancel()
+        halt_monitor_task.cancel()
         
         await ingest_task
         await close_alert_task
         await premarket_alert_task
+        await halt_monitor_task
 
 if __name__ == "__main__":
     try:
