@@ -1287,14 +1287,21 @@ def check_volume_spike(candles_seq, vwap_value):
         curr_candle['close'] - prev_candle['close']
     ) / prev_candle['close'] if prev_candle['close'] > 0 else 0
 
-    # Simplified upward movement requirement - volume spike with any positive price action
+    # 🔥 STRICT MOMENTUM: Volume spike must come with RISING price, not flat/down
     is_green_candle = curr_candle['close'] > curr_candle[
-        'open'] and price_momentum >= 0.01  # Any green candle (1%+)
+        'open'] and price_momentum >= 0.02  # Green candle (2%+ to be meaningful)
     rising_from_prev = curr_candle['close'] > prev_candle[
         'close']  # Above previous close
+    
+    # 🔥 NEW: Check for consecutive price rise (not just single candle)
+    if len(list(candles_seq)) >= 3:
+        last_3_closes = [c['close'] for c in list(candles_seq)[-3:]]
+        price_trending_up = last_3_closes[-1] > last_3_closes[-2]  # At minimum, rising from previous
+    else:
+        price_trending_up = rising_from_prev
 
-    # ONLY POSITIVE MOVEMENT ALERTS (simplified for volume focus)
-    bullish_momentum = is_green_candle and rising_from_prev
+    # ONLY POSITIVE MOVEMENT ALERTS - ignore flat/down price with volume spikes
+    bullish_momentum = is_green_candle and rising_from_prev and price_trending_up
 
     symbol = curr_candle.get('symbol', '?')
 
@@ -1517,7 +1524,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                 f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.011)"
             )
             return
-        if last_trade_volume[symbol] < 250:
+        if last_trade_volume[symbol] < 500:
             logger.info(
                 f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
             )
@@ -1710,7 +1717,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await alert_perfect_setup(symbol, closes, volumes, highs, lows,
                                       list(candles_seq)[-30:], vwap_value)
 
-    # --- Warming Up Logic with PATCH for accurate price and liquidity ---
+    # --- Warming Up Logic with STRICT MOMENTUM REQUIREMENTS ---
     if len(candles_seq) >= 6:
         last_6 = list(candles_seq)[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -1730,6 +1737,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             return  # Block warming up alerts without valid VWAP
         dollar_volume_wu = close_wu * volume_wu
+        
+        # 🔥 STRICT MOMENTUM: Require 2-3 consecutive rising closes AND volumes
+        closes_wu = [c['close'] for c in last_6[-3:]]
+        volumes_wu = [c['volume'] for c in last_6[-3:]]
+        price_streak = all(closes_wu[i] < closes_wu[i+1] for i in range(len(closes_wu)-1))  # 2 consecutive rises
+        volume_streak = all(volumes_wu[i] <= volumes_wu[i+1] for i in range(len(volumes_wu)-1))  # 2 consecutive rises
+        
         # 🚀 EARLY MOMENTUM DETECTION - CATCH MOVES BEFORE THEY RUN!
         warming_up_criteria = (
             volume_wu >= max(1.8 * avg_vol_5, 35_000)
@@ -1737,6 +1751,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             price_move_wu >= 0.04
             and  # EARLY DETECTION: 4% move to catch before big runs!
             price_move_wu > 0 and  # MUST BE POSITIVE (no drops allowed)
+            price_streak and  # 🔥 NEW: 2+ consecutive rising closes
+            volume_streak and  # 🔥 NEW: 2+ consecutive rising volumes
             0.20 <= close_wu <= 25.00
             and  # INCREASED: Higher ceiling for momentum moves
             current_price_wu is not None and current_price_wu > vwap_wu
@@ -1751,9 +1767,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[WARMING UP DEBUG] {symbol} | "
             f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={max(1.5 * avg_vol_5, 25_000):.0f}), "
-            f"PriceMove={price_move_wu*100:.2f}% (req=2%+), "
+            f"PriceMove={price_move_wu*100:.2f}% (req=4%+), "
+            f"PriceStreak={price_streak} (closes={[f'{c:.3f}' for c in closes_wu]}), "
+            f"VolumeStreak={volume_streak} (vols={volumes_wu}), "
             f"Real-time=${current_price_wu or 0:.3f}, VWAP=${vwap_wu:.3f} (Above VWAP={current_price_wu is not None and current_price_wu > vwap_wu}), "
-            f"DollarVol=${dollar_volume_wu:.0f} (req=50K+), "
+            f"DollarVol=${dollar_volume_wu:.0f} (req=75K+), "
             f"Candle Close=${close_wu:.3f}")
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -1771,7 +1789,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
 
         if warming_up_criteria and not warming_up_was_true[symbol]:
-            if last_trade_volume[symbol] < 250:
+            if last_trade_volume[symbol] < 500:
                 logger.info(
                     f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                 )
@@ -1838,17 +1856,20 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             return  # Block all alerts if no VWAP data
         vwap_rn = vwap_candles_numpy(vwap_candles[symbol])
 
+        # 🔥 STRICT MOMENTUM: Require 2-3 consecutive rising closes AND volumes
         closes_for_trend = [c['close'] for c in last_6[-3:]]
+        volumes_for_trend = [c['volume'] for c in last_6[-3:]]
         price_rising_trend = all(
             x < y for x, y in zip(closes_for_trend, closes_for_trend[1:]))
-        price_not_dropping = closes_for_trend[-2] < closes_for_trend[-1]
+        volume_rising_trend = all(
+            x <= y for x, y in zip(volumes_for_trend, volumes_for_trend[1:]))
         wick_ok = close_rn >= 0.55 * high_rn
 
         # 🚨 CRITICAL: Get real-time price for criteria evaluation
         current_price_rn = last_trade_price[symbol]  # Real-time market price
 
         logger.info(
-            f"[RUNNER DEBUG] {symbol} | Closes trend: {closes_for_trend} | price_rising_trend={price_rising_trend} | price_not_dropping={price_not_dropping} | wick_ok={wick_ok}"
+            f"[RUNNER DEBUG] {symbol} | Closes trend: {closes_for_trend} | price_rising_trend={price_rising_trend} | volume_rising_trend={volume_rising_trend} | wick_ok={wick_ok}"
         )
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Real-time Price={current_price_rn} | Candle Close={close_rn} | Above VWAP={current_price_rn is not None and current_price_rn > vwap_rn} | Volume={volume_rn}"
@@ -1858,11 +1879,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[STORED EMA] {symbol} | Runner | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
-
-        # IMPROVED: Lower threshold but add volume confirmation
-        volume_increasing = len(last_6) >= 3 and all(
-            last_6[i]['volume'] <= last_6[i + 1]['volume']
-            for i in range(-3, -1))
 
         # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison in criteria!
         runner_criteria = (
@@ -1874,13 +1890,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and  # Use real-time price, not candle close
             current_price_rn is not None and current_price_rn > vwap_rn
             and  # 🚨 CRITICAL: Real-time price vs VWAP!
-            (price_rising_trend or price_not_dropping)
-            and  # RELAXED: Either trend OR not dropping
+            price_rising_trend
+            and  # 🔥 STRICT: Must have TRUE upward trend (2+ consecutive rises)
+            volume_rising_trend
+            and  # 🔥 STRICT: Volume must be rising too (2+ consecutive rises)
             wick_ok and volume_rn >= 15_000  # SIMPLIFIED: Minimum volume check
         )
 
         if runner_criteria and not runner_was_true[symbol]:
-            if last_trade_volume[symbol] < 250:
+            if last_trade_volume[symbol] < 500:
                 logger.info(
                     f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                 )
@@ -1969,7 +1987,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if (now - last_alert_time[symbol]) < timedelta(
                         minutes=ALERT_COOLDOWN_MINUTES):
                     return
-                if last_trade_volume[symbol] < 250:
+                if last_trade_volume[symbol] < 500:
                     logger.info(
                         f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                     )
@@ -2066,7 +2084,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if (now - last_alert_time[symbol]) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            if last_trade_volume[symbol] < 250:
+            if last_trade_volume[symbol] < 500:
                 logger.info(
                     f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                 )
@@ -2121,7 +2139,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
 
     if spike_detected and not volume_spike_was_true[symbol]:
-        if last_trade_volume[symbol] < 250:
+        if last_trade_volume[symbol] < 500:
             logger.info(
                 f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
             )
@@ -2289,8 +2307,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema200_str = f", ema200={ema200:.2f}" if ema200 is not None else ""
             # Only log EMA stack info when alert actually fires (performance optimization)
 
-            # ADD MOMENTUM CONFIRMATION - only alert on stocks with real upward movement
+            # 🔥 STRICT MOMENTUM CONFIRMATION - require rising volume streaks
             momentum_confirmed = False
+            volume_streak_confirmed = False
+            
             if base_ema_criteria:
                 # Check for 2+ green candles in last 3 candles (realistic recent momentum check)
                 if len(list(candles_seq)) >= 3:
@@ -2298,6 +2318,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     green_candles = sum(1 for c in recent_candles
                                         if c['close'] > c['open'])
                     momentum_confirmed = green_candles >= 2
+                    
+                    # 🔥 NEW: Require rising volume streak (not just threshold)
+                    recent_volumes = [c['volume'] for c in recent_candles]
+                    volume_streak_confirmed = all(recent_volumes[i] <= recent_volumes[i+1] 
+                                                  for i in range(len(recent_volumes)-1))
 
                 # Alternative: Check if real-time price is up 3%+ from 5 candles ago (more realistic sustained move)
                 if not momentum_confirmed and len(closes) >= 5:
@@ -2305,13 +2330,19 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     price_gain = (current_price_ema -
                                   price_5_ago) / price_5_ago
                     momentum_confirmed = price_gain >= 0.03  # 3%+ gain from 5 candles ago
+                    
+                    # 🔥 NEW: Also check volume trend for 5-candle lookback
+                    if len(list(candles_seq)) >= 5:
+                        recent_5_volumes = [c['volume'] for c in list(candles_seq)[-5:]]
+                        volume_streak_confirmed = recent_5_volumes[-1] > recent_5_volumes[0]  # Rising over 5 candles
 
                 # Fallback: If not enough history, allow alert if real-time price > EMA5 (basic confirmation)
                 if not momentum_confirmed and len(closes) < 5:
                     momentum_confirmed = current_price_ema > ema5
+                    volume_streak_confirmed = True  # Allow if limited data
 
-            # Final criteria: base EMA criteria AND momentum confirmation
-            ema_stack_criteria = base_ema_criteria and momentum_confirmed
+            # Final criteria: base EMA criteria AND momentum confirmation AND volume streak
+            ema_stack_criteria = base_ema_criteria and momentum_confirmed and volume_streak_confirmed
 
             if ema_stack_criteria and not ema_stack_was_true[symbol]:
                 vwap_margin = (current_price_ema -
@@ -2325,7 +2356,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.011)"
                     )
                     return
-                if last_trade_volume[symbol] < 250:
+                if last_trade_volume[symbol] < 500:
                     logger.info(
                         f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                     )
