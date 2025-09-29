@@ -1556,8 +1556,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         recent_high[symbol] = rhigh
     if recent_high[symbol] > 0:
         dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
+        # Get current VWAP for filtering
+        current_vwap = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dip_play_criteria = (
-            dip_pct >= MIN_DIP_PCT and close <= 20.00
+            dip_pct >= MIN_DIP_PCT and 
+            close <= 20.00 and 
+            close > current_vwap  # ❌ NO ALERTS UNDER VWAP - FIXED!
         )
         if dip_play_criteria and len(candles_seq) >= 3:
             c1, c2, c3 = list(candles_seq)[-3:]
@@ -1770,10 +1774,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema8 = emas['ema8']
             ema13 = emas['ema13']
             ema200 = emas.get('ema200') if use_200_ema else None
-            vwap_value = vwap_candles_numpy(vwap_candles[symbol])
+            vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
             last_candle = list(candles_seq)[-1]
             last_volume = last_candle['volume']
             price = closes[-1]
+            
+            # 🚨 CRITICAL VWAP CHECK - NEVER ALERT STOCKS UNDER VWAP!
+            if vwap_value <= 0:
+                logger.debug(f"[EMA STACK FILTERED] {symbol} - invalid VWAP {vwap_value}")
+                return
+            if price <= vwap_value:
+                logger.debug(f"[EMA STACK FILTERED] {symbol} @ ${price:.2f} - below/equal VWAP ${vwap_value:.2f}")
+                return
 
             if session_type in ["premarket", "afterhours"]:
                 min_volume = 250_000
@@ -1784,11 +1796,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
             dollar_volume = price * last_volume
 
-            # Base EMA stack criteria (5,8,13)
+            # STRENGTHENED EMA stack criteria (5,8,13) - MUCH more selective for higher quality alerts
+            # NOTE: VWAP check moved above - price already confirmed > VWAP
             base_ema_criteria = (
                 ema5 > ema8 > ema13 and
-                ema5 >= 1.011 * ema13 and
-                price > vwap_value and
+                ema5 >= 1.011 * ema13 and  # Keep original 1.1% spread - just ensure EMAs moving up
+                price >= 1.015 * vwap_value and  # Price must be at least 1.5% above VWAP (DOUBLE CHECK - prevents razor-thin margins)
+                price >= 1.005 * ema13 and  # Price must be at least 0.5% above EMA13 (bottom of stack - confirms real strength)
                 last_volume >= min_volume and
                 dollar_volume >= min_dollar_volume
             )
@@ -1801,8 +1815,32 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema200_str = f", ema200={ema200:.2f}" if ema200 is not None else ""
             # Only log EMA stack info when alert actually fires (performance optimization)
             
+            # ADD MOMENTUM CONFIRMATION - only alert on stocks with real upward movement
+            momentum_confirmed = False
+            if base_ema_criteria:
+                # Check for 2+ green candles in last 3 candles (realistic recent momentum check)
+                if len(list(candles_seq)) >= 3:
+                    recent_candles = list(candles_seq)[-3:]
+                    green_candles = sum(1 for c in recent_candles if c['close'] > c['open'])
+                    momentum_confirmed = green_candles >= 2
+                    
+                # Alternative: Check if price is up 3%+ from 5 candles ago (more realistic sustained move)
+                if not momentum_confirmed and len(closes) >= 5:
+                    price_5_ago = closes[-5]
+                    price_gain = (price - price_5_ago) / price_5_ago
+                    momentum_confirmed = price_gain >= 0.03  # 3%+ gain from 5 candles ago
+                    
+                # Fallback: If not enough history, allow alert if price > EMA5 (basic confirmation)
+                if not momentum_confirmed and len(closes) < 5:
+                    momentum_confirmed = price > ema5
+                    
+            # Final criteria: base EMA criteria AND momentum confirmation
+            ema_stack_criteria = base_ema_criteria and momentum_confirmed
+            
             if ema_stack_criteria and not ema_stack_was_true[symbol]:
-                logger.info(f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, close={price:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}")
+                vwap_margin = (price - vwap_value) / vwap_value * 100
+                ema13_margin = (price - ema13) / ema13 * 100
+                logger.info(f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, close={price:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}, vwap_margin={vwap_margin:.1f}%, ema13_margin={ema13_margin:.1f}%")
                 if ema5 / ema13 < 1.011:
                     logger.error(
                         f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.011)"
@@ -2082,6 +2120,12 @@ async def ingest_polygon_events():
                                         
                                         # Apply price and float filtering
                                         if is_eligible(symbol, current_price, float_shares):
+                                            # ❌ NO ALERTS UNDER VWAP - CHECK VWAP FOR HALT ALERTS TOO!
+                                            current_vwap = vwap_candles_numpy(vwap_candles.get(symbol, [])) if symbol in vwap_candles else 0
+                                            if current_price <= current_vwap:
+                                                logger.debug(f"[LULD FILTERED] {symbol} @ ${current_price:.2f} - below VWAP ${current_vwap:.2f}")
+                                                continue
+                                                
                                             float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
                                             
                                             # Determine halt reason from indicators
@@ -2161,7 +2205,7 @@ async def ingest_polygon_events():
                 print(f"[CONNECTION] General error - reconnecting in 30 seconds...")
                 await asyncio.sleep(30)
 
-# REMOVED: NASDAQ web scraping halt monitor - replaced with Polygon WebSocket halt monitoring (C.* subscription)
+# REMOVED: NASDAQ web scraping halt monitor - replaced with Polygon WebSocket LULD halt monitoring (LULD.* subscription)
 # This is much more reliable, real-time, and uses the same WebSocket connection (no extra rate limits!)
 
 async def ml_training_loop():
