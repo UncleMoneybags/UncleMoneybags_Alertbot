@@ -488,7 +488,7 @@ if not TELEGRAM_CHAT_ID:
     logger.critical("TELEGRAM_CHAT_ID environment variable is required! Set it and restart.")
     sys.exit(1)
 
-PRICE_THRESHOLD = 10.00
+PRICE_THRESHOLD = 15.00  # INCREASED: Allow more headroom for momentum moves
 MAX_SYMBOLS = 4000
 SCREENER_REFRESH_SEC = 30
 MIN_ALERT_MOVE = 0.12
@@ -496,8 +496,8 @@ MIN_3MIN_VOLUME = 25000
 MIN_PER_CANDLE_VOL = 25000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
-RVOL_SPIKE_THRESHOLD = 2.0
-RVOL_SPIKE_MIN_VOLUME = 75000
+RVOL_SPIKE_THRESHOLD = 1.5  # REDUCED: Lower RVOL for early detection  
+RVOL_SPIKE_MIN_VOLUME = 25000  # REDUCED: Lower volume for early spikes
 
 MIN_FLOAT_SHARES = 500_000
 MAX_FLOAT_SHARES = 10_000_000
@@ -1353,7 +1353,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"]:
         logger.info(f"[🔥 FILTER DEBUG] {symbol} | market_scan_time={is_market_scan_time()} | price={close} | price_ok={close <= 20.00}")
     
-    if not is_market_scan_time() or close > 20.00:
+    if not is_market_scan_time() or close > 25.00:  # INCREASED: Higher ceiling for momentum moves
         return
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
@@ -1409,22 +1409,22 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
         vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dollar_volume_wu = close_wu * volume_wu
-        # 🚨 STRICT WARMING UP CRITERIA - NO WEAK ALERTS!
+        # 🚀 EARLY MOMENTUM DETECTION - CATCH MOVES BEFORE THEY RUN!
         warming_up_criteria = (
-            volume_wu >= max(2.0 * avg_vol_5, 75_000) and  # MINIMUM 75K volume + 2x average
-            price_move_wu >= 0.05 and  # Require 5% UPWARD move (not 3%)
+            volume_wu >= max(1.5 * avg_vol_5, 25_000) and  # REDUCED: 25K minimum for early detection
+            price_move_wu >= 0.02 and  # REDUCED: 2% move (catch early momentum!)
             price_move_wu > 0 and  # MUST BE POSITIVE (no drops allowed)
-            0.20 <= close_wu <= 20.00 and
-            close_wu > vwap_wu and  # ABOVE VWAP
-            close_wu >= 1.02 * vwap_wu and  # At least 2% above VWAP (stronger requirement)
-            dollar_volume_wu >= 100_000 and  # Higher dollar volume requirement
-            avg_vol_5 > 10_000  # Prevent division by tiny numbers
+            0.20 <= close_wu <= 25.00 and  # INCREASED: Higher ceiling for momentum moves
+            close_wu > vwap_wu and  # ABOVE VWAP (keep protection)
+            close_wu >= 1.005 * vwap_wu and  # REDUCED: 0.5% above VWAP (less strict)
+            dollar_volume_wu >= 50_000 and  # REDUCED: 50K dollar volume for early alerts
+            avg_vol_5 > 5_000  # REDUCED: Lower average volume threshold
         )
         # 🚨 DETAILED WARMING UP DEBUG - Track why alerts fire
         logger.info(
             f"[WARMING UP DEBUG] {symbol} | "
             f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={max(2.0 * avg_vol_5, 75_000):.0f}), "
-            f"PriceMove={price_move_wu*100:.2f}% (req=5%+), "
+            f"PriceMove={price_move_wu*100:.2f}% (req=2%+), "
             f"Close=${close_wu:.3f}, VWAP=${vwap_wu:.3f} (req=2%+ above), "
             f"DollarVol=${dollar_volume_wu:.0f} (req=100K+), "
             f"Open=${open_wu:.3f}"
@@ -1434,7 +1434,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}")
         # 🚨 EXTRA SAFETY CHECK - Log when criteria would fire
         if (volume_wu >= 2.0 * avg_vol_5 and price_move_wu >= 0.03 and 
-            0.20 <= close_wu <= 20.00 and close_wu > vwap_wu and dollar_volume_wu >= 50_000):
+            0.20 <= close_wu <= 25.00 and close_wu > vwap_wu and dollar_volume_wu >= 50_000):
             logger.warning(f"[⚠️ OLD CRITERIA] {symbol} would have fired under old criteria! "
                          f"Vol={volume_wu}, Move={price_move_wu*100:.1f}%, Close=${close_wu:.3f}, VWAP=${vwap_wu:.3f}")
         
@@ -1511,14 +1511,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         
         
         runner_criteria = (
-            volume_rn >= 2.0 * avg_vol_5 and  # Higher volume requirement for quality
-            price_move_rn >= 0.05 and        # Require 5% UPWARD move for confirmed momentum
+            volume_rn >= 1.75 * avg_vol_5 and  # REDUCED: Lower volume for early detection
+            price_move_rn >= 0.025 and        # REDUCED: 2.5% move (catch runners early!)
             close_rn >= 0.10 and
             close_rn > vwap_rn and
-            price_rising_trend and
-            price_not_dropping and
+            (price_rising_trend or price_not_dropping) and  # RELAXED: Either trend OR not dropping
             wick_ok and
-            volume_increasing  # NEW: Volume must be increasing
+            volume_rn >= 15_000  # SIMPLIFIED: Minimum volume check
         )
 
         if runner_criteria and not runner_was_true[symbol]:
@@ -1645,8 +1644,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close']) and
             curr_candle['close'] > (curr_vwap if curr_vwap is not None else curr_candle['close']) and
             candle_price_move >= 0.03 and  # Require 3% UPWARD move in the reclaim candle
-            curr_candle['volume'] >= 75_000 and  # Higher volume requirement for quality
-            rvol >= 2.0  # Higher RVOL requirement for quality
+            curr_candle['volume'] >= 50_000 and  # REDUCED: Lower volume for early VWAP reclaims
+            rvol >= 1.5  # REDUCED: Lower RVOL for early detection
         )
         
         # DEBUG: Show why VWAP reclaim alerts might not fire
