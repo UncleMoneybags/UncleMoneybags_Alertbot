@@ -913,7 +913,8 @@ async def send_telegram_async(message):
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=payload, timeout=10) as resp:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with session.post(url, data=payload, timeout=timeout) as resp:
                 result_text = await resp.text()
                 logger.debug(f"[DEBUG] Telegram API status: {resp.status}, response: {result_text}")
                 if resp.status != 200:
@@ -930,7 +931,8 @@ async def send_discord_async(message):
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10) as resp:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=timeout) as resp:
                 if resp.status in (200, 204):
                     logger.debug("Discord alert sent successfully")
                 else:
@@ -1079,12 +1081,15 @@ def check_volume_spike(candles_seq, vwap_value):
     curr_candle = list(candles_seq)[-1]
     prev_candle = list(candles_seq)[-2]
     curr_volume = curr_candle['volume']
+    symbol = curr_candle.get('symbol', '?')
     
     # Use 8 trailing candles instead of 3 for more stable RVOL
     trailing_volumes = [c['volume'] for c in list(candles_seq)[-9:-1]]
     trailing_avg = sum(trailing_volumes) / 8 if len(trailing_volumes) == 8 else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
-    above_vwap = curr_candle['close'] > vwap_value
+    # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
+    current_price_spike = last_trade_price[symbol]
+    above_vwap = current_price_spike is not None and current_price_spike > vwap_value
 
     # Use the defined constants for consistency
     min_volume = RVOL_SPIKE_MIN_VOLUME  # 25,000 shares
@@ -1310,10 +1315,12 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
     logger.info(f"[DEBUG] {symbol} | All candle closes: {closes}")
     logger.info(f"[DEBUG] {symbol} | All candle volumes: {volumes}")
 
+    # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
+    current_price_perfect = last_trade_price[symbol]
     perfect = (
         (ema5 > ema8 > ema13)
         and (ema5 >= 1.011 * ema13)
-        and (last_close > vwap_value)
+        and (current_price_perfect is not None and current_price_perfect > vwap_value)  # 🚨 REAL-TIME PRICE!
         and (last_volume >= 100000)
         and (rvol > 2.0)
         and (last_rsi < 70)
@@ -1507,12 +1514,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         open_wu = last_candle['open']
         close_wu = last_candle['close']
         volume_wu = last_candle['volume']
+        # 🚨 CRITICAL: Get real-time price for criteria evaluation
+        current_price_wu = last_trade_price[symbol]  # Real-time market price
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
-        # 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
-        if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
-            logger.info(f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking alert")
-            return  # Block all alerts if no VWAP data
-        vwap_wu = vwap_candles_numpy(vwap_candles[symbol])
+        # 🚨 CRITICAL FIX: Use centralized VWAP guard for warming up alerts
+        vwap_wu = get_valid_vwap(symbol)
+        if vwap_wu is None:
+            logger.info(f"[VWAP GUARD] {symbol} - Blocking warming up alert - insufficient VWAP data")
+            return  # Block warming up alerts without valid VWAP
         dollar_volume_wu = close_wu * volume_wu
         # 🚀 EARLY MOMENTUM DETECTION - CATCH MOVES BEFORE THEY RUN!
         warming_up_criteria = (
@@ -1520,26 +1529,26 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             price_move_wu >= 0.02 and  # REDUCED: 2% move (catch early momentum!)
             price_move_wu > 0 and  # MUST BE POSITIVE (no drops allowed)
             0.20 <= close_wu <= 25.00 and  # INCREASED: Higher ceiling for momentum moves
-            close_wu > vwap_wu and  # ABOVE VWAP (keep protection)
-            close_wu >= 1.005 * vwap_wu and  # REDUCED: 0.5% above VWAP (less strict)
+            current_price_wu is not None and current_price_wu > vwap_wu and  # 🚨 REAL-TIME PRICE ABOVE VWAP!
+            current_price_wu is not None and current_price_wu >= 1.005 * vwap_wu and  # 🚨 REAL-TIME PRICE 0.5% above VWAP!
             dollar_volume_wu >= 50_000 and  # REDUCED: 50K dollar volume for early alerts
             avg_vol_5 > 5_000  # REDUCED: Lower average volume threshold
         )
         # 🚨 DETAILED WARMING UP DEBUG - Track why alerts fire
         logger.info(
             f"[WARMING UP DEBUG] {symbol} | "
-            f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={max(2.0 * avg_vol_5, 75_000):.0f}), "
+            f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={max(1.5 * avg_vol_5, 25_000):.0f}), "
             f"PriceMove={price_move_wu*100:.2f}% (req=2%+), "
-            f"Close=${close_wu:.3f}, VWAP=${vwap_wu:.3f} (req=2%+ above), "
-            f"DollarVol=${dollar_volume_wu:.0f} (req=100K+), "
-            f"Open=${open_wu:.3f}"
+            f"Real-time=${current_price_wu or 0:.3f}, VWAP=${vwap_wu:.3f} (Above VWAP={current_price_wu is not None and current_price_wu > vwap_wu}), "
+            f"DollarVol=${dollar_volume_wu:.0f} (req=50K+), "
+            f"Candle Close=${close_wu:.3f}"
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
         logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}")
         # 🚨 EXTRA SAFETY CHECK - Log when criteria would fire
         if (volume_wu >= 2.0 * avg_vol_5 and price_move_wu >= 0.03 and 
-            0.20 <= close_wu <= 25.00 and close_wu > vwap_wu and dollar_volume_wu >= 50_000):
+            0.20 <= close_wu <= 25.00 and current_price_wu is not None and current_price_wu > vwap_wu and dollar_volume_wu >= 50_000):  # 🚨 REAL-TIME PRICE!
             logger.warning(f"[⚠️ OLD CRITERIA] {symbol} would have fired under old criteria! "
                          f"Vol={volume_wu}, Move={price_move_wu*100:.1f}%, Close=${close_wu:.3f}, VWAP=${vwap_wu:.3f}")
         
@@ -1606,11 +1615,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         price_not_dropping = closes_for_trend[-2] < closes_for_trend[-1]
         wick_ok = close_rn >= 0.55 * high_rn
 
+        # 🚨 CRITICAL: Get real-time price for criteria evaluation
+        current_price_rn = last_trade_price[symbol]  # Real-time market price
+        
         logger.info(
             f"[RUNNER DEBUG] {symbol} | Closes trend: {closes_for_trend} | price_rising_trend={price_rising_trend} | price_not_dropping={price_not_dropping} | wick_ok={wick_ok}"
         )
         logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close_rn} | Candle Volume={volume_rn}"
+            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Real-time Price={current_price_rn} | Candle Close={close_rn} | Above VWAP={current_price_rn is not None and current_price_rn > vwap_rn} | Volume={volume_rn}"
         )
         # Use stored EMAs for Runner Detection
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -1623,11 +1635,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
         
         
+        # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison in criteria!
         runner_criteria = (
             volume_rn >= 1.75 * avg_vol_5 and  # REDUCED: Lower volume for early detection
             price_move_rn >= 0.025 and        # REDUCED: 2.5% move (catch runners early!)
-            close_rn >= 0.10 and
-            close_rn > vwap_rn and
+            current_price_rn is not None and current_price_rn >= 0.10 and      # Use real-time price, not candle close
+            current_price_rn is not None and current_price_rn > vwap_rn and    # 🚨 CRITICAL: Real-time price vs VWAP!
             (price_rising_trend or price_not_dropping) and  # RELAXED: Either trend OR not dropping
             wick_ok and
             volume_rn >= 15_000  # SIMPLIFIED: Minimum volume check
@@ -1767,9 +1780,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             rvol = curr_candle['volume'] / avg_trailing if avg_trailing > 0 else 0
         # Require UPWARD price movement for VWAP reclaim
         candle_price_move = (curr_candle['close'] - curr_candle['open']) / curr_candle['open'] if curr_candle['open'] > 0 else 0
+        # 🚨 CRITICAL FIX: Use real-time price for VWAP reclaim criteria!
+        current_price_reclaim = last_trade_price[symbol]  # Real-time market price
         vwap_reclaim_criteria = (
             prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close']) and
-            curr_candle['close'] > (curr_vwap if curr_vwap is not None else curr_candle['close']) and
+            current_price_reclaim is not None and current_price_reclaim > (curr_vwap if curr_vwap is not None else current_price_reclaim) and  # 🚨 REAL-TIME PRICE!
             candle_price_move >= 0.03 and  # Require 3% UPWARD move in the reclaim candle
             curr_candle['volume'] >= 50_000 and  # REDUCED: Lower volume for early VWAP reclaims
             rvol >= 1.5  # REDUCED: Lower RVOL for early detection
@@ -1779,7 +1794,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         if symbol in ["OCTO", "GRND", "EQS"]:
             logger.info(f"[💎 VWAP RECLAIM DEBUG] {symbol} | criteria_met={vwap_reclaim_criteria} | prev_close<prev_vwap={prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close'])} | curr_close>curr_vwap={curr_candle['close'] > (curr_vwap if curr_vwap is not None else curr_candle['close'])} | volume>50K={curr_candle['volume'] >= 50_000} | rvol>1.5={rvol >= 1.5}")
         logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: vwap_reclaim | VWAP={curr_vwap:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={curr_candle['close']} | Candle Volume={curr_candle['volume']}"
+            f"[ALERT DEBUG] {symbol} | Alert Type: vwap_reclaim | VWAP={curr_vwap:.4f} | Real-time Price={current_price_reclaim} | Candle Close={curr_candle['close']} | Above VWAP={current_price_reclaim is not None and current_price_reclaim > curr_vwap} | Volume={curr_candle['volume']}"
         )
         # Use stored EMAs 
         emas = get_stored_emas(symbol, [5, 8, 13])
