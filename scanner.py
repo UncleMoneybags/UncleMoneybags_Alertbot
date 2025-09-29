@@ -2804,8 +2804,136 @@ async def ingest_polygon_events():
                 await asyncio.sleep(30)
 
 
-# REMOVED: NASDAQ web scraping halt monitor - replaced with Polygon WebSocket LULD halt monitoring (LULD.* subscription)
-# This is much more reliable, real-time, and uses the same WebSocket connection (no extra rate limits!)
+async def nasdaq_halt_monitor():
+    """Monitor NASDAQ halt page for ALL halt types (T1, T2, T5, T12, LUDP, etc.)
+    Complements Polygon LULD feed which only catches volatility halts"""
+    import aiohttp
+    from datetime import datetime, timezone
+    
+    seen_halts = set()  # Track processed halts
+    
+    while True:
+        try:
+            ny_tz = pytz.timezone("America/New_York")
+            now = datetime.now(timezone.utc).astimezone(ny_tz)
+            
+            # Only run during extended market hours (4am-8pm ET)
+            if not (4 <= now.hour < 20):
+                await asyncio.sleep(300)  # Check every 5 minutes when closed
+                continue
+            
+            # Scrape NASDAQ halt page
+            url = "https://www.nasdaqtrader.com/trader.aspx?id=tradehalts"
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        
+                        # Parse halt data (NASDAQ uses table format)
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html, 'html.parser')
+                        
+                        # Find halt table
+                        table = soup.find('table', {'id': 'Trading_Halts'})
+                        if table:
+                            rows = table.find_all('tr')[1:]  # Skip header
+                            
+                            for row in rows:
+                                cols = row.find_all('td')
+                                if len(cols) >= 6:
+                                    halt_time_str = cols[0].text.strip()
+                                    symbol = cols[1].text.strip()
+                                    halt_reason_code = cols[4].text.strip()
+                                    resume_time_str = cols[5].text.strip()
+                                    
+                                    # Skip if already resumed
+                                    if resume_time_str and resume_time_str != '':
+                                        continue
+                                    
+                                    # Create unique halt key
+                                    halt_key = f"{symbol}_{halt_time_str}_{halt_reason_code}"
+                                    
+                                    if halt_key in seen_halts:
+                                        continue
+                                    
+                                    seen_halts.add(halt_key)
+                                    
+                                    # Get current price and float
+                                    try:
+                                        current_price = last_trade_price.get(symbol)
+                                        if not current_price:
+                                            # Fallback to yfinance
+                                            import yfinance as yf
+                                            ticker_info = yf.Ticker(symbol).info
+                                            current_price = ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
+                                        
+                                        float_shares = await get_float_shares(symbol)
+                                        
+                                        # Apply eligibility filters
+                                        if is_eligible(symbol, current_price, float_shares):
+                                            # Check VWAP
+                                            current_vwap = vwap_candles_numpy(
+                                                vwap_candles.get(symbol, [])
+                                            ) if symbol in vwap_candles else 0
+                                            
+                                            if current_price and current_price > current_vwap:
+                                                # Decode halt reason
+                                                halt_reasons = {
+                                                    'T1': 'News Pending',
+                                                    'T2': 'News Released',
+                                                    'T5': 'Single Security Trading Pause',
+                                                    'T6': 'Regulatory Concern',
+                                                    'T8': 'ETF Component Security Halt',
+                                                    'T12': 'Additional Information Requested',
+                                                    'LUDP': 'Volatility Trading Pause',
+                                                    'LUDS': 'Straddle Condition',
+                                                    'MWC': 'Market-Wide Circuit Breaker',
+                                                    'IPO1': 'IPO Not Ready',
+                                                    'M': 'Volatility Trading Pause',
+                                                }
+                                                halt_reason = halt_reasons.get(halt_reason_code, halt_reason_code)
+                                                
+                                                float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                                                
+                                                # Send alert
+                                                alert_msg = f"""🛑 <b>TRADING HALT</b> (NASDAQ)
+
+<b>Symbol:</b> {symbol}
+<b>Price:</b> ${current_price:.2f}
+<b>Float:</b> {float_display} shares
+<b>Halt Time:</b> {halt_time_str} EST
+<b>Reason:</b> {halt_reason} ({halt_reason_code})
+<b>Status:</b> HALTED ⏸️
+
+💡 <i>Meets your criteria: ≤$15 & ≤10M float</i>
+🚀 <i>Real-time via NASDAQ feed</i>"""
+                                                
+                                                await send_all_alerts(alert_msg)
+                                                
+                                                # Log halt event
+                                                log_event(
+                                                    "nasdaq_halt", symbol,
+                                                    current_price, 0, now, {
+                                                        "halt_reason": halt_reason,
+                                                        "halt_code": halt_reason_code,
+                                                        "halt_time": halt_time_str,
+                                                        "float_shares": float_shares,
+                                                        "data_source": "nasdaq_scrape"
+                                                    })
+                                                
+                                                logger.info(
+                                                    f"[NASDAQ HALT] {symbol} @ ${current_price:.2f} - {halt_reason}"
+                                                )
+                                    except Exception as e:
+                                        logger.error(f"[NASDAQ HALT ERROR] {symbol}: {e}")
+                                        continue
+                        
+        except Exception as e:
+            logger.error(f"[NASDAQ HALT MONITOR] Error: {e}")
+        
+        # Check every 30 seconds during market hours
+        await asyncio.sleep(30)
 
 
 async def ml_training_loop():
@@ -2833,7 +2961,8 @@ async def main():
     # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
     close_alert_task = asyncio.create_task(market_close_alert_loop())
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
-    # NASDAQ halt monitoring now handled via Polygon WebSocket (LULD.* subscription) - much more reliable!
+    # Enable NASDAQ halt monitoring (catches T1, T2, T5, T12 halts that Polygon LULD misses)
+    nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
     try:
         while True:
             await asyncio.sleep(60)
@@ -2843,10 +2972,12 @@ async def main():
         ingest_task.cancel()
         close_alert_task.cancel()
         premarket_alert_task.cancel()
+        nasdaq_halt_task.cancel()
 
         await ingest_task
         await close_alert_task
         await premarket_alert_task
+        await nasdaq_halt_task
 
 
 if __name__ == "__main__":
