@@ -97,8 +97,8 @@ load_float_cache()
 filter_counts = defaultdict(int)
 
 def is_eligible(symbol, last_price, float_shares):
-    """Check if symbol meets filtering criteria: price <= $10 AND float <= 10M"""
-    # Price check - ALL symbols must be <= $10 (no exceptions!)
+    """Check if symbol meets filtering criteria: price <= $15 AND float <= 10M"""
+    # Price check - ALL symbols must be <= $15 (increased for early momentum detection!)
     if last_price is None:
         filter_counts["price_none"] += 1
         if filter_counts["price_none"] % 100 == 1:  # Log every 100th occurrence
@@ -1407,7 +1407,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         close_wu = last_candle['close']
         volume_wu = last_candle['volume']
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
-        vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+        # 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
+        if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
+            logger.info(f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking alert")
+            return  # Block all alerts if no VWAP data
+        vwap_wu = vwap_candles_numpy(vwap_candles[symbol])
         dollar_volume_wu = close_wu * volume_wu
         # 🚀 EARLY MOMENTUM DETECTION - CATCH MOVES BEFORE THEY RUN!
         warming_up_criteria = (
@@ -1486,7 +1490,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         high_rn = last_candle['high']
         volume_rn = last_candle['volume']
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
-        vwap_rn = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+        # 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data  
+        if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
+            logger.info(f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking runner alert")
+            return  # Block all alerts if no VWAP data
+        vwap_rn = vwap_candles_numpy(vwap_candles[symbol])
 
         closes_for_trend = [c['close'] for c in last_6[-3:]]
         price_rising_trend = all(x < y for x, y in zip(closes_for_trend, closes_for_trend[1:]))
@@ -1679,8 +1687,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             alerted_symbols[symbol] = today
             last_alert_time[symbol] = now
 
-    # Volume Spike Logic PATCH
-    vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+    # Volume Spike Logic PATCH - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
+    if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
+        logger.info(f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking volume spike alert")
+        return  # Block all alerts if no VWAP data
+    vwap_value = vwap_candles_numpy(vwap_candles[symbol])
     logger.info(
         f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close} | Candle Volume={volume}"
     )
