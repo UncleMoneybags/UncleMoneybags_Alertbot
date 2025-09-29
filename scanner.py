@@ -1732,10 +1732,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         dollar_volume_wu = close_wu * volume_wu
         # 🚀 EARLY MOMENTUM DETECTION - CATCH MOVES BEFORE THEY RUN!
         warming_up_criteria = (
-            volume_wu >= max(1.5 * avg_vol_5, 25_000)
-            and  # REDUCED: 25K minimum for early detection
-            price_move_wu >= 0.02
-            and  # REDUCED: 2% move (catch early momentum!)
+            volume_wu >= max(1.8 * avg_vol_5, 35_000)
+            and  # EARLY DETECTION: Moderate volume spike
+            price_move_wu >= 0.04
+            and  # EARLY DETECTION: 4% move to catch before big runs!
             price_move_wu > 0 and  # MUST BE POSITIVE (no drops allowed)
             0.20 <= close_wu <= 25.00
             and  # INCREASED: Higher ceiling for momentum moves
@@ -1743,8 +1743,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and  # 🚨 REAL-TIME PRICE ABOVE VWAP!
             current_price_wu is not None and current_price_wu
             >= 1.005 * vwap_wu and  # 🚨 REAL-TIME PRICE 0.5% above VWAP!
-            dollar_volume_wu >= 50_000
-            and  # REDUCED: 50K dollar volume for early alerts
+            dollar_volume_wu >= 75_000
+            and  # EARLY DETECTION: Lower dollar volume for early alerts
             avg_vol_5 > 5_000  # REDUCED: Lower average volume threshold
         )
         # 🚨 DETAILED WARMING UP DEBUG - Track why alerts fire
@@ -1866,10 +1866,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
         # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison in criteria!
         runner_criteria = (
-            volume_rn >= 1.75 * avg_vol_5
-            and  # REDUCED: Lower volume for early detection
-            price_move_rn >= 0.025
-            and  # REDUCED: 2.5% move (catch runners early!)
+            volume_rn >= 2.2 * avg_vol_5
+            and  # BALANCED: Strong volume for confirmed runners
+            price_move_rn >= 0.06
+            and  # BALANCED: 6% move for established momentum!
             current_price_rn is not None and current_price_rn >= 0.10
             and  # Use real-time price, not candle close
             current_price_rn is not None and current_price_rn > vwap_rn
