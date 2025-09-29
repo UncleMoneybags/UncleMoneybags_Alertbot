@@ -1409,19 +1409,35 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
         vwap_wu = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
         dollar_volume_wu = close_wu * volume_wu
+        # 🚨 STRICT WARMING UP CRITERIA - NO WEAK ALERTS!
         warming_up_criteria = (
-            volume_wu >= 2.0 * avg_vol_5 and  # Higher volume requirement for quality
-            price_move_wu >= 0.03 and  # Require 3% UPWARD move for early detection
+            volume_wu >= max(2.0 * avg_vol_5, 75_000) and  # MINIMUM 75K volume + 2x average
+            price_move_wu >= 0.05 and  # Require 5% UPWARD move (not 3%)
+            price_move_wu > 0 and  # MUST BE POSITIVE (no drops allowed)
             0.20 <= close_wu <= 20.00 and
-            close_wu > vwap_wu and
-            dollar_volume_wu >= 50_000
+            close_wu > vwap_wu and  # ABOVE VWAP
+            close_wu >= 1.02 * vwap_wu and  # At least 2% above VWAP (stronger requirement)
+            dollar_volume_wu >= 100_000 and  # Higher dollar volume requirement
+            avg_vol_5 > 10_000  # Prevent division by tiny numbers
         )
+        # 🚨 DETAILED WARMING UP DEBUG - Track why alerts fire
         logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: warming_up | VWAP={vwap_wu:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close_wu} | Candle Volume={volume_wu}"
+            f"[WARMING UP DEBUG] {symbol} | "
+            f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={max(2.0 * avg_vol_5, 75_000):.0f}), "
+            f"PriceMove={price_move_wu*100:.2f}% (req=5%+), "
+            f"Close=${close_wu:.3f}, VWAP=${vwap_wu:.3f} (req=2%+ above), "
+            f"DollarVol=${dollar_volume_wu:.0f} (req=100K+), "
+            f"Open=${open_wu:.3f}"
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
         logger.info(f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}")
+        # 🚨 EXTRA SAFETY CHECK - Log when criteria would fire
+        if (volume_wu >= 2.0 * avg_vol_5 and price_move_wu >= 0.03 and 
+            0.20 <= close_wu <= 20.00 and close_wu > vwap_wu and dollar_volume_wu >= 50_000):
+            logger.warning(f"[⚠️ OLD CRITERIA] {symbol} would have fired under old criteria! "
+                         f"Vol={volume_wu}, Move={price_move_wu*100:.1f}%, Close=${close_wu:.3f}, VWAP=${vwap_wu:.3f}")
+        
         if warming_up_criteria and not warming_up_was_true[symbol]:
             if last_trade_volume[symbol] < 250:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
