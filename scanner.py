@@ -398,21 +398,116 @@ def calculate_emas(prices, periods=[5, 8, 13], window=30, symbol=None, latest_tr
     return emas
 
 def vwap_numpy(prices, volumes):
+    """🚨 ENHANCED VWAP: Bulletproof calculation with comprehensive validation"""
+    # Convert to numpy arrays with validation
     prices = np.asarray(prices, dtype=float)
     volumes = np.asarray(volumes, dtype=float)
-    total_vol = np.sum(volumes)
-    return np.sum(prices * volumes) / total_vol if total_vol > 0 else 0.0
+    
+    # Validate input arrays
+    if len(prices) != len(volumes):
+        raise ValueError(f"Price and volume arrays must have same length: {len(prices)} vs {len(volumes)}")
+    if len(prices) == 0:
+        raise ValueError("Cannot calculate VWAP with empty arrays")
+    
+    # Check for invalid values
+    if np.any(np.isnan(prices)) or np.any(np.isnan(volumes)):
+        raise ValueError("Price or volume arrays contain NaN values")
+    if np.any(np.isinf(prices)) or np.any(np.isinf(volumes)):
+        raise ValueError("Price or volume arrays contain infinite values")
+    if np.any(prices <= 0):
+        raise ValueError(f"All prices must be positive, got: {prices[prices <= 0]}")
+    if np.any(volumes <= 0):
+        raise ValueError(f"All volumes must be positive, got: {volumes[volumes <= 0]}")
+    
+    # Calculate VWAP with high precision
+    price_volume_products = np.multiply(prices, volumes, dtype=np.float64)
+    total_vol = np.sum(volumes, dtype=np.float64)
+    total_pv = np.sum(price_volume_products, dtype=np.float64)
+    
+    if total_vol <= 0:
+        raise ValueError(f"Total volume must be positive, got: {total_vol}")
+    
+    vwap_result = total_pv / total_vol
+    
+    # Final validation of result
+    if not np.isfinite(vwap_result) or vwap_result <= 0:
+        raise ValueError(f"VWAP calculation resulted in invalid value: {vwap_result}")
+    
+    return float(vwap_result)
 
 def vwap_candles_numpy(candles):
+    """🚨 ENHANCED CANDLE VWAP: Bulletproof calculation with error handling"""
     if not candles:
         logger.info("[VWAP DEBUG] No candles, returning 0")
         return 0.0
-    prices = [(c['high'] + c['low'] + c['close']) / 3 for c in candles]
-    volumes = [c['volume'] for c in candles]
-    logger.info(f"[VWAP DEBUG] Prices used: {prices}")
-    logger.info(f"[VWAP DEBUG] Volumes used: {volumes}")
-    vwap_val = vwap_numpy(prices, volumes)
-    logger.info(f"[VWAP DEBUG] VWAP result: {vwap_val}")
+    
+    try:
+        # Extract typical prices and volumes with validation
+        prices = []
+        volumes = []
+        for i, candle in enumerate(candles):
+            # Validate candle structure
+            required_fields = ['high', 'low', 'close', 'volume']
+            for field in required_fields:
+                if field not in candle:
+                    raise ValueError(f"Candle {i} missing required field: {field}")
+            
+            # Calculate typical price (HLC/3)
+            typical_price = (candle['high'] + candle['low'] + candle['close']) / 3
+            prices.append(typical_price)
+            volumes.append(candle['volume'])
+        
+        logger.info(f"[VWAP DEBUG] Prices used: {prices}")
+        logger.info(f"[VWAP DEBUG] Volumes used: {volumes}")
+        
+        # Use enhanced VWAP calculation
+        vwap_val = vwap_numpy(prices, volumes)
+        logger.info(f"[VWAP DEBUG] VWAP result: {vwap_val}")
+        return vwap_val
+        
+    except Exception as e:
+        logger.error(f"[VWAP ERROR] Failed to calculate VWAP from candles: {e}")
+        return 0.0  # Return 0 on error (will be caught by validation later)
+
+def get_valid_vwap(symbol):
+    """🚨 CENTRALIZED VWAP GUARD: Returns valid VWAP or None if insufficient data"""
+    if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
+        logger.info(f"[VWAP GUARD] {symbol} - Insufficient VWAP data ({len(vwap_candles[symbol]) if symbol in vwap_candles else 0} candles)")
+        return None
+    
+    # 🚨 CRITICAL VALIDATION: Ensure all candle data is valid before VWAP calculation
+    candles = vwap_candles[symbol]
+    for i, candle in enumerate(candles):
+        # Validate required fields exist and are positive
+        required_fields = ['high', 'low', 'close', 'volume']
+        for field in required_fields:
+            if field not in candle or candle[field] is None or candle[field] <= 0:
+                logger.error(f"[VWAP ERROR] {symbol} - Invalid candle {i}: {field}={candle.get(field, 'missing')}")
+                return None
+        
+        # Validate price relationships (high >= low >= 0, close between high/low)
+        if not (candle['high'] >= candle['low'] > 0):
+            logger.error(f"[VWAP ERROR] {symbol} - Invalid price relationship in candle {i}: high={candle['high']}, low={candle['low']}")
+            return None
+        if not (candle['low'] <= candle['close'] <= candle['high']):
+            logger.error(f"[VWAP ERROR] {symbol} - Close price outside high/low range in candle {i}: close={candle['close']}, high={candle['high']}, low={candle['low']}")
+            return None
+    
+    vwap_val = vwap_candles_numpy(vwap_candles[symbol])
+    
+    # 🚨 FINAL VALIDATION: Ensure VWAP result is reasonable
+    if vwap_val <= 0 or vwap_val > 10000:  # Sanity check - no stock should be > $10,000
+        logger.error(f"[VWAP ERROR] {symbol} - Unreasonable VWAP value: {vwap_val}")
+        return None
+    
+    # Verify VWAP is within reasonable range of current prices
+    recent_prices = [candle['close'] for candle in candles[-3:]]
+    min_recent = min(recent_prices)
+    max_recent = max(recent_prices)
+    if not (min_recent * 0.5 <= vwap_val <= max_recent * 2.0):  # VWAP should be within 50%-200% of recent prices
+        logger.warning(f"[VWAP WARNING] {symbol} - VWAP {vwap_val:.4f} seems out of range compared to recent prices {min_recent:.4f}-{max_recent:.4f}")
+    
+    logger.info(f"[VWAP VALIDATED] {symbol} - VWAP={vwap_val:.4f} from {len(candles)} candles")
     return vwap_val
 
 def rsi(prices, period=14):
@@ -1236,9 +1331,11 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
         if last_trade_volume[symbol] < 250:
             logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
             return
+        # 🚨 CRITICAL FIX: Use real-time price for perfect setup alerts
+        current_price = last_trade_price[symbol] if symbol in last_trade_price else last_close
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
-            f"<b>{escape_html(symbol)}</b> | ${get_display_price(symbol, last_close):.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
+            f"<b>{escape_html(symbol)}</b> | ${get_display_price(symbol, current_price):.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
             f"Trend: EMA5 > EMA8 > EMA13\n"
             f"{'Above VWAP' if last_close > vwap_value else 'Below VWAP'}"
             f" | MACD↑"
@@ -1266,7 +1363,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows, candles_seq,
         log_event(
             "perfect_setup",
             symbol,
-            get_display_price(symbol, last_close),
+            get_display_price(symbol, current_price),
             last_volume,
             now,
             {
@@ -1393,7 +1490,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         highs = [c['high'] for c in list(candles_seq)[-30:]]
         lows = [c['low'] for c in list(candles_seq)[-30:]]
         volumes = [c['volume'] for c in list(candles_seq)[-30:]]
-        vwap_value = vwap_candles_numpy(list(vwap_candles[symbol]))
+        # 🚨 CRITICAL FIX: Use centralized VWAP guard for perfect setup
+        vwap_value = get_valid_vwap(symbol)
+        if vwap_value is None:
+            logger.info(f"[VWAP GUARD] {symbol} - Blocking perfect setup alert - insufficient VWAP data")
+            return  # Block perfect setup alerts without valid VWAP
         if not ema_stack_was_true[symbol]:
             await alert_perfect_setup(symbol, closes, volumes, highs, lows, list(candles_seq)[-30:], vwap_value)
 
@@ -1448,11 +1549,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
             if (now - last_alert_time[symbol]) < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            log_event("warming_up", symbol, get_display_price(symbol, close_wu), volume_wu, event_time, {
+            # 🚨 CRITICAL FIX: Use real-time price, not stale candle price!
+            current_price = last_trade_price[symbol]  # Real-time market price
+            log_event("warming_up", symbol, get_display_price(symbol, current_price), volume_wu, event_time, {
                 "price_move": price_move_wu,
-                "dollar_volume": dollar_volume_wu
+                "dollar_volume": dollar_volume_wu,
+                "candle_price": close_wu,  # Log candle price for comparison
+                "real_time_price": current_price  # Log real-time price
             })
-            price_str = f"{get_display_price(symbol, close_wu):.2f}"
+            price_str = f"{get_display_price(symbol, current_price):.2f}"
             alert_text = (
                 f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
                 f"Current Price: ${price_str}"
@@ -1542,15 +1647,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             }
             score = get_alert_score("runner", symbol, alert_data)
             
-            log_event("runner", symbol, get_display_price(symbol, close_rn), volume_rn, event_time, {
+            # 🚨 CRITICAL FIX: Use real-time price for runner alerts
+            current_price = last_trade_price[symbol]
+            log_event("runner", symbol, get_display_price(symbol, current_price), volume_rn, event_time, {
                 "price_move": price_move_rn,
                 "trend_closes": closes_for_trend,
                 "wick_ok": wick_ok,
                 "vwap": vwap_rn,
-                "last_trade_price": last_trade_price[symbol],
+                "candle_price": close_rn,
+                "real_time_price": current_price,
                 "alert_score": score
             })
-            price_str = f"{get_display_price(symbol, close_rn):.2f}"
+            price_str = f"{get_display_price(symbol, current_price):.2f}"
             alert_text = (
                 f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
                 f"Current Price: ${price_str} (+{price_move_rn*100:.1f}%)"
@@ -1579,12 +1687,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         recent_high[symbol] = rhigh
     if recent_high[symbol] > 0:
         dip_pct = (recent_high[symbol] - close) / recent_high[symbol]
-        # Get current VWAP for filtering
-        current_vwap = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+        # 🚨 CRITICAL FIX: Use centralized VWAP guard
+        current_vwap = get_valid_vwap(symbol)
+        if current_vwap is None:
+            logger.info(f"[VWAP GUARD] {symbol} - Blocking dip play alert - insufficient VWAP data")
+            return  # Block dip play alerts without valid VWAP
         dip_play_criteria = (
             dip_pct >= MIN_DIP_PCT and 
             close <= 20.00 and 
-            close > current_vwap  # ❌ NO ALERTS UNDER VWAP - FIXED!
+            close > current_vwap  # ✅ NOW PROPERLY PROTECTED!
         )
         if dip_play_criteria and len(candles_seq) >= 3:
             c1, c2, c3 = list(candles_seq)[-3:]
@@ -1604,10 +1715,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if last_trade_volume[symbol] < 250:
                     logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                     return
-                log_event("dip_play", symbol, get_display_price(symbol, close), volume, event_time, {
-                    "dip_pct": dip_pct
+                # 🚨 CRITICAL FIX: Use real-time price for dip play alerts
+                current_price = last_trade_price[symbol]
+                log_event("dip_play", symbol, get_display_price(symbol, current_price), volume, event_time, {
+                    "dip_pct": dip_pct,
+                    "candle_price": close,
+                    "real_time_price": current_price
                 })
-                price_str = f"{get_display_price(symbol, close):.2f}"
+                price_str = f"{get_display_price(symbol, current_price):.2f}"
                 alert_text = (
                     f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
                     f"Current Price: ${price_str}"
@@ -1635,11 +1750,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 alerted_symbols[symbol] = today
                 last_alert_time[symbol] = now
 
-    # VWAP Reclaim Logic
-    if len(candles_seq) >= 2:
+    # VWAP Reclaim Logic - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
+    if len(candles_seq) >= 2 and len(vwap_candles[symbol]) >= 3:
         prev_candle = list(candles_seq)[-2]
         curr_candle = list(candles_seq)[-1]
-        prev_vwap = vwap_candles_numpy(list(vwap_candles[symbol])[:-1]) if len(vwap_candles[symbol]) >= 2 else None
+        # Require sufficient VWAP data for both calculations
+        if len(vwap_candles[symbol]) < 3:
+            logger.info(f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data for reclaim, blocking alert")
+            return  # Block VWAP reclaim if insufficient data
+        prev_vwap = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
         curr_vwap = vwap_candles_numpy(list(vwap_candles[symbol]))
         trailing_vols = [c['volume'] for c in list(candles_seq)[:-1]]
         rvol = 0
@@ -1671,10 +1790,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if last_trade_volume[symbol] < 250:
                 logger.info(f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})")
                 return
-            log_event("vwap_reclaim", symbol, get_display_price(symbol, curr_candle['close']), curr_candle['volume'], event_time, {
-                "rvol": rvol
+            # 🚨 CRITICAL FIX: Use real-time price for VWAP reclaim alerts
+            current_price = last_trade_price[symbol]
+            log_event("vwap_reclaim", symbol, get_display_price(symbol, current_price), curr_candle['volume'], event_time, {
+                "rvol": rvol,
+                "candle_price": curr_candle['close'],
+                "real_time_price": current_price
             })
-            price_str = f"{get_display_price(symbol, curr_candle['close']):.2f}"
+            price_str = f"{get_display_price(symbol, current_price):.2f}"
             vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
             vol_str = f"{curr_candle['volume']:,}"
             rvol_str = f"{rvol:.2f}"
@@ -1721,7 +1844,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"]:
             logger.info(f"[📊 VOLUME SPIKE] {symbol} | Adding to pending_alerts | Score: {score} | Volume: {spike_data['volume']} | RVOL: {spike_data['rvol']:.2f}")
         
-        price_str = f"{get_display_price(symbol, close):.2f}"
+        # 🚨 CRITICAL FIX: Use real-time price for volume spike alerts
+        current_price = last_trade_price[symbol]
+        price_str = f"{get_display_price(symbol, current_price):.2f}"
         rvol_str = f"{spike_data['rvol']:.1f}"
         move_pct = spike_data['price_move'] * 100
         
@@ -1747,7 +1872,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         await send_best_alert(symbol)
         
         event_time = now
-        log_event("volume_spike", symbol, get_display_price(symbol, close), volume, event_time, {
+        log_event("volume_spike", symbol, get_display_price(symbol, current_price), volume, event_time, {
+            "candle_price": close,
+            "real_time_price": current_price,
             "rvol": spike_data['rvol'],
             "vwap": vwap_value,
             "price_move": spike_data['price_move'],
@@ -1800,7 +1927,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema8 = emas['ema8']
             ema13 = emas['ema13']
             ema200 = emas.get('ema200') if use_200_ema else None
-            vwap_value = vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 0
+            # 🚨 CRITICAL FIX: Use centralized VWAP guard for EMA stack
+            vwap_value = get_valid_vwap(symbol)
+            if vwap_value is None:
+                logger.info(f"[VWAP GUARD] {symbol} - Blocking EMA stack alert - insufficient VWAP data")
+                return  # Block EMA stack alerts without valid VWAP
             last_candle = list(candles_seq)[-1]
             last_volume = last_candle['volume']
             price = closes[-1]
