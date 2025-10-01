@@ -13,7 +13,7 @@ import signal
 import pickle
 import csv
 import os
-import joblib
+import jobliba
 import numpy as np
 import atexit
 import sys
@@ -2703,20 +2703,22 @@ async def ingest_polygon_events():
                                         float_shares = await get_float_shares(
                                             symbol)
 
-                                        # Apply price and float filtering
-                                        if is_eligible(symbol, current_price,
-                                                       float_shares):
-                                            # ❌ NO ALERTS UNDER VWAP - CHECK VWAP FOR HALT ALERTS TOO!
-                                            current_vwap = vwap_candles_numpy(
-                                                vwap_candles.get(symbol, [])
-                                            ) if symbol in vwap_candles else 0
-                                            if current_price <= current_vwap:
-                                                logger.debug(
-                                                    f"[LULD FILTERED] {symbol} @ ${current_price:.2f} - below VWAP ${current_vwap:.2f}"
-                                                )
+                                        # 🚨 HALT ALERTS: Price check only (allow unknown float - it's a critical event!)
+                                        if current_price and current_price <= PRICE_THRESHOLD:
+                                            # Check if float is within range (if known), but don't block if unknown
+                                            float_in_range = (float_shares is None or 
+                                                            (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES) or
+                                                            symbol in FLOAT_EXCEPTION_SYMBOLS)
+                                            
+                                            if not float_in_range:
+                                                float_str = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                                                logger.info(f"[LULD FILTERED] {symbol} - float {float_str} out of range")
                                                 continue
-
-                                            float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                                            
+                                            # 🚨 HALT ALERTS: No VWAP check - halts are critical events!
+                                            # (VWAP can be invalid after reverse splits like RAYA, AKAN)
+                                            
+                                            float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
 
                                             # Determine halt reason from indicators
                                             halt_reason = "Volatility Halt"
@@ -2881,16 +2883,23 @@ async def nasdaq_halt_monitor():
                                         
                                         float_shares = await get_float_shares(symbol)
                                         
-                                        # Apply eligibility filters
-                                        if is_eligible(symbol, current_price, float_shares):
-                                            # Check VWAP
-                                            current_vwap = vwap_candles_numpy(
-                                                vwap_candles.get(symbol, [])
-                                            ) if symbol in vwap_candles else 0
+                                        # 🚨 HALT ALERTS: Price check only (allow unknown float - it's a critical event!)
+                                        if current_price and current_price <= PRICE_THRESHOLD:
+                                            # Check if float is within range (if known), but don't block if unknown
+                                            float_in_range = (float_shares is None or 
+                                                            (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES) or
+                                                            symbol in FLOAT_EXCEPTION_SYMBOLS)
                                             
-                                            if current_price and current_price > current_vwap:
-                                                # Decode halt reason
-                                                halt_reasons = {
+                                            if not float_in_range:
+                                                float_str = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                                                logger.info(f"[NASDAQ FILTERED] {symbol} - float {float_str} out of range")
+                                                continue
+                                            
+                                            # 🚨 HALT ALERTS: No VWAP check - halts are critical events!
+                                            # (VWAP can be invalid after reverse splits like RAYA, AKAN)
+                                            
+                                            # Decode halt reason
+                                            halt_reasons = {
                                                     'T1': 'News Pending',
                                                     'T2': 'News Released',
                                                     'T5': 'Single Security Trading Pause',
@@ -2903,12 +2912,12 @@ async def nasdaq_halt_monitor():
                                                     'IPO1': 'IPO Not Ready',
                                                     'M': 'Volatility Trading Pause',
                                                 }
-                                                halt_reason = halt_reasons.get(halt_reason_code, halt_reason_code)
-                                                
-                                                float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
-                                                
-                                                # Send alert
-                                                alert_msg = f"""🛑 <b>TRADING HALT</b> (NASDAQ)
+                                            halt_reason = halt_reasons.get(halt_reason_code, halt_reason_code)
+                                            
+                                            float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
+                                            
+                                            # Send alert
+                                            alert_msg = f"""🛑 <b>TRADING HALT</b> (NASDAQ)
 
 <b>Symbol:</b> {symbol}
 <b>Price:</b> ${current_price:.2f}
@@ -2919,23 +2928,24 @@ async def nasdaq_halt_monitor():
 
 💡 <i>Meets your criteria: ≤$15 & ≤10M float</i>
 🚀 <i>Real-time via NASDAQ feed</i>"""
-                                                
-                                                await send_all_alerts(alert_msg)
-                                                
-                                                # Log halt event
-                                                log_event(
-                                                    "nasdaq_halt", symbol,
-                                                    current_price, 0, now, {
-                                                        "halt_reason": halt_reason,
-                                                        "halt_code": halt_reason_code,
-                                                        "halt_time": halt_time_str,
-                                                        "float_shares": float_shares,
-                                                        "data_source": "nasdaq_scrape"
-                                                    })
-                                                
-                                                logger.info(
-                                                    f"[NASDAQ HALT] {symbol} @ ${current_price:.2f} - {halt_reason}"
-                                                )
+                                            
+                                            await send_all_alerts(alert_msg)
+                                            
+                                            # Log halt event
+                                            log_event(
+                                                "nasdaq_halt", symbol,
+                                                current_price, 0, now, {
+                                                    "halt_reason": halt_reason,
+                                                    "halt_code": halt_reason_code,
+                                                    "halt_time": halt_time_str,
+                                                    "float_shares": float_shares,
+                                                    "data_source": "nasdaq_scrape"
+                                                })
+                                            
+                                            logger.info(
+                                                f"[NASDAQ HALT] {symbol} @ ${current_price:.2f} - {halt_reason}"
+                                            )
+                                        
                                     except Exception as e:
                                         logger.error(f"[NASDAQ HALT ERROR] {symbol}: {e}")
                                         continue
