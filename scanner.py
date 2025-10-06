@@ -2045,24 +2045,38 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 len(trailing_vols), 20)
             rvol = curr_candle[
                 'volume'] / avg_trailing if avg_trailing > 0 else 0
+        # 🚨 FIX: Track real-time VWAP status for proper crossover detection
+        # Check if price is below VWAP NOW (not retroactively)
+        current_price_reclaim = last_trade_price[symbol]  # Real-time market price
+        is_below_vwap_now = (current_price_reclaim is not None and 
+                            curr_vwap is not None and 
+                            current_price_reclaim < curr_vwap * 0.995)  # 0.5% buffer to avoid noise
+        
+        is_above_vwap_now = (current_price_reclaim is not None and 
+                            curr_vwap is not None and 
+                            current_price_reclaim > curr_vwap * 1.01)  # 1% buffer for clear crossover
+        
+        # Update tracking: was the stock below VWAP on previous candle?
+        was_below_vwap_prev = below_vwap_streak[symbol] > 0
+        
+        # Update current status
+        if is_below_vwap_now:
+            below_vwap_streak[symbol] += 1
+        elif is_above_vwap_now:
+            below_vwap_streak[symbol] = 0  # Reset when clearly above
+        
         # Require UPWARD price movement for VWAP reclaim
         candle_price_move = (
             curr_candle['close'] - curr_candle['open']
         ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
-        # 🚨 CRITICAL FIX: Use real-time price for VWAP reclaim criteria!
-        current_price_reclaim = last_trade_price[
-            symbol]  # Real-time market price
+        
+        # 🚨 FIX: VWAP reclaim requires CROSSOVER (was below, now above)
         vwap_reclaim_criteria = (
-            prev_candle['close']
-            < (prev_vwap if prev_vwap is not None else prev_candle['close'])
-            and current_price_reclaim is not None and current_price_reclaim
-            > (curr_vwap if curr_vwap is not None else current_price_reclaim)
-            and  # 🚨 REAL-TIME PRICE!
-            candle_price_move >= 0.03
-            and  # Require 3% UPWARD move in the reclaim candle
-            curr_candle['volume'] >= 50_000
-            and  # REDUCED: Lower volume for early VWAP reclaims
-            rvol >= 1.5  # REDUCED: Lower RVOL for early detection
+            was_below_vwap_prev  # Stock WAS below VWAP on previous candle
+            and is_above_vwap_now  # Stock is NOW above VWAP (crossover!)
+            and candle_price_move >= 0.03  # Require 3% UPWARD move in the reclaim candle
+            and curr_candle['volume'] >= 50_000  # REDUCED: Lower volume for early VWAP reclaims
+            and rvol >= 1.5  # REDUCED: Lower RVOL for early detection
         )
 
         # DEBUG: Show why VWAP reclaim alerts might not fire
@@ -2089,14 +2103,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
             # 🚨 CRITICAL FIX: Use real-time price for VWAP reclaim alerts
             current_price = last_trade_price[symbol]
-            
-            # 🚨 CRITICAL SAFETY CHECK: Verify price is STILL above VWAP before sending alert
-            if current_price is None or curr_vwap is None or current_price <= curr_vwap:
-                logger.info(
-                    f"[VWAP PROTECTION] {symbol} - VWAP Reclaim blocked: price dropped back below VWAP. Price=${current_price}, VWAP=${curr_vwap}"
-                )
-                return  # Block alert if price dropped below VWAP
-            
             log_event(
                 "vwap_reclaim", symbol,
                 get_display_price(symbol, current_price),
@@ -2587,6 +2593,7 @@ async def ingest_polygon_events():
                                 symbol = event["sym"]
                                 price = event["p"]
                                 size = event.get('s', 0)
+                                trade_timestamp = event.get('t', 0)  # Polygon's event timestamp (milliseconds)
 
                                 # Check eligibility BEFORE processing/logging
                                 float_shares = await get_float_shares(symbol)
@@ -2594,12 +2601,21 @@ async def ingest_polygon_events():
                                                    float_shares):
                                     continue  # Skip ineligible symbols completely
 
+                                # 🚨 FIX: Use Polygon's timestamp to reject stale trades
+                                trade_time = datetime.fromtimestamp(trade_timestamp / 1000, tz=timezone.utc)
+                                now_utc = datetime.now(timezone.utc)
+                                trade_age_seconds = (now_utc - trade_time).total_seconds()
+                                
+                                # Reject trades older than 3 seconds (stale data)
+                                if trade_age_seconds > 3:
+                                    logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting")
+                                    continue
+                                
                                 last_trade_price[symbol] = price
                                 last_trade_volume[symbol] = size
-                                last_trade_time[symbol] = datetime.now(
-                                    timezone.utc)
+                                last_trade_time[symbol] = trade_time  # Use Polygon's timestamp, not now()
                                 print(
-                                    f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={last_trade_time[symbol]}"
+                                    f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={trade_time} | Age={trade_age_seconds:.1f}s"
                                 )
                             elif event.get("ev") == "AM":
                                 symbol = event["sym"]
@@ -2644,6 +2660,20 @@ async def ingest_polygon_events():
                                 if last_session != session_date:
                                     vwap_candles[symbol] = []
                                     vwap_session_date[symbol] = session_date
+                                
+                                # 🚨 FIX: Reset VWAP at 9:30 AM to exclude pre-market data
+                                candle_time = start_time.astimezone(eastern).time()
+                                market_open_time = dt_time(9, 30)
+                                
+                                # If this is the first candle at or after 9:30 AM, reset VWAP
+                                if len(vwap_candles[symbol]) > 0:
+                                    last_candle_time = vwap_candles[symbol][-1]['start_time'].astimezone(eastern).time()
+                                    # Reset if crossing from pre-market into regular session
+                                    if last_candle_time < market_open_time <= candle_time:
+                                        logger.info(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing pre-market data")
+                                        vwap_candles[symbol] = []
+                                        vwap_cum_vol[symbol] = 0
+                                        vwap_cum_pv[symbol] = 0
                                 
                                 # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
                                 if len(vwap_candles[symbol]) > 0:
