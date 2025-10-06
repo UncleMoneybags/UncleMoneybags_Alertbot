@@ -1,5 +1,5 @@
 import logging
-import asyncio
+import asyncios
 import websockets
 import aiohttp
 import json
@@ -1276,60 +1276,35 @@ def check_volume_spike(candles_seq, vwap_value):
     # Use the defined constants for consistency
     min_volume = RVOL_SPIKE_MIN_VOLUME  # 25,000 shares
 
-    wick_ok = curr_candle['close'] >= 0.75 * curr_candle['high']
-
-    # STRICT UPWARD MOVEMENT ONLY - NO NEGATIVE OR FLAT MOVES
+    # 🔥 SIMPLIFIED: Volume spike must come with RISING price
     price_momentum = (curr_candle['close'] - curr_candle['open']
                       ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
-    prev_momentum = (
-        curr_candle['close'] - prev_candle['close']
-    ) / prev_candle['close'] if prev_candle['close'] > 0 else 0
-
-    # 🔥 STRICT MOMENTUM: Volume spike must come with RISING price, not flat/down
-    is_green_candle = curr_candle['close'] > curr_candle[
-        'open'] and price_momentum >= 0.02  # Green candle (2%+ to be meaningful)
-    rising_from_prev = curr_candle['close'] > prev_candle[
-        'close']  # Above previous close
+    prev_momentum = (curr_candle['close'] - prev_candle['close']
+                     ) / prev_candle['close'] if prev_candle['close'] > 0 else 0
     
-    # 🔥 NEW: Check for consecutive price rise (not just single candle)
-    if len(list(candles_seq)) >= 3:
-        last_3_closes = [c['close'] for c in list(candles_seq)[-3:]]
-        price_trending_up = last_3_closes[-1] > last_3_closes[-2]  # At minimum, rising from previous
-    else:
-        price_trending_up = rising_from_prev
-
-    # ONLY POSITIVE MOVEMENT ALERTS - ignore flat/down price with volume spikes
-    bullish_momentum = is_green_candle and rising_from_prev and price_trending_up
+    # Green candle with meaningful move OR rising from previous with meaningful move
+    is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005  # 0.5%+ for early detection
+    rising_from_prev = curr_candle['close'] > prev_candle['close'] and prev_momentum >= 0.003  # 0.3%+ from previous
+    
+    # Price must be moving UP (green candle OR rising from previous)
+    bullish_momentum = is_green_candle or rising_from_prev
 
     symbol = curr_candle.get('symbol', '?')
 
-    # Special debug logging for problematic symbols
-    if symbol in ["PMI", "ETHZ", "ETHW"]:
-        logger.error(
-            f"[🚨 {symbol} DEBUG] DETAILED ANALYSIS | "
-            f"Open={curr_candle['open']}, Close={curr_candle['close']}, "
-            f"PrevClose={prev_candle['close']}, "
-            f"Price_momentum={price_momentum*100:.2f}%, Prev_momentum={prev_momentum*100:.2f}%, "
-            f"Vol={curr_volume}, RVOL={rvol:.2f}, Above_VWAP={above_vwap}, "
-            f"Green_candle={is_green_candle} (needs >=3.5%), "
-            f"Rising_from_prev={rising_from_prev} (needs >=2%), "
-            f"Bullish_momentum={bullish_momentum}")
-
     logger.info(
-        f"[VOLUME SPIKE] {symbol} | "
-        f"Vol={curr_volume}, RVOL={rvol:.2f}, Above VWAP={above_vwap}, "
-        f"Green Candle={is_green_candle} ({price_momentum*100:.1f}%), "
-        f"Rising from prev={rising_from_prev} ({prev_momentum*100:.1f}%), Wick OK={wick_ok}, "
-        f"Bullish momentum={bullish_momentum}")
+        f"[VOLUME SPIKE CHECK] {symbol} | "
+        f"Vol={curr_volume}, RVOL={rvol:.2f}, "
+        f"Green={is_green_candle} ({price_momentum*100:.1f}%), "
+        f"Rising={rising_from_prev}, Momentum={bullish_momentum}, "
+        f"Above VWAP={above_vwap}")
 
-    # Debug each condition individually
+    # Check each condition
     vol_ok = curr_volume >= min_volume
-    rvol_ok = rvol >= RVOL_SPIKE_THRESHOLD  # 2.5x for true spikes
+    rvol_ok = rvol >= RVOL_SPIKE_THRESHOLD  # 1.5x threshold for early detection
     vwap_ok = above_vwap
-    wick_check = wick_ok
     momentum_ok = bullish_momentum
 
-    spike_detected = vol_ok and rvol_ok and vwap_ok and wick_check and momentum_ok
+    spike_detected = vol_ok and rvol_ok and vwap_ok and momentum_ok
 
     # SPECIAL LOG: Rejected for being below VWAP
     if not vwap_ok and (vol_ok
@@ -1343,7 +1318,7 @@ def check_volume_spike(candles_seq, vwap_value):
         f"[SPIKE DEBUG] {curr_candle.get('symbol', '?')} | "
         f"vol_ok={vol_ok} ({curr_volume}>={min_volume}), "
         f"rvol_ok={rvol_ok} ({rvol:.2f}>={RVOL_SPIKE_THRESHOLD}), "
-        f"vwap_ok={vwap_ok}, wick_ok={wick_check}, momentum_ok={momentum_ok}, "
+        f"vwap_ok={vwap_ok}, momentum_ok={momentum_ok}, "
         f"FINAL: spike_detected={spike_detected}")
 
     # Return both result and data for scoring
@@ -1527,12 +1502,11 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                 f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
             )
             return
-        # 🚨 CRITICAL FIX: Use real-time price for perfect setup alerts
-        current_price = last_trade_price[
-            symbol] if symbol in last_trade_price else last_close
+        # 🚨 FIX: Use real-time price if fresh, otherwise candle close
+        alert_price = get_display_price(symbol, last_close)  # Fallback to candle close
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
-            f"<b>{escape_html(symbol)}</b> | ${get_display_price(symbol, current_price):.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
+            f"<b>{escape_html(symbol)}</b> | ${alert_price:.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
             f"Trend: EMA5 > EMA8 > EMA13\n"
             f"{'Above VWAP' if last_close > vwap_value else 'Below VWAP'}"
             f" | MACD↑"
@@ -1560,7 +1534,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
 
         now = datetime.now(timezone.utc)
         log_event(
-            "perfect_setup", symbol, get_display_price(symbol, current_price),
+            "perfect_setup", symbol, alert_price,
             last_volume, now, {
                 "ema5": ema5,
                 "ema8": ema8,
@@ -1736,41 +1710,43 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             return  # Block warming up alerts without valid VWAP
         dollar_volume_wu = close_wu * volume_wu
         
-        # 🔥 STRICT MOMENTUM: Require 2-3 consecutive rising closes AND volumes
+        # 🚀 EARLY RUNNER DETECTION - CATCH BEFORE THEY TAKE OFF!
         closes_wu = [c['close'] for c in last_6[-3:]]
         volumes_wu = [c['volume'] for c in last_6[-3:]]
-        price_streak = all(closes_wu[i] < closes_wu[i+1] for i in range(len(closes_wu)-1))  # 2 consecutive rises
-        volume_streak = all(volumes_wu[i] <= volumes_wu[i+1] for i in range(len(volumes_wu)-1))  # 2 consecutive rises
         
-        # 🚀 EARLY MOMENTUM DETECTION - CATCH MOVES BEFORE THEY RUN!
+        # Simple early momentum check (not too strict)
+        has_green_candle = close_wu > open_wu
+        rising_from_prev = len(closes_wu) >= 2 and close_wu > closes_wu[-2]
+        early_momentum = has_green_candle or rising_from_prev  # Either condition
+        
+        # WARMING UP = Early runner detection (low thresholds)
         warming_up_criteria = (
-            volume_wu >= max(1.8 * avg_vol_5, 35_000)
-            and  # EARLY DETECTION: Moderate volume spike
-            price_move_wu >= 0.04
-            and  # EARLY DETECTION: 4% move to catch before big runs!
-            price_move_wu > 0 and  # MUST BE POSITIVE (no drops allowed)
-            price_streak and  # 🔥 NEW: 2+ consecutive rising closes
-            volume_streak and  # 🔥 NEW: 2+ consecutive rising volumes
+            volume_wu >= 1.5 * avg_vol_5
+            and  # EARLY: Just 1.5x volume spike
+            volume_wu >= 25_000
+            and  # Minimum volume
+            price_move_wu >= 0.02
+            and  # EARLY: Just 2% move to catch before it runs!
+            price_move_wu > 0
+            and  # MUST BE POSITIVE
+            early_momentum
+            and  # Green candle OR rising from previous
             0.20 <= close_wu <= 25.00
-            and  # INCREASED: Higher ceiling for momentum moves
+            and
             current_price_wu is not None and current_price_wu > vwap_wu
-            and  # 🚨 REAL-TIME PRICE ABOVE VWAP!
-            current_price_wu is not None and current_price_wu
-            >= 1.005 * vwap_wu and  # 🚨 REAL-TIME PRICE 0.5% above VWAP!
-            dollar_volume_wu >= 75_000
-            and  # EARLY DETECTION: Lower dollar volume for early alerts
-            avg_vol_5 > 5_000  # REDUCED: Lower average volume threshold
+            and  # Above VWAP
+            dollar_volume_wu >= 50_000
+            and  # Lower dollar volume for early detection
+            avg_vol_5 > 5_000
         )
-        # 🚨 DETAILED WARMING UP DEBUG - Track why alerts fire
+        # 🚨 WARMING UP DEBUG
         logger.info(
             f"[WARMING UP DEBUG] {symbol} | "
-            f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={max(1.5 * avg_vol_5, 25_000):.0f}), "
-            f"PriceMove={price_move_wu*100:.2f}% (req=4%+), "
-            f"PriceStreak={price_streak} (closes={[f'{c:.3f}' for c in closes_wu]}), "
-            f"VolumeStreak={volume_streak} (vols={volumes_wu}), "
-            f"Real-time=${current_price_wu or 0:.3f}, VWAP=${vwap_wu:.3f} (Above VWAP={current_price_wu is not None and current_price_wu > vwap_wu}), "
-            f"DollarVol=${dollar_volume_wu:.0f} (req=75K+), "
-            f"Candle Close=${close_wu:.3f}")
+            f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={1.5 * avg_vol_5:.0f}), "
+            f"PriceMove={price_move_wu*100:.2f}% (req=2%+), "
+            f"Green={has_green_candle}, Rising={rising_from_prev}, Momentum={early_momentum}, "
+            f"Real-time=${current_price_wu or 0:.3f}, VWAP=${vwap_wu:.3f}, "
+            f"DollarVol=${dollar_volume_wu:.0f}")
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
         logger.info(
@@ -1795,22 +1771,21 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if (now - last_alert_time[symbol]) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            # 🚨 CRITICAL FIX: Use real-time price, not stale candle price!
-            current_price = last_trade_price[symbol]  # Real-time market price
+            # 🚨 FIX: Use real-time price if fresh, otherwise candle close
+            alert_price = get_display_price(symbol, close_wu)  # Fallback to candle close
             log_event(
                 "warming_up",
                 symbol,
-                get_display_price(symbol, current_price),
+                alert_price,
                 volume_wu,
                 event_time,
                 {
                     "price_move": price_move_wu,
                     "dollar_volume": dollar_volume_wu,
-                    "candle_price":
-                    close_wu,  # Log candle price for comparison
-                    "real_time_price": current_price  # Log real-time price
+                    "candle_price": close_wu,
+                    "real_time_price": last_trade_price.get(symbol)
                 })
-            price_str = f"{get_display_price(symbol, current_price):.2f}"
+            price_str = f"{alert_price:.2f}"
             alert_text = (f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
                           f"Current Price: ${price_str}")
             # Calculate alert score and add to pending alerts
@@ -1854,20 +1829,23 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             return  # Block all alerts if no VWAP data
         vwap_rn = vwap_candles_numpy(vwap_candles[symbol])
 
-        # 🔥 STRICT MOMENTUM: Require 2-3 consecutive rising closes AND volumes
+        # 🔥 EARLY DETECTION: Check for momentum trend (2 out of 3 rising)
         closes_for_trend = [c['close'] for c in last_6[-3:]]
         volumes_for_trend = [c['volume'] for c in last_6[-3:]]
-        price_rising_trend = all(
-            x < y for x, y in zip(closes_for_trend, closes_for_trend[1:]))
-        volume_rising_trend = all(
-            x <= y for x, y in zip(volumes_for_trend, volumes_for_trend[1:]))
-        wick_ok = close_rn >= 0.55 * high_rn
+        
+        # Count rising closes (2 out of 3 is good enough for early detection)
+        rising_closes = sum(1 for i in range(len(closes_for_trend)-1) 
+                           if closes_for_trend[i+1] > closes_for_trend[i])
+        price_rising_trend = rising_closes >= 2  # At least 2 out of 3 rising
+        
+        # Volume should be increasing (at least current > average of previous 2)
+        volume_rising_trend = volume_rn > sum(volumes_for_trend[:2]) / 2
 
         # 🚨 CRITICAL: Get real-time price for criteria evaluation
         current_price_rn = last_trade_price[symbol]  # Real-time market price
 
         logger.info(
-            f"[RUNNER DEBUG] {symbol} | Closes trend: {closes_for_trend} | price_rising_trend={price_rising_trend} | volume_rising_trend={volume_rising_trend} | wick_ok={wick_ok}"
+            f"[RUNNER DEBUG] {symbol} | Closes: {closes_for_trend} | Rising closes: {rising_closes}/2 | Price trend: {price_rising_trend} | Volume trend: {volume_rising_trend}"
         )
         logger.info(
             f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Real-time Price={current_price_rn} | Candle Close={close_rn} | Above VWAP={current_price_rn is not None and current_price_rn > vwap_rn} | Volume={volume_rn}"
@@ -1878,21 +1856,21 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             f"[STORED EMA] {symbol} | Runner | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
 
-        # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison in criteria!
+        # 🏃 RUNNER = Stocks ALREADY MOVING UP with volume and price
         runner_criteria = (
-            volume_rn >= 2.2 * avg_vol_5
-            and  # BALANCED: Strong volume for confirmed runners
-            price_move_rn >= 0.06
-            and  # BALANCED: 6% move for established momentum!
+            volume_rn >= 2.5 * avg_vol_5
+            and  # STRONG: 2.5x volume - stock is moving!
+            price_move_rn >= 0.05
+            and  # CONFIRMED: 5% move - established momentum!
             current_price_rn is not None and current_price_rn >= 0.10
-            and  # Use real-time price, not candle close
+            and  # Use real-time price
             current_price_rn is not None and current_price_rn > vwap_rn
-            and  # 🚨 CRITICAL: Real-time price vs VWAP!
+            and  # Above VWAP
             price_rising_trend
-            and  # 🔥 STRICT: Must have TRUE upward trend (2+ consecutive rises)
+            and  # At least 2 out of 3 candles rising
             volume_rising_trend
-            and  # 🔥 STRICT: Volume must be rising too (2+ consecutive rises)
-            wick_ok and volume_rn >= 15_000  # SIMPLIFIED: Minimum volume check
+            and  # Volume increasing
+            volume_rn >= 25_000  # Higher minimum for runners
         )
 
         if runner_criteria and not runner_was_true[symbol]:
@@ -1912,20 +1890,20 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             }
             score = get_alert_score("runner", symbol, alert_data)
 
-            # 🚨 CRITICAL FIX: Use real-time price for runner alerts
-            current_price = last_trade_price[symbol]
+            # 🚨 FIX: Use real-time price if fresh, otherwise candle close
+            alert_price = get_display_price(symbol, close_rn)  # Fallback to candle close
             log_event(
-                "runner", symbol, get_display_price(symbol, current_price),
+                "runner", symbol, alert_price,
                 volume_rn, event_time, {
                     "price_move": price_move_rn,
                     "trend_closes": closes_for_trend,
-                    "wick_ok": wick_ok,
+                    "rising_closes": rising_closes,
                     "vwap": vwap_rn,
                     "candle_price": close_rn,
-                    "real_time_price": current_price,
+                    "real_time_price": last_trade_price.get(symbol),
                     "alert_score": score
                 })
-            price_str = f"{get_display_price(symbol, current_price):.2f}"
+            price_str = f"{alert_price:.2f}"
             alert_text = (
                 f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
                 f"Current Price: ${price_str} (+{price_move_rn*100:.1f}%)")
@@ -1990,17 +1968,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                     )
                     return
-                # 🚨 CRITICAL FIX: Use real-time price for dip play alerts
-                current_price = last_trade_price[symbol]
+                # 🚨 FIX: Use real-time price if fresh, otherwise candle close
+                alert_price = get_display_price(symbol, close)  # Fallback to candle close
                 log_event(
                     "dip_play", symbol,
-                    get_display_price(symbol,
-                                      current_price), volume, event_time, {
+                    alert_price, volume, event_time, {
                                           "dip_pct": dip_pct,
                                           "candle_price": close,
-                                          "real_time_price": current_price
+                                          "real_time_price": last_trade_price.get(symbol)
                                       })
-                price_str = f"{get_display_price(symbol, current_price):.2f}"
+                price_str = f"{alert_price:.2f}"
                 alert_text = (f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
                               f"Current Price: ${price_str}")
                 # Calculate alert score and add to pending alerts
@@ -2045,47 +2022,38 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 len(trailing_vols), 20)
             rvol = curr_candle[
                 'volume'] / avg_trailing if avg_trailing > 0 else 0
-        # 🚨 FIX: Track real-time VWAP status for proper crossover detection
-        # Check if price is below VWAP NOW (not retroactively)
-        current_price_reclaim = last_trade_price[symbol]  # Real-time market price
-        is_below_vwap_now = (current_price_reclaim is not None and 
-                            curr_vwap is not None and 
-                            current_price_reclaim < curr_vwap * 0.995)  # 0.5% buffer to avoid noise
+        # 🚨 CRITICAL FIX: VWAP reclaim uses ONLY candle closes for crossover detection
+        # Previous logic was BROKEN - mixed real-time ticks with candle data
+        prev_close = prev_candle['close']
+        curr_close = curr_candle['close']
         
-        is_above_vwap_now = (current_price_reclaim is not None and 
-                            curr_vwap is not None and 
-                            current_price_reclaim > curr_vwap * 1.01)  # 1% buffer for clear crossover
+        # Simple, clean crossover detection: previous candle below, current candle above
+        prev_below_vwap = (prev_vwap is not None and prev_close < prev_vwap)
+        curr_above_vwap = (curr_vwap is not None and curr_close > curr_vwap * 1.005)  # 0.5% buffer
         
-        # Update tracking: was the stock below VWAP on previous candle?
-        was_below_vwap_prev = below_vwap_streak[symbol] > 0
-        
-        # Update current status
-        if is_below_vwap_now:
-            below_vwap_streak[symbol] += 1
-        elif is_above_vwap_now:
-            below_vwap_streak[symbol] = 0  # Reset when clearly above
+        # TRUE CROSSOVER = previous closed below AND current closed above (that's it!)
+        is_true_crossover = prev_below_vwap and curr_above_vwap
         
         # Require UPWARD price movement for VWAP reclaim
         candle_price_move = (
             curr_candle['close'] - curr_candle['open']
         ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
         
-        # 🚨 FIX: VWAP reclaim requires CROSSOVER (was below, now above)
+        # 🚨 VWAP reclaim criteria: TRUE crossover + volume confirmation
         vwap_reclaim_criteria = (
-            was_below_vwap_prev  # Stock WAS below VWAP on previous candle
-            and is_above_vwap_now  # Stock is NOW above VWAP (crossover!)
+            is_true_crossover  # Previous candle closed below, current closed above!
             and candle_price_move >= 0.03  # Require 3% UPWARD move in the reclaim candle
-            and curr_candle['volume'] >= 50_000  # REDUCED: Lower volume for early VWAP reclaims
-            and rvol >= 1.5  # REDUCED: Lower RVOL for early detection
+            and curr_candle['volume'] >= 50_000  # Volume threshold
+            and rvol >= 1.5  # RVOL threshold
         )
 
-        # DEBUG: Show why VWAP reclaim alerts might not fire
-        if symbol in ["OCTO", "GRND", "EQS"]:
+        # DEBUG: Show VWAP reclaim detection logic
+        if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
             logger.info(
-                f"[💎 VWAP RECLAIM DEBUG] {symbol} | criteria_met={vwap_reclaim_criteria} | prev_close<prev_vwap={prev_candle['close'] < (prev_vwap if prev_vwap is not None else prev_candle['close'])} | curr_close>curr_vwap={curr_candle['close'] > (curr_vwap if curr_vwap is not None else curr_candle['close'])} | volume>50K={curr_candle['volume'] >= 50_000} | rvol>1.5={rvol >= 1.5}"
+                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < prev_vwap={prev_vwap:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > curr_vwap={curr_vwap:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
             )
         logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: vwap_reclaim | VWAP={curr_vwap:.4f} | Real-time Price={current_price_reclaim} | Candle Close={curr_candle['close']} | Above VWAP={current_price_reclaim is not None and current_price_reclaim > curr_vwap} | Volume={curr_candle['volume']}"
+            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={prev_vwap:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2101,17 +2069,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                 )
                 return
-            # 🚨 CRITICAL FIX: Use real-time price for VWAP reclaim alerts
-            current_price = last_trade_price[symbol]
+            # 🚨 FIX: Use real-time price if fresh, otherwise candle close
+            alert_price = get_display_price(symbol, curr_candle['close'])  # Fallback to candle close
             log_event(
                 "vwap_reclaim", symbol,
-                get_display_price(symbol, current_price),
+                alert_price,
                 curr_candle['volume'], event_time, {
                     "rvol": rvol,
                     "candle_price": curr_candle['close'],
-                    "real_time_price": current_price
+                    "real_time_price": last_trade_price.get(symbol)
                 })
-            price_str = f"{get_display_price(symbol, current_price):.2f}"
+            price_str = f"{alert_price:.2f}"
             vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
             vol_str = f"{curr_candle['volume']:,}"
             rvol_str = f"{rvol:.2f}"
@@ -2172,9 +2140,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[📊 VOLUME SPIKE] {symbol} | Adding to pending_alerts | Score: {score} | Volume: {spike_data['volume']} | RVOL: {spike_data['rvol']:.2f}"
             )
 
-        # 🚨 CRITICAL FIX: Use real-time price for volume spike alerts
-        current_price = last_trade_price[symbol]
-        price_str = f"{get_display_price(symbol, current_price):.2f}"
+        # 🚨 FIX: Use real-time price if fresh, otherwise candle close
+        alert_price = get_display_price(symbol, close)  # Fallback to candle close
+        price_str = f"{alert_price:.2f}"
         rvol_str = f"{spike_data['rvol']:.1f}"
         move_pct = spike_data['price_move'] * 100
 
@@ -2199,10 +2167,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
         event_time = now
         log_event(
-            "volume_spike", symbol, get_display_price(symbol, current_price),
+            "volume_spike", symbol, alert_price,
             volume, event_time, {
                 "candle_price": close,
-                "real_time_price": current_price,
+                "real_time_price": last_trade_price.get(symbol),
                 "rvol": spike_data['rvol'],
                 "vwap": vwap_value,
                 "price_move": spike_data['price_move'],
@@ -2376,17 +2344,20 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if (now - last_alert_time[symbol]) < timedelta(
                         minutes=ALERT_COOLDOWN_MINUTES):
                     return
+                # 🚨 FIX: Use real-time price if fresh, otherwise candle close
+                alert_price = get_display_price(symbol, candle_close)  # Fallback to candle close
                 log_event(
                     "ema_stack", symbol,
-                    get_display_price(symbol, current_price_ema), last_volume,
+                    alert_price, last_volume,
                     event_time, {
                         "ema5": ema5,
                         "ema8": ema8,
                         "ema13": ema13,
                         "vwap": vwap_value,
-                        "session": session_type
+                        "session": session_type,
+                        "real_time_price": last_trade_price.get(symbol)
                     })
-                price_str = f"{get_display_price(symbol, current_price_ema):.2f}"
+                price_str = f"{alert_price:.2f}"
                 ema_display = f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
 
                 alert_text = (
@@ -2523,8 +2494,8 @@ async def ingest_polygon_events():
                 f"[CONNECTION] Connecting to Polygon WebSocket... (attempt {connection_attempts + 1})"
             )
             async with websockets.connect(url,
-                                          ping_interval=20,
-                                          ping_timeout=10) as ws:
+                                          ping_interval=30,
+                                          ping_timeout=30) as ws:
                 print(
                     "[CONNECTION] Successfully connected to Polygon WebSocket")
 
