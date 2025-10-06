@@ -2089,6 +2089,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 return
             # 🚨 CRITICAL FIX: Use real-time price for VWAP reclaim alerts
             current_price = last_trade_price[symbol]
+            
+            # 🚨 CRITICAL SAFETY CHECK: Verify price is STILL above VWAP before sending alert
+            if current_price is None or curr_vwap is None or current_price <= curr_vwap:
+                logger.info(
+                    f"[VWAP PROTECTION] {symbol} - VWAP Reclaim blocked: price dropped back below VWAP. Price=${current_price}, VWAP=${curr_vwap}"
+                )
+                return  # Block alert if price dropped below VWAP
+            
             log_event(
                 "vwap_reclaim", symbol,
                 get_display_price(symbol, current_price),
