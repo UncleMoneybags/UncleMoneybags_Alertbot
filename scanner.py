@@ -1161,9 +1161,10 @@ volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
 
-ALERT_COOLDOWN_MINUTES = 2  # Reduced from 5 to 2 minutes for faster day trading alerts
+ALERT_COOLDOWN_MINUTES = 1  # 🚨 REDUCED to 1 minute - catch rapid momentum shifts
+# 🚨 NEW: Track last alert time PER ALERT TYPE (not just per symbol)
 last_alert_time = defaultdict(
-    lambda: datetime.min.replace(tzinfo=timezone.utc))
+    lambda: defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc)))
 
 # --- ALERT PRIORITIZATION SYSTEM ---
 ALERT_PRIORITIES = {
@@ -1238,14 +1239,14 @@ async def send_best_alert(symbol):
         )
 
     # Only send if score is high enough (LOWERED for faster alerts)
-    if best_alert['score'] >= 30:
+    if best_alert['score'] >= 20:  # 🚨 LOWERED from 30 to 20 - catch more valid setups
         await send_all_alerts(best_alert['message'])
         logger.info(
             f"[ALERT SENT] {symbol} | {best_alert['type']} | Score: {best_alert['score']}"
         )
     else:
         logger.info(
-            f"[ALERT SKIPPED] {symbol} | Best score: {best_alert['score']} (threshold: 30)"
+            f"[ALERT SKIPPED] {symbol} | Best score: {best_alert['score']} (threshold: 20)"
         )
 
     # Clear pending alerts for this symbol
@@ -1372,13 +1373,32 @@ def get_ny_date():
 MAX_PRICE_AGE_SECONDS = 5  # REAL-TIME for day trading - not 60s delays!
 
 
-def get_display_price(symbol, fallback, max_age_seconds=MAX_PRICE_AGE_SECONDS):
-    price = last_trade_price[symbol]
-    trade_time = last_trade_time[symbol]
+def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_PRICE_AGE_SECONDS):
+    """Get freshest available price - compares real-time trade vs candle close timestamps"""
+    trade_price = last_trade_price.get(symbol)
+    trade_time = last_trade_time.get(symbol)
     now = datetime.now(timezone.utc)
-    if (price is not None and trade_time is not None
-            and (now - trade_time).total_seconds() < max_age_seconds):
-        return price
+    
+    # If we have a real-time trade price with timestamp
+    if trade_price is not None and trade_time is not None:
+        trade_age = (now - trade_time).total_seconds()
+        
+        # If fallback has a timestamp, compare which is fresher
+        if fallback_time is not None:
+            fallback_age = (now - fallback_time).total_seconds()
+            # Use whichever is fresher and within max age
+            if trade_age < fallback_age and trade_age < max_age_seconds:
+                return trade_price
+            elif fallback_age < max_age_seconds:
+                return fallback
+            # Both stale - use less stale one
+            return trade_price if trade_age < fallback_age else fallback
+        
+        # No fallback timestamp - use trade if fresh enough
+        if trade_age < max_age_seconds:
+            return trade_price
+    
+    # No valid real-time data, use fallback
     return fallback
 
 
@@ -1528,8 +1548,10 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                 f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
             )
             return
-        # 🚨 FIX: Use real-time price if fresh, otherwise candle close
-        alert_price = get_display_price(symbol, last_close)  # Fallback to candle close
+        
+        # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+        candle_time_ps = candles_seq[-1]['start_time'] + timedelta(minutes=1)
+        alert_price = get_display_price(symbol, last_close, candle_time_ps)
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
             f"<b>{escape_html(symbol)}</b> | ${alert_price:.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
@@ -1796,11 +1818,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                 )
                 return
-            if (now - last_alert_time[symbol]) < timedelta(
+            if (now - last_alert_time[symbol]['warming_up']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
-            # 🚨 FIX: Use real-time price if fresh, otherwise candle close
-            alert_price = get_display_price(symbol, close_wu)  # Fallback to candle close
+            
+            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+            candle_time_wu = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
+            alert_price = get_display_price(symbol, close_wu, candle_time_wu)
             log_event(
                 "warming_up",
                 symbol,
@@ -1836,7 +1860,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
             warming_up_was_true[symbol] = True
             alerted_symbols[symbol] = today
-            last_alert_time[symbol] = now
+            last_alert_time[symbol]['warming_up'] = now
 
     # --- Runner Logic with trend check, upper wick filter, real-time price in alert, and debug logging ---
     if len(candles_seq) >= 6:
@@ -1908,9 +1932,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                 )
                 return
-            if (now - last_alert_time[symbol]) < timedelta(
+            if (now - last_alert_time[symbol]['runner']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
+            
             # Calculate alert score and add to pending alerts
             alert_data = {
                 'rvol': volume_rn / avg_vol_5,
@@ -1919,8 +1944,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             }
             score = get_alert_score("runner", symbol, alert_data)
 
-            # 🚨 FIX: Use real-time price if fresh, otherwise candle close
-            alert_price = get_display_price(symbol, close_rn)  # Fallback to candle close
+            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+            candle_time_rn = last_6[-1]['start_time'] + timedelta(minutes=1)
+            alert_price = get_display_price(symbol, close_rn, candle_time_rn)
             log_event(
                 "runner", symbol, alert_price,
                 volume_rn, event_time, {
@@ -1949,7 +1975,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
             runner_was_true[symbol] = True
             runner_alerted_today[symbol] = today
-            last_alert_time[symbol] = now
+            last_alert_time[symbol]['runner'] = now
 
     # DIP PLAY LOGIC
     MIN_DIP_PCT = 0.10
@@ -1989,7 +2015,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[STORED EMA] {symbol} | Dip Play | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
             )
             if dip_play_criteria and not dip_play_was_true[symbol]:
-                if (now - last_alert_time[symbol]) < timedelta(
+                if (now - last_alert_time[symbol]['dip_play']) < timedelta(
                         minutes=ALERT_COOLDOWN_MINUTES):
                     return
                 if last_trade_volume[symbol] < 500:
@@ -1997,8 +2023,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                     )
                     return
-                # 🚨 FIX: Use real-time price if fresh, otherwise candle close
-                alert_price = get_display_price(symbol, close)  # Fallback to candle close
+                
+                # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+                candle_time_dp = c3['start_time'] + timedelta(minutes=1)
+                alert_price = get_display_price(symbol, close, candle_time_dp)
                 log_event(
                     "dip_play", symbol,
                     alert_price, volume, event_time, {
@@ -2030,7 +2058,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 dip_play_was_true[symbol] = True
                 dip_play_seen.add(symbol)
                 alerted_symbols[symbol] = today
-                last_alert_time[symbol] = now
+                last_alert_time[symbol]['dip_play'] = now
 
     # VWAP Reclaim Logic - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
     if len(candles_seq) >= 2 and len(vwap_candles[symbol]) >= 3:
@@ -2090,7 +2118,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
         if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
-            if (now - last_alert_time[symbol]) < timedelta(
+            if (now - last_alert_time[symbol]['vwap_reclaim']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
             if last_trade_volume[symbol] < 500:
@@ -2099,45 +2127,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
                 return
             
-            # 🚨 CRITICAL SAFETY CHECK: Require FRESH real-time price confirmation above VWAP
-            latest_price = last_trade_price.get(symbol)
-            latest_time = last_trade_time.get(symbol)
-            now = datetime.now(timezone.utc)
+            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+            candle_time_vr = curr_candle['start_time'] + timedelta(minutes=1)
+            alert_price = get_display_price(symbol, curr_candle['close'], candle_time_vr)
             
-            # Check if price is fresh (< 5 seconds old)
-            price_is_fresh = (latest_price is not None and latest_time is not None 
-                            and (now - latest_time).total_seconds() < 5)
-            
-            # Block if no FRESH price data OR if current price not above VWAP
-            if not price_is_fresh:
-                logger.info(
-                    f"[VWAP SAFEGUARD] {symbol} - No FRESH price data (<5s), blocking VWAP reclaim alert"
-                )
-                return  # Require fresh real-time price for VWAP reclaim
-            
-            # Require price to be MEANINGFULLY above VWAP (at least 0.3% above)
-            vwap_margin = (latest_price - curr_vwap) / curr_vwap if curr_vwap > 0 else -1
-            
-            if vwap_margin < 0.003:  # Block if price not at least 0.3% above VWAP
-                logger.info(
-                    f"[VWAP SAFEGUARD] {symbol} - Fresh price ${latest_price:.2f} not sufficiently above VWAP ${curr_vwap:.2f} (margin: {vwap_margin*100:.2f}%), blocking alert"
-                )
-                return  # Block alert if price not meaningfully above VWAP
-            
-            # 🚨 DIAGNOSTIC LOGGING - Capture ALL values at alert time
-            logger.critical(
-                f"🚨 [VWAP RECLAIM ALERT FIRING] {symbol}\n"
-                f"  ├─ Fresh Price: ${latest_price:.4f} (age: {(now - latest_time).total_seconds():.1f}s)\n"
-                f"  ├─ Current VWAP: ${curr_vwap:.4f}\n"
-                f"  ├─ Margin: {vwap_margin*100:.2f}%\n"
-                f"  ├─ Prev Close: ${prev_close:.4f} | Prev VWAP: ${prev_vwap:.4f}\n"
-                f"  ├─ Curr Close: ${curr_close:.4f} | Curr VWAP: ${curr_vwap:.4f}\n"
-                f"  ├─ Crossover: prev_below={prev_below_vwap}, curr_above={curr_above_vwap}\n"
-                f"  └─ VWAP Candles Used: {len(vwap_candles[symbol])}"
-            )
-            
-            # 🚨 FIX: Use real-time price if fresh, otherwise candle close
-            alert_price = get_display_price(symbol, curr_candle['close'])  # Fallback to candle close
+            # 🚨 REMOVED 0.3% margin requirement - was blocking valid reclaims
+            # Price just needs to be above VWAP, period - no artificial margin required
             log_event(
                 "vwap_reclaim", symbol,
                 alert_price,
@@ -2155,7 +2150,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             await send_all_alerts(alert_text)
             vwap_reclaim_was_true[symbol] = True
             alerted_symbols[symbol] = today
-            last_alert_time[symbol] = now
+            last_alert_time[symbol]['vwap_reclaim'] = now
 
     # Volume Spike Logic PATCH - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
     if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
@@ -2178,7 +2173,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX",
                   "EBMT"]:  # Debug key symbols
         logger.info(
-            f"[🔥 VOLUME SPIKE DEBUG] {symbol} | spike_detected={spike_detected} | volume_spike_was_true={volume_spike_was_true[symbol]} | last_trade_volume={last_trade_volume[symbol]} | cooldown_ok={(now - last_alert_time[symbol]).total_seconds() > ALERT_COOLDOWN_MINUTES * 60}"
+            f"[🔥 VOLUME SPIKE DEBUG] {symbol} | spike_detected={spike_detected} | volume_spike_was_true={volume_spike_was_true[symbol]} | last_trade_volume={last_trade_volume[symbol]} | cooldown_ok={(now - last_alert_time[symbol]['volume_spike']).total_seconds() > ALERT_COOLDOWN_MINUTES * 60}"
         )
         if spike_detected:
             logger.info(
@@ -2191,10 +2186,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
             )
             return
-        if (now - last_alert_time[symbol]) < timedelta(
+        if (now - last_alert_time[symbol]['volume_spike']) < timedelta(
                 minutes=ALERT_COOLDOWN_MINUTES):
             logger.info(
-                f"[COOLDOWN] {symbol}: Skipping alert due to cooldown ({(now - last_alert_time[symbol]).total_seconds():.0f}s ago)"
+                f"[COOLDOWN] {symbol}: Skipping volume_spike alert due to cooldown ({(now - last_alert_time[symbol]['volume_spike']).total_seconds():.0f}s ago)"
             )
             return
 
@@ -2207,8 +2202,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[📊 VOLUME SPIKE] {symbol} | Adding to pending_alerts | Score: {score} | Volume: {spike_data['volume']} | RVOL: {spike_data['rvol']:.2f}"
             )
 
-        # 🚨 FIX: Use real-time price if fresh, otherwise candle close
-        alert_price = get_display_price(symbol, close)  # Fallback to candle close
+        # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+        candle_time_vs = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
+        alert_price = get_display_price(symbol, close, candle_time_vs)
         price_str = f"{alert_price:.2f}"
         rvol_str = f"{spike_data['rvol']:.1f}"
         move_pct = spike_data['price_move'] * 100
@@ -2245,7 +2241,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             })
         volume_spike_was_true[symbol] = True
         alerted_symbols[symbol] = today
-        last_alert_time[symbol] = now
+        last_alert_time[symbol]['volume_spike'] = now
 
     # --- EMA STACK LOGIC PATCH (SESSION-AWARE THRESHOLDS) ---
     if (float_shares is not None and float_shares <= 10_000_000):
@@ -2308,33 +2304,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_volume = last_candle['volume']
             candle_close = closes[-1]
 
-            # 🚨 CRITICAL FIX: Require FRESH real-time price for EMA stack verification
-            current_price_ema = last_trade_price.get(symbol)
-            latest_time = last_trade_time.get(symbol)
-            now = datetime.now(timezone.utc)
-            
-            # Check if price is fresh (< 5 seconds old)
-            price_is_fresh = (current_price_ema is not None and latest_time is not None 
-                            and (now - latest_time).total_seconds() < 5)
-            
-            # Block if no FRESH price data - cannot verify EMAs are truly stacked
-            if not price_is_fresh:
-                logger.debug(
-                    f"[EMA STACK BLOCKED] {symbol} - No FRESH price data (<5s), cannot confirm EMAs truly stacked"
-                )
-                return  # Require fresh real-time price for EMA stack alerts
-            
-            # 🚨 DIAGNOSTIC LOGGING - Capture ALL values at alert time
-            logger.critical(
-                f"🚨 [EMA STACK ALERT FIRING] {symbol}\n"
-                f"  ├─ Fresh Price: ${current_price_ema:.4f} (age: {(now - latest_time).total_seconds():.1f}s)\n"
-                f"  ├─ VWAP: ${vwap_value:.4f}\n"
-                f"  ├─ Price vs VWAP: {((current_price_ema - vwap_value) / vwap_value * 100):.2f}%\n"
-                f"  ├─ EMA5: {ema5:.4f} | EMA8: {ema8:.4f} | EMA13: {ema13:.4f}\n"
-                f"  ├─ Ratio 5/8: {(ema5/ema8 if ema8 > 0 else 0):.6f} (need >={1.011:.6f})\n"
-                f"  ├─ Ratio 8/13: {(ema8/ema13 if ema13 > 0 else 0):.6f} (need >={1.011:.6f})\n"
-                f"  └─ Stack Valid: {ema_stack_valid}"
-            )
+            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+            candle_time_ema = last_candle['start_time'] + timedelta(minutes=1)
+            current_price_ema = get_display_price(symbol, candle_close, candle_time_ema)
             
             # 🚨 CRITICAL VWAP CHECK - NEVER ALERT STOCKS UNDER VWAP!
             if vwap_value <= 0:
@@ -2431,7 +2403,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                     )
                     return
-                if (now - last_alert_time[symbol]) < timedelta(
+                if (now - last_alert_time[symbol]['ema_stack']) < timedelta(
                         minutes=ALERT_COOLDOWN_MINUTES):
                     return
                 # 🚨 FIX: Use real-time price if fresh, otherwise candle close
@@ -2475,7 +2447,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
                 ema_stack_was_true[symbol] = True
                 alerted_symbols[symbol] = today
-                last_alert_time[symbol] = now
+                last_alert_time[symbol]['ema_stack'] = now
 
 
 def update_profile_for_day(symbol, day_candles):
@@ -2850,7 +2822,7 @@ async def ingest_polygon_events():
 <b>Low Limit:</b> ${low_limit:.2f}
 <b>Status:</b> VOLATILITY HALT ⚠️
 
-💡 <i>Meets your criteria: ≤$10 & 0.5M-10M float</i>
+💡 <i>Meets your criteria: ≤$15 & 0.5M-10M float</i>
 🚀 <i>Real-time via Polygon LULD feed</i>"""
 
                                             await send_all_alerts(alert_msg)
