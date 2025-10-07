@@ -721,6 +721,16 @@ RVOL_SPIKE_MIN_VOLUME = 25000  # REDUCED: Lower volume for early spikes
 MIN_FLOAT_SHARES = 500_000
 MAX_FLOAT_SHARES = 10_000_000
 
+# 🚨 ADAPTIVE VOLUME THRESHOLDS FOR MICRO-FLOAT STOCKS
+def get_min_volume_for_float(float_shares):
+    """Return adaptive volume threshold based on float size - catches ULY-type micro-float runners"""
+    if float_shares is None:
+        return 25_000  # Default for unknown float
+    elif float_shares < 3_000_000:  # Micro-float (like ULY at 1.25M)
+        return 7_500  # 🚨 MUCH LOWER for micro-floats - catches 8-18k/min spikes
+    else:  # Regular float (3M-10M)
+        return 25_000  # Standard threshold
+
 # Exception list for hot stocks that bypass float restrictions
 FLOAT_EXCEPTION_SYMBOLS = {
     "OCTO", "GME", "AMC", "BBBY", "DWAC"
@@ -1266,8 +1276,12 @@ def get_session_date(dt):
     return dt_ny.date()
 
 
-def check_volume_spike(candles_seq, vwap_value):
-    """Improved volume spike detection with better RVOL calculation and price momentum"""
+def check_volume_spike(candles_seq, vwap_value, float_shares=None):
+    """Improved volume spike detection with better RVOL calculation and price momentum
+    
+    Args:
+        float_shares: Float size for adaptive thresholds - catches micro-float spikes like ULY
+    """
     if len(candles_seq) < 10:  # Need more candles for stable RVOL
         return False, {}
 
@@ -1285,8 +1299,8 @@ def check_volume_spike(candles_seq, vwap_value):
     current_price_spike = last_trade_price[symbol]
     above_vwap = current_price_spike is not None and current_price_spike > vwap_value
 
-    # Use the defined constants for consistency
-    min_volume = RVOL_SPIKE_MIN_VOLUME  # 25,000 shares
+    # 🚨 ADAPTIVE volume threshold - catches ULY-type micro-float spikes (8-18k shares/min)
+    min_volume = get_min_volume_for_float(float_shares)  # 7.5k for micro-floats, 25k for regular
 
     # 🔥 SIMPLIFIED: Volume spike must come with RISING price
     price_momentum = (curr_candle['close'] - curr_candle['open']
@@ -1733,11 +1747,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         early_momentum = has_green_candle or rising_from_prev  # Either condition
         
         # WARMING UP = Early runner detection (low thresholds)
+        min_vol_wu = get_min_volume_for_float(float_shares)  # 🚨 Adaptive: 7.5k for micro-floats, 25k for regular
         warming_up_criteria = (
             volume_wu >= 1.5 * avg_vol_5
             and  # EARLY: Just 1.5x volume spike
-            volume_wu >= 25_000
-            and  # Minimum volume
+            volume_wu >= min_vol_wu
+            and  # 🚨 ADAPTIVE minimum volume (catches ULY 8-18k spikes!)
             price_move_wu >= 0.02
             and  # EARLY: Just 2% move to catch before it runs!
             price_move_wu > 0
@@ -1870,6 +1885,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
 
         # 🏃 RUNNER = Stocks ALREADY MOVING UP with volume and price
+        min_vol_rn = get_min_volume_for_float(float_shares)  # 🚨 Adaptive: 7.5k for micro-floats, 25k for regular
         runner_criteria = (
             volume_rn >= 2.5 * avg_vol_5
             and  # STRONG: 2.5x volume - stock is moving!
@@ -1883,7 +1899,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and  # At least 2 out of 3 candles rising
             volume_rising_trend
             and  # Volume increasing
-            volume_rn >= 25_000  # Higher minimum for runners
+            volume_rn >= min_vol_rn  # 🚨 ADAPTIVE minimum (catches ULY 8-18k spikes!)
         )
 
         if runner_criteria and not runner_was_true[symbol]:
@@ -2082,6 +2098,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                 )
                 return
+            
+            # 🚨 CRITICAL SAFETY CHECK: Ensure current price is STILL above VWAP before alerting
+            latest_price = last_trade_price.get(symbol) or curr_candle['close']
+            if latest_price <= curr_vwap:
+                logger.info(
+                    f"[VWAP SAFEGUARD] {symbol} - Price ${latest_price:.2f} dropped back below VWAP ${curr_vwap:.2f}, blocking false reclaim alert"
+                )
+                return  # Block alert if price fell back below VWAP
+            
             # 🚨 FIX: Use real-time price if fresh, otherwise candle close
             alert_price = get_display_price(symbol, curr_candle['close'])  # Fallback to candle close
             log_event(
@@ -2118,7 +2143,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     logger.info(
         f"[STORED EMA] {symbol} | Volume Spike | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
     )
-    spike_detected, spike_data = check_volume_spike(candles_seq, vwap_value)
+    spike_detected, spike_data = check_volume_spike(candles_seq, vwap_value, float_shares)
 
     # DEBUG: Show why volume spike alerts might not fire
     if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX",
