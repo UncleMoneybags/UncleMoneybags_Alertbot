@@ -33,6 +33,10 @@ last_trade_price = defaultdict(lambda: None)
 last_trade_volume = defaultdict(lambda: 0)
 last_trade_time = defaultdict(lambda: None)
 
+# 🎯 GRANDFATHERING: Track entry price when stock first becomes eligible
+# Once eligible, keep monitoring even if price runs past $15 threshold
+entry_price = defaultdict(lambda: None)
+
 float_cache = {}
 float_cache_none_retry = {}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
@@ -108,22 +112,30 @@ load_float_cache()
 filter_counts = defaultdict(int)
 
 
-def is_eligible(symbol, last_price, float_shares):
-    """Check if symbol meets filtering criteria: price <= $15 AND float <= 10M"""
+def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
+    """Check if symbol meets filtering criteria: price <= $15 AND float <= 10M
+    
+    Args:
+        use_entry_price: If True and symbol has entry_price, use that instead of current price
+                        (allows grandfathering - keeps tracking stocks that run past $15)
+    """
+    # 🎯 GRANDFATHERING: Use entry price for already-tracked stocks
+    check_price = entry_price.get(symbol) if use_entry_price and entry_price.get(symbol) else last_price
+    
     # Price check - ALL symbols must be <= $15 (increased for early momentum detection!)
-    if last_price is None:
+    if check_price is None:
         filter_counts["price_none"] += 1
         if filter_counts["price_none"] % 100 == 1:  # Log every 100th occurrence
             logger.info(
                 f"[FILTER DEBUG] {symbol} filtered: price is None (count: {filter_counts['price_none']})"
             )
         return False
-    elif last_price > PRICE_THRESHOLD:
+    elif check_price > PRICE_THRESHOLD:
         filter_counts["price_too_high"] += 1
-        if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"
+        if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT", "GLTO"
                       ] or filter_counts["price_too_high"] % 50 == 1:
             logger.info(
-                f"[FILTER DEBUG] {symbol} filtered: price ${last_price:.2f} > ${PRICE_THRESHOLD} (count: {filter_counts['price_too_high']})"
+                f"[FILTER DEBUG] {symbol} filtered: price ${check_price:.2f} > ${PRICE_THRESHOLD} (count: {filter_counts['price_too_high']}) [using {'entry' if use_entry_price and entry_price.get(symbol) else 'current'} price]"
             )
         return False
 
@@ -1695,6 +1707,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         last_candles = list(candles_seq)[-available:]
         volumes_prev = [c["volume"] for c in last_candles[:-1]]
         avg_vol_5 = sum(volumes_prev) / len(volumes_prev) if volumes_prev else 1
+        last_candle = last_candles[-1]
         open_wu = last_candle['open']
         close_wu = last_candle['close']
         volume_wu = last_candle['volume']
@@ -2568,9 +2581,21 @@ async def ingest_polygon_events():
 
                                 # Check eligibility BEFORE processing/logging
                                 float_shares = await get_float_shares(symbol)
-                                if not is_eligible(symbol, price,
-                                                   float_shares):
+                                
+                                # 🎯 GRANDFATHERING: Use entry price for already-tracked stocks
+                                is_tracked = symbol in entry_price and entry_price[symbol] is not None
+                                
+                                if not is_eligible(symbol, price, float_shares, use_entry_price=is_tracked):
+                                    # If not eligible and was being tracked, clear entry price
+                                    if is_tracked:
+                                        logger.info(f"[GRANDFATHERING] {symbol} no longer eligible, removing from tracking (entry: ${entry_price[symbol]:.2f}, current: ${price:.2f})")
+                                        entry_price[symbol] = None
                                     continue  # Skip ineligible symbols completely
+                                
+                                # 🎯 NEW STOCK: Record entry price when first eligible
+                                if not is_tracked:
+                                    entry_price[symbol] = price
+                                    logger.info(f"[GRANDFATHERING] {symbol} now eligible - locked entry price: ${price:.2f}")
 
                                 # 🚨 FIX: Use Polygon's timestamp to reject stale trades
                                 trade_time = datetime.fromtimestamp(trade_timestamp / 1000, tz=timezone.utc)
