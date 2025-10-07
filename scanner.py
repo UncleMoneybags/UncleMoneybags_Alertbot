@@ -2786,17 +2786,16 @@ async def ingest_polygon_events():
                                         float_shares = await get_float_shares(
                                             symbol)
 
-                                        # 🚨 HALT ALERTS: Price check only (allow unknown float - it's a critical event!)
+                                        # 🚨 HALT ALERTS: Price check only - ALWAYS alert if price ≤$15
                                         if current_price and current_price <= PRICE_THRESHOLD:
-                                            # Check if float is within range (if known), but don't block if unknown
-                                            float_in_range = (float_shares is None or 
-                                                            (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES) or
-                                                            symbol in FLOAT_EXCEPTION_SYMBOLS)
-                                            
-                                            if not float_in_range:
-                                                float_str = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
-                                                logger.info(f"[LULD FILTERED] {symbol} - float {float_str} out of range")
-                                                continue
+                                            # Only check float if we have the data - don't block on unknown float!
+                                            if float_shares is not None:
+                                                # We have float data - verify it's in range
+                                                if not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
+                                                    float_str = f"{float_shares/1e6:.1f}M"
+                                                    logger.info(f"[LULD FILTERED] {symbol} - float {float_str} out of range")
+                                                    continue
+                                            # If float_shares is None, we proceed (halts are critical - don't block on missing data!)
                                             
                                             # 🚨 HALT ALERTS: No VWAP check - halts are critical events!
                                             # (VWAP can be invalid after reverse splits like RAYA, AKAN)
@@ -2966,17 +2965,16 @@ async def nasdaq_halt_monitor():
                                         
                                         float_shares = await get_float_shares(symbol)
                                         
-                                        # 🚨 HALT ALERTS: Price check only (allow unknown float - it's a critical event!)
+                                        # 🚨 HALT ALERTS: Price check only - ALWAYS alert if price ≤$15
                                         if current_price and current_price <= PRICE_THRESHOLD:
-                                            # Check if float is within range (if known), but don't block if unknown
-                                            float_in_range = (float_shares is None or 
-                                                            (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES) or
-                                                            symbol in FLOAT_EXCEPTION_SYMBOLS)
-                                            
-                                            if not float_in_range:
-                                                float_str = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
-                                                logger.info(f"[NASDAQ FILTERED] {symbol} - float {float_str} out of range")
-                                                continue
+                                            # Only check float if we have the data - don't block on unknown float!
+                                            if float_shares is not None:
+                                                # We have float data - verify it's in range
+                                                if not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
+                                                    float_str = f"{float_shares/1e6:.1f}M"
+                                                    logger.info(f"[NASDAQ FILTERED] {symbol} - float {float_str} out of range")
+                                                    continue
+                                            # If float_shares is None, we proceed (halts are critical - don't block on missing data!)
                                             
                                             # 🚨 HALT ALERTS: No VWAP check - halts are critical events!
                                             # (VWAP can be invalid after reverse splits like RAYA, AKAN)
