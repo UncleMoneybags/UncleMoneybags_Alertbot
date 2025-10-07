@@ -2494,8 +2494,8 @@ async def ingest_polygon_events():
                 f"[CONNECTION] Connecting to Polygon WebSocket... (attempt {connection_attempts + 1})"
             )
             async with websockets.connect(url,
-                                          ping_interval=30,
-                                          ping_timeout=30) as ws:
+                                          ping_interval=15,
+                                          ping_timeout=20) as ws:
                 print(
                     "[CONNECTION] Successfully connected to Polygon WebSocket")
 
