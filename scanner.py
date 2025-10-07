@@ -2099,13 +2099,42 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 )
                 return
             
-            # 🚨 CRITICAL SAFETY CHECK: Ensure current price is STILL above VWAP before alerting
-            latest_price = last_trade_price.get(symbol) or curr_candle['close']
-            if latest_price <= curr_vwap:
+            # 🚨 CRITICAL SAFETY CHECK: Require FRESH real-time price confirmation above VWAP
+            latest_price = last_trade_price.get(symbol)
+            latest_time = last_trade_time.get(symbol)
+            now = datetime.now(timezone.utc)
+            
+            # Check if price is fresh (< 5 seconds old)
+            price_is_fresh = (latest_price is not None and latest_time is not None 
+                            and (now - latest_time).total_seconds() < 5)
+            
+            # Block if no FRESH price data OR if current price not above VWAP
+            if not price_is_fresh:
                 logger.info(
-                    f"[VWAP SAFEGUARD] {symbol} - Price ${latest_price:.2f} dropped back below VWAP ${curr_vwap:.2f}, blocking false reclaim alert"
+                    f"[VWAP SAFEGUARD] {symbol} - No FRESH price data (<5s), blocking VWAP reclaim alert"
                 )
-                return  # Block alert if price fell back below VWAP
+                return  # Require fresh real-time price for VWAP reclaim
+            
+            # Require price to be MEANINGFULLY above VWAP (at least 0.3% above)
+            vwap_margin = (latest_price - curr_vwap) / curr_vwap if curr_vwap > 0 else -1
+            
+            if vwap_margin < 0.003:  # Block if price not at least 0.3% above VWAP
+                logger.info(
+                    f"[VWAP SAFEGUARD] {symbol} - Fresh price ${latest_price:.2f} not sufficiently above VWAP ${curr_vwap:.2f} (margin: {vwap_margin*100:.2f}%), blocking alert"
+                )
+                return  # Block alert if price not meaningfully above VWAP
+            
+            # 🚨 DIAGNOSTIC LOGGING - Capture ALL values at alert time
+            logger.critical(
+                f"🚨 [VWAP RECLAIM ALERT FIRING] {symbol}\n"
+                f"  ├─ Fresh Price: ${latest_price:.4f} (age: {(now - latest_time).total_seconds():.1f}s)\n"
+                f"  ├─ Current VWAP: ${curr_vwap:.4f}\n"
+                f"  ├─ Margin: {vwap_margin*100:.2f}%\n"
+                f"  ├─ Prev Close: ${prev_close:.4f} | Prev VWAP: ${prev_vwap:.4f}\n"
+                f"  ├─ Curr Close: ${curr_close:.4f} | Curr VWAP: ${curr_vwap:.4f}\n"
+                f"  ├─ Crossover: prev_below={prev_below_vwap}, curr_above={curr_above_vwap}\n"
+                f"  └─ VWAP Candles Used: {len(vwap_candles[symbol])}"
+            )
             
             # 🚨 FIX: Use real-time price if fresh, otherwise candle close
             alert_price = get_display_price(symbol, curr_candle['close'])  # Fallback to candle close
@@ -2279,11 +2308,34 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_volume = last_candle['volume']
             candle_close = closes[-1]
 
-            # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
-            current_price_ema = last_trade_price[symbol]
-            if current_price_ema is None:
-                current_price_ema = candle_close
-
+            # 🚨 CRITICAL FIX: Require FRESH real-time price for EMA stack verification
+            current_price_ema = last_trade_price.get(symbol)
+            latest_time = last_trade_time.get(symbol)
+            now = datetime.now(timezone.utc)
+            
+            # Check if price is fresh (< 5 seconds old)
+            price_is_fresh = (current_price_ema is not None and latest_time is not None 
+                            and (now - latest_time).total_seconds() < 5)
+            
+            # Block if no FRESH price data - cannot verify EMAs are truly stacked
+            if not price_is_fresh:
+                logger.debug(
+                    f"[EMA STACK BLOCKED] {symbol} - No FRESH price data (<5s), cannot confirm EMAs truly stacked"
+                )
+                return  # Require fresh real-time price for EMA stack alerts
+            
+            # 🚨 DIAGNOSTIC LOGGING - Capture ALL values at alert time
+            logger.critical(
+                f"🚨 [EMA STACK ALERT FIRING] {symbol}\n"
+                f"  ├─ Fresh Price: ${current_price_ema:.4f} (age: {(now - latest_time).total_seconds():.1f}s)\n"
+                f"  ├─ VWAP: ${vwap_value:.4f}\n"
+                f"  ├─ Price vs VWAP: {((current_price_ema - vwap_value) / vwap_value * 100):.2f}%\n"
+                f"  ├─ EMA5: {ema5:.4f} | EMA8: {ema8:.4f} | EMA13: {ema13:.4f}\n"
+                f"  ├─ Ratio 5/8: {(ema5/ema8 if ema8 > 0 else 0):.6f} (need >={1.011:.6f})\n"
+                f"  ├─ Ratio 8/13: {(ema8/ema13 if ema13 > 0 else 0):.6f} (need >={1.011:.6f})\n"
+                f"  └─ Stack Valid: {ema_stack_valid}"
+            )
+            
             # 🚨 CRITICAL VWAP CHECK - NEVER ALERT STOCKS UNDER VWAP!
             if vwap_value <= 0:
                 logger.debug(
