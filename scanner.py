@@ -1690,11 +1690,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                                       list(candles_seq)[-30:], vwap_value)
 
     # --- Warming Up Logic with STRICT MOMENTUM REQUIREMENTS ---
-    if len(candles_seq) >= 6:
-        last_6 = list(candles_seq)[-6:]
-        volumes_5 = [c['volume'] for c in last_6[:-1]]
-        avg_vol_5 = sum(volumes_5) / 5
-        last_candle = last_6[-1]
+    if len(candles_seq) >= 3:
+        available = min(6, len(candles_seq))
+        last_candles = list(candles_seq)[-available:]
+        volumes_prev = [c["volume"] for c in last_candles[:-1]]
+        avg_vol_5 = sum(volumes_prev) / len(volumes_prev) if volumes_prev else 1
         open_wu = last_candle['open']
         close_wu = last_candle['close']
         volume_wu = last_candle['volume']
@@ -1711,8 +1711,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         dollar_volume_wu = close_wu * volume_wu
         
         # 🚀 EARLY RUNNER DETECTION - CATCH BEFORE THEY TAKE OFF!
-        closes_wu = [c['close'] for c in last_6[-3:]]
-        volumes_wu = [c['volume'] for c in last_6[-3:]]
+        closes_wu = [c['close'] for c in last_candles[-3:]]
+        volumes_wu = [c['volume'] for c in last_candles[-3:]]
         
         # Simple early momentum check (not too strict)
         has_green_candle = close_wu > open_wu
