@@ -1374,7 +1374,8 @@ MAX_PRICE_AGE_SECONDS = 5  # REAL-TIME for day trading - not 60s delays!
 
 
 def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_PRICE_AGE_SECONDS):
-    """Get freshest available price - compares real-time trade vs candle close timestamps"""
+    """Get freshest available price - compares real-time trade vs candle close timestamps
+    Returns None if all data is stale (>max_age_seconds) to prevent false alerts"""
     trade_price = last_trade_price.get(symbol)
     trade_time = last_trade_time.get(symbol)
     now = datetime.now(timezone.utc)
@@ -1391,14 +1392,24 @@ def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_
                 return trade_price
             elif fallback_age < max_age_seconds:
                 return fallback
-            # Both stale - use less stale one
-            return trade_price if trade_age < fallback_age else fallback
+            # Both stale - return None to block alerts
+            return None
         
         # No fallback timestamp - use trade if fresh enough
         if trade_age < max_age_seconds:
             return trade_price
+        # Trade is stale and no fallback timestamp - return None
+        return None
     
-    # No valid real-time data, use fallback
+    # No valid real-time data - use fallback only if we have its timestamp and it's fresh
+    if fallback_time is not None:
+        fallback_age = (now - fallback_time).total_seconds()
+        if fallback_age < max_age_seconds:
+            return fallback
+        # Fallback is stale - return None
+        return None
+    
+    # No timestamp info - return fallback as last resort (for compatibility)
     return fallback
 
 
@@ -1822,6 +1833,29 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
             
+            # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
+            real_time_price_wu = last_trade_price.get(symbol)
+            real_time_timestamp_wu = last_trade_time.get(symbol)
+            
+            # Check if we have real-time price data (explicit None check to catch $0.00)
+            if real_time_price_wu is None or real_time_timestamp_wu is None:
+                logger.info(f"[WARMING UP BLOCKED] {symbol} - No real-time price available for confirmation")
+                return
+            
+            # Recompute NOW to ensure freshness check reflects actual alert moment
+            now_fresh_wu = datetime.now(timezone.utc)
+            
+            # Verify price data is FRESH (≤5 seconds old)
+            price_age_wu = (now_fresh_wu - real_time_timestamp_wu).total_seconds()
+            if price_age_wu > 5:
+                logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is stale ({price_age_wu:.1f}s old)")
+                return
+            
+            # Verify real-time price is ACTUALLY above VWAP (not just from criteria check)
+            if real_time_price_wu <= vwap_wu:
+                logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price ${real_time_price_wu:.2f} NOT above VWAP ${vwap_wu:.2f}")
+                return
+            
             # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
             candle_time_wu = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
             alert_price = get_display_price(symbol, close_wu, candle_time_wu)
@@ -1936,6 +1970,29 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
             
+            # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
+            real_time_price_rn = last_trade_price.get(symbol)
+            real_time_timestamp_rn = last_trade_time.get(symbol)
+            
+            # Check if we have real-time price data (explicit None check to catch $0.00)
+            if real_time_price_rn is None or real_time_timestamp_rn is None:
+                logger.info(f"[RUNNER BLOCKED] {symbol} - No real-time price available for confirmation")
+                return
+            
+            # Recompute NOW to ensure freshness check reflects actual alert moment
+            now_fresh_rn = datetime.now(timezone.utc)
+            
+            # Verify price data is FRESH (≤5 seconds old)
+            price_age_rn = (now_fresh_rn - real_time_timestamp_rn).total_seconds()
+            if price_age_rn > 5:
+                logger.info(f"[RUNNER BLOCKED] {symbol} - Real-time price is stale ({price_age_rn:.1f}s old)")
+                return
+            
+            # Verify real-time price is ACTUALLY above VWAP (not just from criteria check)
+            if real_time_price_rn <= vwap_rn:
+                logger.info(f"[RUNNER BLOCKED] {symbol} - Real-time price ${real_time_price_rn:.2f} NOT above VWAP ${vwap_rn:.2f}")
+                return
+            
             # Calculate alert score and add to pending alerts
             alert_data = {
                 'rvol': volume_rn / avg_vol_5,
@@ -2022,6 +2079,29 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     logger.info(
                         f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                     )
+                    return
+                
+                # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
+                real_time_price = last_trade_price.get(symbol)
+                real_time_timestamp = last_trade_time.get(symbol)
+                
+                # Check if we have real-time price data (explicit None check to catch $0.00)
+                if real_time_price is None or real_time_timestamp is None:
+                    logger.info(f"[DIP PLAY BLOCKED] {symbol} - No real-time price available for confirmation")
+                    return
+                
+                # Recompute NOW to ensure freshness check reflects actual alert moment
+                now_fresh = datetime.now(timezone.utc)
+                
+                # Verify price data is FRESH (≤5 seconds old)
+                price_age = (now_fresh - real_time_timestamp).total_seconds()
+                if price_age > 5:
+                    logger.info(f"[DIP PLAY BLOCKED] {symbol} - Real-time price is stale ({price_age:.1f}s old)")
+                    return
+                
+                # Verify real-time price is ACTUALLY above VWAP (not just candle close)
+                if real_time_price <= current_vwap:
+                    logger.info(f"[DIP PLAY BLOCKED] {symbol} - Real-time price ${real_time_price:.2f} NOT above VWAP ${current_vwap:.2f}")
                     return
                 
                 # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
@@ -2308,6 +2388,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             candle_time_ema = last_candle['start_time'] + timedelta(minutes=1)
             current_price_ema = get_display_price(symbol, candle_close, candle_time_ema)
             
+            # Block alert if no fresh price data available
+            if current_price_ema is None:
+                logger.info(f"[EMA STACK BLOCKED] {symbol} - No fresh price data (all sources >5s old)")
+                return
+            
             # 🚨 CRITICAL VWAP CHECK - NEVER ALERT STOCKS UNDER VWAP!
             if vwap_value <= 0:
                 logger.debug(
@@ -2405,6 +2490,29 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     return
                 if (now - last_alert_time[symbol]['ema_stack']) < timedelta(
                         minutes=ALERT_COOLDOWN_MINUTES):
+                    return
+                
+                # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
+                real_time_price_ema = last_trade_price.get(symbol)
+                real_time_timestamp_ema = last_trade_time.get(symbol)
+                
+                # Check if we have real-time price data (explicit None check to catch $0.00)
+                if real_time_price_ema is None or real_time_timestamp_ema is None:
+                    logger.info(f"[EMA STACK BLOCKED] {symbol} - No real-time price available for confirmation")
+                    return
+                
+                # Recompute NOW to ensure freshness check reflects actual alert moment
+                now_fresh_ema = datetime.now(timezone.utc)
+                
+                # Verify price data is FRESH (≤5 seconds old)
+                price_age_ema = (now_fresh_ema - real_time_timestamp_ema).total_seconds()
+                if price_age_ema > 5:
+                    logger.info(f"[EMA STACK BLOCKED] {symbol} - Real-time price is stale ({price_age_ema:.1f}s old)")
+                    return
+                
+                # Verify real-time price is ACTUALLY above VWAP (not just from get_display_price fallback)
+                if real_time_price_ema <= vwap_value:
+                    logger.info(f"[EMA STACK BLOCKED] {symbol} - Real-time price ${real_time_price_ema:.2f} NOT above VWAP ${vwap_value:.2f}")
                     return
                 # 🚨 FIX: Use real-time price if fresh, otherwise candle close
                 alert_price = get_display_price(symbol, candle_close)  # Fallback to candle close
