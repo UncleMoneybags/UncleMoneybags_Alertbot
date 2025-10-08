@@ -1386,19 +1386,23 @@ def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_
         # If fallback has a timestamp, compare which is fresher
         if fallback_time is not None:
             fallback_age = (now - fallback_time).total_seconds()
-            # Use whichever is fresher and within max age
-            if trade_age < fallback_age and trade_age < max_age_seconds:
+            
+            # Prefer real-time if it's fresh (within max age)
+            if trade_age < max_age_seconds:
                 return trade_price
-            elif fallback_age < max_age_seconds:
+            
+            # Real-time is stale, check fallback
+            if fallback_age < max_age_seconds:
                 return fallback
-            # Both stale - use less stale one
+            
+            # Both stale - use whichever is fresher
             return trade_price if trade_age < fallback_age else fallback
         
-        # No fallback timestamp - use trade if fresh enough
+        # No fallback timestamp - use trade if fresh enough, otherwise fallback
         if trade_age < max_age_seconds:
             return trade_price
     
-    # No valid real-time data, use fallback
+    # No valid real-time data or real-time is too old, use fallback
     return fallback
 
 
@@ -1556,7 +1560,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
             f"<b>{escape_html(symbol)}</b> | ${alert_price:.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
             f"Trend: EMA5 > EMA8 > EMA13\n"
-            f"{'Above VWAP' if last_close > vwap_value else 'Below VWAP'}"
+            f"{'Above VWAP' if alert_price > vwap_value else 'Below VWAP'}"
             f" | MACD↑"
             f" | RSI: {int(round(last_rsi))}")
         # Calculate alert score and add to pending alerts
@@ -1565,7 +1569,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
             rvol,
             'volume':
             last_volume,
-            'price_move': (last_close - candles_seq[-1]['open']) /
+            'price_move': (alert_price - candles_seq[-1]['open']) /
             candles_seq[-1]['open'] if candles_seq[-1]['open'] > 0 else 0
         }
         score = get_alert_score("perfect_setup", symbol, alert_data)
@@ -1707,8 +1711,20 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[EMA BACKFILL] {symbol} | Backfill failed, using current close price"
             )
 
-    # Update stored EMAs with new candle close price
-    current_emas = update_stored_emas(symbol, close)
+    # Update stored EMAs with real-time price if available, otherwise candle close
+    # This ensures EMAs stay synchronized with the price used in alert criteria
+    update_price = last_trade_price.get(symbol)
+    if update_price is None or last_trade_time.get(symbol) is None:
+        # No real-time data, use candle close
+        update_price = close
+    else:
+        # Check if real-time price is fresh (within 5 seconds)
+        trade_age = (now - last_trade_time[symbol]).total_seconds()
+        if trade_age > 5:
+            # Real-time data is stale, use candle close
+            update_price = close
+    
+    current_emas = update_stored_emas(symbol, update_price)
     vwap_candles[symbol].append({
         'open': open_,
         'high': high,
