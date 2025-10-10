@@ -12,7 +12,7 @@ import pytz
 import signal
 import pickle
 import csv
-import os 
+import os
 import joblib
 import numpy as np
 import atexit
@@ -113,7 +113,7 @@ filter_counts = defaultdict(int)
 
 
 def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
-    """Check if symbol meets filtering criteria: price <= $15 AND float <= 10M
+    """Check if symbol meets filtering criteria: price <= $15 AND float <= 20M
     
     Args:
         use_entry_price: If True and symbol has entry_price, use that instead of current price
@@ -719,7 +719,7 @@ RVOL_SPIKE_THRESHOLD = 1.5  # REDUCED: Lower RVOL for early detection
 RVOL_SPIKE_MIN_VOLUME = 25000  # REDUCED: Lower volume for early spikes
 
 MIN_FLOAT_SHARES = 500_000
-MAX_FLOAT_SHARES = 10_000_000
+MAX_FLOAT_SHARES = 20_000_000  # UPDATED: Increased from 10M to 20M
 
 # 🚨 ADAPTIVE VOLUME THRESHOLDS FOR MICRO-FLOAT STOCKS
 def get_min_volume_for_float(float_shares):
@@ -728,7 +728,7 @@ def get_min_volume_for_float(float_shares):
         return 25_000  # Default for unknown float
     elif float_shares < 3_000_000:  # Micro-float (like ULY at 1.25M)
         return 7_500  # 🚨 MUCH LOWER for micro-floats - catches 8-18k/min spikes
-    else:  # Regular float (3M-10M)
+    else:  # Regular float (3M-20M)
         return 25_000  # Standard threshold
 
 # Exception list for hot stocks that bypass float restrictions
@@ -1297,7 +1297,7 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
         trailing_volumes) == 3 else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
     # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
-    current_price_spike = last_trade_price[symbol]
+    current_price_spike = last_trade_price.get(symbol)
     above_vwap = current_price_spike is not None and current_price_spike > vwap_value
 
     # 🚨 ADAPTIVE volume threshold - catches ULY-type micro-float spikes (8-18k shares/min)
@@ -1540,7 +1540,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
     logger.info(f"[DEBUG] {symbol} | All candle volumes: {volumes}")
 
     # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
-    current_price_perfect = last_trade_price[symbol]
+    current_price_perfect = last_trade_price.get(symbol)
     perfect = ((ema5 > ema8 > ema13) and (ema5 >= 1.011 * ema13) and
                (current_price_perfect is not None
                 and current_price_perfect > vwap_value)  # 🚨 REAL-TIME PRICE!
@@ -1759,7 +1759,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         close_wu = last_candle['close']
         volume_wu = last_candle['volume']
         # 🚨 CRITICAL: Get real-time price for criteria evaluation
-        current_price_wu = last_trade_price[symbol]  # Real-time market price
+        current_price_wu = last_trade_price.get(symbol)  # Real-time market price
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
         # 🚨 CRITICAL FIX: Use centralized VWAP guard for warming up alerts
         vwap_wu = get_valid_vwap(symbol)
@@ -1928,7 +1928,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         volume_rising_trend = volume_rn > sum(volumes_for_trend[:2]) / 2
 
         # 🚨 CRITICAL: Get real-time price for criteria evaluation
-        current_price_rn = last_trade_price[symbol]  # Real-time market price
+        current_price_rn = last_trade_price.get(symbol)  # Real-time market price
 
         logger.info(
             f"[RUNNER DEBUG] {symbol} | Closes: {closes_for_trend} | Rising closes: {rising_closes}/2 | Price trend: {price_rising_trend} | Volume trend: {volume_rising_trend}"
@@ -2064,7 +2064,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}"
             )
             logger.info(
-                f"[ALERT DEBUG] {symbol} | Alert Type: dip_play | VWAP={vwap_candles_numpy(vwap_candles[symbol]):.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close} | Candle Volume={volume}"
+                f"[ALERT DEBUG] {symbol} | Alert Type: dip_play | VWAP={vwap_candles_numpy(vwap_candles[symbol]):.4f} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
             )
             # Use stored EMAs for Dip Play
             emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2240,7 +2240,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         return  # Block all alerts if no VWAP data
     vwap_value = vwap_candles_numpy(vwap_candles[symbol])
     logger.info(
-        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value:.4f} | Last Trade={last_trade_price[symbol]} | Candle Close={close} | Candle Volume={volume}"
+        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value:.4f} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
     )
     # Use stored EMAs for Volume Spike
     emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2324,7 +2324,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         last_alert_time[symbol]['volume_spike'] = now
 
     # --- EMA STACK LOGIC PATCH (SESSION-AWARE THRESHOLDS) ---
-    if (float_shares is not None and float_shares <= 10_000_000):
+    if (float_shares is not None and float_shares <= 20_000_000):
         session_type = get_session_type(list(candles_seq)[-1]['start_time'])
         closes = [c['close']
                   for c in list(candles_seq)]  # Use all available candles
@@ -2845,6 +2845,19 @@ async def ingest_polygon_events():
                                 vwap_cum_vol[symbol] += volume
                                 vwap_cum_pv[symbol] += (
                                     (high + low + close) / 3) * volume
+                                
+                                # 🚨 CRITICAL FIX: Update last_trade_price/time from candle as fallback
+                                # Use CURRENT time to pass freshness validation (not candle time which could be stale)
+                                now_utc = datetime.now(timezone.utc)
+                                current_trade_time = last_trade_time.get(symbol)
+                                candle_close_time = start_time + timedelta(minutes=1)
+                                
+                                # Update ONLY if: no trade data OR trade data is older than candle close
+                                if current_trade_time is None or current_trade_time < candle_close_time:
+                                    last_trade_price[symbol] = close
+                                    last_trade_time[symbol] = now_utc  # Use NOW so freshness check passes!
+                                    logger.info(f"[PRICE FALLBACK] {symbol} - Using candle close ${close:.2f} with current timestamp (no fresh trades)")
+                                
                                 await on_new_candle(symbol, open_, high, low,
                                                     close, volume, start_time)
                                 # Process all pending alerts and send only the best one
