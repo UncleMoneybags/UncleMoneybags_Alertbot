@@ -3037,12 +3037,27 @@ async def ingest_polygon_events():
 
 
 async def nasdaq_halt_monitor():
-    """Monitor NASDAQ halt page for ALL halt types (T1, T2, T5, T12, LUDP, etc.)
-    Complements Polygon LULD feed which only catches volatility halts"""
+    """🚨 PRIMARY HALT SOURCE: Monitor NASDAQ every 15 seconds (more reliable than WebSocket)
+    Catches ALL halt types (T1, T2, T5, T12, LUDP, etc.) with relaxed $20 price threshold
+    Also alerts on RESUMES and tracks previously halted stocks to bypass price filter"""
     import aiohttp
     from datetime import datetime, timezone
+    import pickle
+    import os
     
-    seen_halts = set()  # Track processed halts
+    seen_halts = set()  # Track processed halts (halt_key)
+    seen_resumes = set()  # Track processed resumes (resume_key)
+    
+    # Load persisted halted symbols (survives restarts)
+    ever_halted_symbols = set()
+    if os.path.exists("halted_symbols.pkl"):
+        try:
+            with open("halted_symbols.pkl", "rb") as f:
+                ever_halted_symbols = pickle.load(f)
+            logger.info(f"[HALT TRACKER] Loaded {len(ever_halted_symbols)} previously halted symbols from disk")
+        except:
+            logger.warning("[HALT TRACKER] Could not load halted_symbols.pkl, starting fresh")
+            ever_halted_symbols = set()
     
     while True:
         try:
@@ -3072,59 +3087,127 @@ async def nasdaq_halt_monitor():
                             
                             for row in rows:
                                 cols = row.find_all('td')
-                                if len(cols) >= 9:  # Need at least 9 columns for reason code
-                                    symbol = cols[0].text.strip()              # Issue Symbol
-                                    halt_time_str = cols[4].text.strip()       # Halt Time
-                                    resume_time_str = cols[7].text.strip()     # Resumption Trade Time
-                                    halt_reason_code = cols[8].text.strip()    # Reason Codes
+                                if len(cols) >= 9:  # Need at least 9 columns
+                                    symbol = cols[0].text.strip()              # Column 0: Issue Symbol
+                                    halt_time_str = cols[6].text.strip()       # Column 6: Halt Time (ET)
+                                    resume_time_str = cols[8].text.strip()     # Column 8: Resume Time (ET)
+                                    halt_reason_code = cols[3].text.strip()    # Column 3: Reason Code
                                     
-                                    # Skip if already resumed
-                                    if resume_time_str and resume_time_str != '':
-                                        continue
-                                    
-                                    # Create unique halt key
+                                    # Create unique keys
                                     halt_key = f"{symbol}_{halt_time_str}_{halt_reason_code}"
+                                    resume_key = f"{symbol}_{halt_time_str}_{resume_time_str}"
                                     
+                                    # Check if this is a RESUME (has resume time and we haven't alerted on this resume yet)
+                                    if resume_time_str and resume_time_str != '':
+                                        if resume_key not in seen_resumes:
+                                            seen_resumes.add(resume_key)
+                                            
+                                            # 🟢 RESUME ALERT
+                                            logger.warning(f"[NASDAQ RESUME] {symbol} resumed at {resume_time_str} ET (halted at {halt_time_str})")
+                                            
+                                            try:
+                                                # Get current price
+                                                current_price = last_trade_price.get(symbol)
+                                                if not current_price and symbol in candles and len(candles[symbol]) > 0:
+                                                    current_price = candles[symbol][-1]['close']
+                                                
+                                                price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
+                                                
+                                                # Send resume alert (no filtering - resumes are important!)
+                                                alert_msg = f"""🟢 <b>TRADING RESUMED</b> (NASDAQ)
+
+<b>Symbol:</b> {symbol}
+<b>Price:</b> {price_display}
+<b>Halted:</b> {halt_time_str} ET
+<b>Resumed:</b> {resume_time_str} ET
+<b>Reason:</b> {halt_reason_code}
+<b>Status:</b> BACK TO TRADING ▶️
+
+🚀 <i>Real-time via NASDAQ feed</i>"""
+                                                
+                                                logger.warning(f"[🟢 RESUME ALERT] Sending resume for {symbol} @ {price_display}")
+                                                await send_all_alerts(alert_msg)
+                                                
+                                                # Log resume event
+                                                log_event(
+                                                    "nasdaq_resume", symbol,
+                                                    current_price if current_price else 0, 0, now, {
+                                                        "halt_time": halt_time_str,
+                                                        "resume_time": resume_time_str,
+                                                        "halt_code": halt_reason_code,
+                                                        "data_source": "nasdaq_scrape"
+                                                    })
+                                            except Exception as e:
+                                                logger.error(f"[RESUME ERROR] Error processing resume for {symbol}: {e}")
+                                        continue  # Don't process as halt
+                                    
+                                    # Process as HALT (no resume time yet)
                                     if halt_key in seen_halts:
                                         continue
                                     
                                     seen_halts.add(halt_key)
                                     
+                                    # Track and persist halted symbols (survives restarts)
+                                    if symbol not in ever_halted_symbols:
+                                        ever_halted_symbols.add(symbol)
+                                        try:
+                                            with open("halted_symbols.pkl", "wb") as f:
+                                                pickle.dump(ever_halted_symbols, f)
+                                            logger.info(f"[HALT TRACKER] Added {symbol} to persistent halt tracker ({len(ever_halted_symbols)} total)")
+                                        except Exception as e:
+                                            logger.error(f"[HALT TRACKER] Failed to save halted symbols: {e}")
+                                    
                                     # 🚨🚨 SPECIAL HALT HANDLING - BULLETPROOF 🚨🚨
-                                    logger.warning(f"[NASDAQ DETECTED] {symbol} halt at {halt_time_str} ET")
+                                    logger.warning(f"[NASDAQ DETECTED] {symbol} halt at {halt_time_str} ET (Reason: {halt_reason_code})")
                                     
                                     try:
-                                        # Try to get price from multiple sources
+                                        # Try to get price from multiple sources with detailed logging
                                         current_price = last_trade_price.get(symbol)
                                         price_source = "last_trade"
                                         
                                         if not current_price:
-                                            logger.info(f"[NASDAQ] {symbol} - No last_trade_price, trying yfinance...")
+                                            logger.info(f"[HALT PRICE] {symbol} - No last_trade_price, trying yfinance...")
                                             try:
                                                 import yfinance as yf
                                                 ticker_info = yf.Ticker(symbol).info
                                                 current_price = ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
                                                 price_source = "yfinance"
+                                                if current_price:
+                                                    logger.info(f"[HALT PRICE] {symbol} - Got ${current_price:.2f} from yfinance")
                                             except Exception as yf_error:
-                                                logger.warning(f"[NASDAQ] {symbol} - yfinance failed: {yf_error}")
+                                                logger.warning(f"[HALT PRICE] {symbol} - yfinance failed: {yf_error}")
                                         
                                         if not current_price and symbol in candles and len(candles[symbol]) > 0:
                                             current_price = candles[symbol][-1]['close']
                                             price_source = "candle"
-                                            logger.info(f"[NASDAQ] {symbol} - Using candle price ${current_price:.2f}")
+                                            logger.info(f"[HALT PRICE] {symbol} - Using candle price ${current_price:.2f}")
                                         
+                                        # Get float with detailed logging
                                         float_shares = await get_float_shares(symbol)
+                                        if float_shares:
+                                            logger.info(f"[HALT FLOAT] {symbol} - Float: {float_shares/1e6:.2f}M shares")
+                                        else:
+                                            logger.warning(f"[HALT FLOAT] {symbol} - Could not get float data (will not block halt alert)")
                                         
-                                        # 🚨 SPECIAL HALT RULE: Only filter if price is KNOWN and >$15
+                                        # 🚨 SPECIAL HALT RULE: RELAXED price filter for halts (critical events!)
+                                        # Allow up to $20 for halts (vs $15 for regular alerts)
                                         # If price unknown, send alert anyway (halts are critical!)
+                                        # If symbol was halted before, BYPASS price filter completely!
                                         should_alert = True
                                         filter_reason = None
+                                        HALT_PRICE_THRESHOLD = 20.00  # Higher threshold for halts
                                         
                                         if current_price:
                                             logger.info(f"[NASDAQ] {symbol} - Price ${current_price:.2f} from {price_source}")
-                                            if current_price > PRICE_THRESHOLD:
+                                            
+                                            # Bypass price filter if this symbol has been halted before
+                                            if symbol in ever_halted_symbols:
+                                                logger.warning(f"[NASDAQ] ✅ {symbol} BYPASSING price filter (previously halted, now ${current_price:.2f})")
+                                            elif current_price > HALT_PRICE_THRESHOLD:
                                                 should_alert = False
-                                                filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
+                                                filter_reason = f"price ${current_price:.2f} > ${HALT_PRICE_THRESHOLD}"
+                                            else:
+                                                logger.warning(f"[NASDAQ] ✅ {symbol} PASSED price filter (${current_price:.2f} <= ${HALT_PRICE_THRESHOLD})")
                                         else:
                                             logger.warning(f"[NASDAQ] {symbol} - NO PRICE DATA - will alert anyway (halt is critical)")
                                         
@@ -3133,10 +3216,14 @@ async def nasdaq_halt_monitor():
                                             if not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
                                                 should_alert = False
                                                 filter_reason = f"float {float_shares/1e6:.1f}M out of range"
+                                            else:
+                                                logger.warning(f"[NASDAQ] ✅ {symbol} PASSED float filter ({float_shares/1e6:.1f}M <= {MAX_FLOAT_SHARES/1e6:.0f}M)")
                                         
                                         if should_alert:
                                             float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
                                             price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
+                                            
+                                            logger.warning(f"[HALT APPROVED] {symbol} - Sending alert! Price: {price_display}, Float: {float_display}")
                                             
                                             # Decode halt reason
                                             halt_reasons = {
@@ -3183,7 +3270,9 @@ async def nasdaq_halt_monitor():
                                             
                                             logger.warning(f"[✅ NASDAQ SENT] {symbol} @ {price_display} - {halt_reason}")
                                         else:
-                                            logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                                            float_str = f"{float_shares/1e6:.1f}M" if float_shares else "None"
+                                            price_str = f"${current_price:.2f}" if current_price else "None"
+                                            logger.warning(f"[❌ HALT FILTERED] {symbol} - {filter_reason} (Price: {price_str}, Float: {float_str})")
                                         
                                     except Exception as e:
                                         logger.error(f"[🚨 NASDAQ ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
@@ -3199,8 +3288,8 @@ async def nasdaq_halt_monitor():
         except Exception as e:
             logger.error(f"[NASDAQ HALT MONITOR] Error: {e}")
         
-        # Check every 30 seconds during market hours
-        await asyncio.sleep(30)
+        # 🚨 PRIMARY HALT SOURCE: Check every 15 seconds for fast detection (more reliable than WebSocket)
+        await asyncio.sleep(15)
 
 
 async def ml_training_loop():
