@@ -141,15 +141,14 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
 
     # Float check - exception symbols bypass ONLY float filter
     if symbol not in FLOAT_EXCEPTION_SYMBOLS:
-        # FAIL-CLOSED: must have valid float data AND be <= 10M
+        # FAIL-OPEN: If float unknown, ALLOW symbol (only reject when we KNOW float is too high)
         if float_shares is None:
             filter_counts["float_none"] += 1
-            if symbol in ["OCTO", "GRND", "EQS"
-                          ] or filter_counts["float_none"] % 100 == 1:
+            if filter_counts["float_none"] % 100 == 1:
                 logger.info(
-                    f"[FILTER DEBUG] {symbol} filtered: float_shares is None (count: {filter_counts['float_none']})"
+                    f"[FLOAT UNKNOWN] {symbol} - no float data available, ALLOWING symbol to process (count: {filter_counts['float_none']})"
                 )
-            return False
+            # ALLOW symbol through when float data unavailable
         elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
             filter_counts["float_out_of_range"] += 1
             if symbol in ["OCTO", "GRND", "EQS"
@@ -160,15 +159,17 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             return False
     else:
         # Log exception symbols that are passing filter
+        float_str = f"{float_shares/1e6:.1f}M" if float_shares is not None else "Unknown"
         logger.info(
-            f"[FILTER EXCEPTION] {symbol} bypassing float filter (float: {float_shares/1e6:.1f}M if known)"
+            f"[FILTER EXCEPTION] {symbol} bypassing float filter (float: {float_str})"
         )
 
     # Symbol passed all filters
     filter_counts["passed"] += 1
     if symbol in ["OCTO", "GRND", "EQS"] or filter_counts["passed"] % 100 == 1:
+        float_str = f"{float_shares/1e6:.1f}M" if float_shares is not None else "Unknown"
         logger.info(
-            f"[FILTER PASS] {symbol} eligible: price=${last_price:.2f}, float={float_shares/1e6:.1f}M (total passed: {filter_counts['passed']})"
+            f"[FILTER PASS] {symbol} eligible: price=${last_price:.2f}, float={float_str} (total passed: {filter_counts['passed']})"
         )
 
     return True
