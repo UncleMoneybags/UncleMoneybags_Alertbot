@@ -2569,8 +2569,9 @@ async def premarket_gainers_alert_loop():
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
         if now_est.weekday() in range(0, 5):
+            # Only send in narrow 10-second window (9:24:55-9:25:05) to avoid restart spam
             if (now_est.time().hour == 9 and now_est.time().minute == 24
-                    and now_est.time().second >= 55 and not sent_today):
+                    and 55 <= now_est.time().second <= 59 and not sent_today):
                 logger.info("Sending premarket gainers alert at 9:24:55am ET")
                 gainers = []
                 for sym in premarket_open_prices:
@@ -2621,9 +2622,9 @@ async def market_close_alert_loop():
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
 
-        # Only send alert on trading days (Mon-Thu) at 8:01 PM
+        # Only send alert on trading days (Mon-Thu) at 8:01 PM (narrow 2-minute window to avoid restart spam)
         if now_est.weekday() in (0, 1, 2, 3):
-            if now_est.time() >= dt_time(20, 1) and not sent_today:
+            if (dt_time(20, 1) <= now_est.time() <= dt_time(20, 3)) and not sent_today:
                 await send_all_alerts(
                     "Market Closed. Reconvene in pre market tomorrow.")
                 event_time = datetime.now(timezone.utc)
