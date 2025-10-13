@@ -1138,6 +1138,7 @@ CANDLE_MAXLEN = 30
 
 candles = defaultdict(lambda: deque(maxlen=CANDLE_MAXLEN))
 trade_candle_builders = defaultdict(list)
+local_candle_builder = {}  # Track 1-min candle aggregation from trades when Polygon doesn't provide AM events
 trade_candle_last_time = {}
 last_alerted_price = {}
 last_halt_alert = {}
@@ -1412,6 +1413,44 @@ def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_
     
     # No timestamp info - return fallback as last resort (for compatibility)
     return fallback
+
+
+def validate_price_above_vwap_strict(symbol, vwap_value, alert_type, max_age_seconds=MAX_PRICE_AGE_SECONDS):
+    """🚨 STRICT VWAP VALIDATION - Never allows alerts under VWAP
+    
+    Checks ONLY real-time trade price (no candle fallback) against VWAP.
+    Blocks alerts if:
+    - Real-time price is stale (>max_age_seconds old)
+    - Real-time price is below or equal to VWAP
+    - No real-time price available
+    
+    This prevents the bug where candle close above VWAP but current price below VWAP.
+    
+    Returns: (is_valid, price, reason)
+        - is_valid: True if real-time price is fresh and above VWAP
+        - price: The real-time price (or None)
+        - reason: Log message explaining why validation failed (or success)
+    """
+    real_time_price = last_trade_price.get(symbol)
+    real_time_timestamp = last_trade_time.get(symbol)
+    now = datetime.now(timezone.utc)
+    
+    # Check if we have real-time price data
+    if real_time_price is None or real_time_timestamp is None:
+        return (False, None, f"[{alert_type.upper()} BLOCKED] {symbol} - No real-time price available for VWAP validation")
+    
+    # Check freshness - MUST be within max age
+    price_age = (now - real_time_timestamp).total_seconds()
+    if price_age > max_age_seconds:
+        return (False, real_time_price, f"[{alert_type.upper()} BLOCKED] {symbol} - Real-time price is stale ({price_age:.1f}s old)")
+    
+    # Check if real-time price is above VWAP
+    if real_time_price <= vwap_value:
+        return (False, real_time_price, f"[{alert_type.upper()} BLOCKED] {symbol} - Real-time price ${real_time_price:.2f} NOT above VWAP ${vwap_value:.2f}")
+    
+    # All checks passed
+    return (True, real_time_price, f"[{alert_type.upper()} VWAP OK] {symbol} - Real-time price ${real_time_price:.2f} above VWAP ${vwap_value:.2f} (age: {price_age:.1f}s)")
+
 
 
 def is_bullish_engulfing(candles_seq):
@@ -1971,27 +2010,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
             
-            # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
-            real_time_price_rn = last_trade_price.get(symbol)
-            real_time_timestamp_rn = last_trade_time.get(symbol)
-            
-            # Check if we have real-time price data (explicit None check to catch $0.00)
-            if real_time_price_rn is None or real_time_timestamp_rn is None:
-                logger.info(f"[RUNNER BLOCKED] {symbol} - No real-time price available for confirmation")
-                return
-            
-            # Recompute NOW to ensure freshness check reflects actual alert moment
-            now_fresh_rn = datetime.now(timezone.utc)
-            
-            # Verify price data is FRESH (≤30 seconds old)
-            price_age_rn = (now_fresh_rn - real_time_timestamp_rn).total_seconds()
-            if price_age_rn > MAX_PRICE_AGE_SECONDS:
-                logger.info(f"[RUNNER BLOCKED] {symbol} - Real-time price is stale ({price_age_rn:.1f}s old)")
-                return
-            
-            # Verify real-time price is ACTUALLY above VWAP (not just from criteria check)
-            if real_time_price_rn <= vwap_rn:
-                logger.info(f"[RUNNER BLOCKED] {symbol} - Real-time price ${real_time_price_rn:.2f} NOT above VWAP ${vwap_rn:.2f}")
+            # 🚨 STRICT VWAP VALIDATION - Checks ONLY real-time price (no candle fallback)
+            vwap_valid, real_time_price_rn, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_rn, "RUNNER")
+            if not vwap_valid:
+                logger.info(vwap_reason)
                 return
             
             # Calculate alert score and add to pending alerts
@@ -2082,27 +2104,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     )
                     return
                 
-                # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
-                real_time_price = last_trade_price.get(symbol)
-                real_time_timestamp = last_trade_time.get(symbol)
-                
-                # Check if we have real-time price data (explicit None check to catch $0.00)
-                if real_time_price is None or real_time_timestamp is None:
-                    logger.info(f"[DIP PLAY BLOCKED] {symbol} - No real-time price available for confirmation")
-                    return
-                
-                # Recompute NOW to ensure freshness check reflects actual alert moment
-                now_fresh = datetime.now(timezone.utc)
-                
-                # Verify price data is FRESH (≤30 seconds old)
-                price_age = (now_fresh - real_time_timestamp).total_seconds()
-                if price_age > MAX_PRICE_AGE_SECONDS:
-                    logger.info(f"[DIP PLAY BLOCKED] {symbol} - Real-time price is stale ({price_age:.1f}s old)")
-                    return
-                
-                # Verify real-time price is ACTUALLY above VWAP (not just candle close)
-                if real_time_price <= current_vwap:
-                    logger.info(f"[DIP PLAY BLOCKED] {symbol} - Real-time price ${real_time_price:.2f} NOT above VWAP ${current_vwap:.2f}")
+                # 🚨 STRICT VWAP VALIDATION - Checks ONLY real-time price (no candle fallback)
+                vwap_valid, real_time_price, vwap_reason = validate_price_above_vwap_strict(symbol, current_vwap, "DIP PLAY")
+                if not vwap_valid:
+                    logger.info(vwap_reason)
                     return
                 
                 # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
@@ -2273,6 +2278,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[COOLDOWN] {symbol}: Skipping volume_spike alert due to cooldown ({(now - last_alert_time[symbol]['volume_spike']).total_seconds():.0f}s ago)"
             )
             return
+        
+        # 🚨 STRICT VWAP VALIDATION - Final check with real-time price freshness
+        vwap_valid, real_time_price_vs, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "VOLUME SPIKE")
+        if not vwap_valid:
+            logger.info(vwap_reason)
+            return
 
         # Calculate alert score and add to pending alerts
         score = get_alert_score("volume_spike", symbol, spike_data)
@@ -2385,24 +2396,19 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_volume = last_candle['volume']
             candle_close = closes[-1]
 
-            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
-            candle_time_ema = last_candle['start_time'] + timedelta(minutes=1)
-            current_price_ema = get_display_price(symbol, candle_close, candle_time_ema)
-            
-            # Block alert if no fresh price data available
-            if current_price_ema is None:
-                logger.info(f"[EMA STACK BLOCKED] {symbol} - No fresh price data (all sources >{MAX_PRICE_AGE_SECONDS}s old)")
+            # 🚨 STRICT VWAP VALIDATION - Checks ONLY real-time price (no candle fallback)
+            vwap_valid, real_time_price_ema, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "EMA STACK")
+            if not vwap_valid:
+                logger.info(vwap_reason)
                 return
             
-            # 🚨 CRITICAL VWAP CHECK - NEVER ALERT STOCKS UNDER VWAP!
+            # Use validated real-time price for alert (guaranteed fresh and above VWAP)
+            current_price_ema = real_time_price_ema
+            
+            # Additional VWAP sanity check
             if vwap_value <= 0:
                 logger.debug(
                     f"[EMA STACK FILTERED] {symbol} - invalid VWAP {vwap_value}"
-                )
-                return
-            if current_price_ema <= vwap_value:
-                logger.debug(
-                    f"[EMA STACK FILTERED] {symbol} @ Real-time=${current_price_ema:.2f} - below/equal VWAP ${vwap_value:.2f}"
                 )
                 return
 
@@ -2760,6 +2766,100 @@ async def ingest_polygon_events():
                                 print(
                                     f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={trade_time} | Age={trade_age_seconds:.1f}s"
                                 )
+                                
+                                # 🚨 LOCAL CANDLE AGGREGATION: Build 1-min candles from trades when Polygon doesn't provide AM events
+                                # Track trades per minute for symbols missing Polygon candles
+                                current_minute = trade_time.replace(second=0, microsecond=0)
+                                
+                                # Initialize tracking structures if needed
+                                if symbol not in local_candle_builder:
+                                    local_candle_builder[symbol] = {
+                                        'minute': current_minute,
+                                        'open': price,
+                                        'high': price,
+                                        'low': price,
+                                        'close': price,
+                                        'volume': size,
+                                        'trade_count': 1
+                                    }
+                                elif local_candle_builder[symbol]['minute'] == current_minute:
+                                    # Same minute - update OHLCV
+                                    builder = local_candle_builder[symbol]
+                                    builder['high'] = max(builder['high'], price)
+                                    builder['low'] = min(builder['low'], price)
+                                    builder['close'] = price
+                                    builder['volume'] += size
+                                    builder['trade_count'] += 1
+                                else:
+                                    # New minute - create candle from previous minute and start new builder
+                                    prev_builder = local_candle_builder[symbol]
+                                    prev_minute = prev_builder['minute']
+                                    
+                                    # Only create local candle if we had enough trades (min 5)
+                                    if prev_builder['trade_count'] >= 5:
+                                        local_candle = {
+                                            "open": prev_builder['open'],
+                                            "high": prev_builder['high'],
+                                            "low": prev_builder['low'],
+                                            "close": prev_builder['close'],
+                                            "volume": prev_builder['volume'],
+                                            "start_time": prev_minute,
+                                        }
+                                        
+                                        print(
+                                            f"[LOCAL CANDLE] {symbol} {prev_minute} o:{local_candle['open']} h:{local_candle['high']} l:{local_candle['low']} c:{local_candle['close']} v:{local_candle['volume']} (trades:{prev_builder['trade_count']})"
+                                        )
+                                        
+                                        # Process the local candle through normal logic
+                                        if not isinstance(candles[symbol], deque):
+                                            candles[symbol] = deque(candles[symbol], maxlen=20)
+                                        if not isinstance(vwap_candles[symbol], list):
+                                            vwap_candles[symbol] = list(vwap_candles[symbol])
+                                        
+                                        candles[symbol].append(local_candle)
+                                        session_date = get_session_date(local_candle['start_time'])
+                                        last_session = vwap_session_date[symbol]
+                                        if last_session != session_date:
+                                            vwap_candles[symbol] = []
+                                            vwap_session_date[symbol] = session_date
+                                        
+                                        # Process VWAP reset at market open
+                                        eastern = pytz.timezone("America/New_York")
+                                        candle_time = prev_minute.astimezone(eastern).time()
+                                        market_open_time = dt_time(9, 30)
+                                        if candle_time >= market_open_time:
+                                            if not vwap_reset_done[symbol]:
+                                                vwap_candles[symbol] = []
+                                                vwap_reset_done[symbol] = True
+                                                logger.info(f"[VWAP RESET] {symbol} - Cleared pre-market VWAP data at market open (9:30 AM)")
+                                        
+                                        vwap_candles[symbol].append(local_candle)
+                                        
+                                        # Trigger alert processing
+                                        await on_new_candle(
+                                            symbol,
+                                            local_candle['open'],
+                                            local_candle['high'],
+                                            local_candle['low'],
+                                            local_candle['close'],
+                                            local_candle['volume'],
+                                            prev_minute
+                                        )
+                                        
+                                        # Send best alert if any pending
+                                        if symbol in pending_alerts and pending_alerts[symbol]:
+                                            await send_best_alert(symbol)
+                                    
+                                    # Start new minute builder
+                                    local_candle_builder[symbol] = {
+                                        'minute': current_minute,
+                                        'open': price,
+                                        'high': price,
+                                        'low': price,
+                                        'close': price,
+                                        'volume': size,
+                                        'trade_count': 1
+                                    }
                             elif event.get("ev") == "AM":
                                 symbol = event["sym"]
                                 open_ = event["o"]
