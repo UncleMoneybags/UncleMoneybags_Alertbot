@@ -3100,12 +3100,13 @@ async def ingest_polygon_events():
                     f"[🚨 CONNECTION LIMIT] Backing off for {connection_backoff_delay} seconds..."
                 )
 
-                # Send alert about connection issues
-                alert_msg = f"🚨 <b>SCANNER CONNECTION ISSUE</b>\n\nPolygon connection limit exceeded. Backing off for {connection_backoff_delay}s.\nAttempt: {connection_attempts}"
-                try:
-                    await send_all_alerts(alert_msg)
-                except:
-                    pass  # Don't fail on alert send
+                # Connection alerts DISABLED - user only wants trade alerts, not infrastructure spam
+                # alert_msg = f"🚨 <b>SCANNER CONNECTION ISSUE</b>\n\nPolygon connection limit exceeded. Backing off for {connection_backoff_delay}s.\nAttempt: {connection_attempts}"
+                # try:
+                #     await send_all_alerts(alert_msg)
+                # except:
+                #     pass  # Don't fail on alert send
+                print(f"[CONNECTION] Silently backing off, no user alert sent")
 
                 await asyncio.sleep(connection_backoff_delay)
 
