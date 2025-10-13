@@ -1370,7 +1370,7 @@ def get_ny_date():
 
 
 # PATCH: FRESHNESS CHECK for price
-MAX_PRICE_AGE_SECONDS = 5  # REAL-TIME for day trading - not 60s delays!
+MAX_PRICE_AGE_SECONDS = 30  # RELAXED: Catch big movers even with data delays (was 5s, too strict)
 
 
 def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_PRICE_AGE_SECONDS):
@@ -1845,10 +1845,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Recompute NOW to ensure freshness check reflects actual alert moment
             now_fresh_wu = datetime.now(timezone.utc)
             
-            # Verify price data is FRESH (≤5 seconds old)
+            # Verify price data is FRESH (≤30 seconds old)
             price_age_wu = (now_fresh_wu - real_time_timestamp_wu).total_seconds()
-            if price_age_wu > 5:
-                logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is stale ({price_age_wu:.1f}s old)")
+            if price_age_wu > MAX_PRICE_AGE_SECONDS:
+                logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is stale ({price_age_wu:.1f}s old, limit: {MAX_PRICE_AGE_SECONDS}s)")
                 return
             
             # Verify real-time price is ACTUALLY above VWAP (not just from criteria check)
@@ -1982,9 +1982,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Recompute NOW to ensure freshness check reflects actual alert moment
             now_fresh_rn = datetime.now(timezone.utc)
             
-            # Verify price data is FRESH (≤5 seconds old)
+            # Verify price data is FRESH (≤30 seconds old)
             price_age_rn = (now_fresh_rn - real_time_timestamp_rn).total_seconds()
-            if price_age_rn > 5:
+            if price_age_rn > MAX_PRICE_AGE_SECONDS:
                 logger.info(f"[RUNNER BLOCKED] {symbol} - Real-time price is stale ({price_age_rn:.1f}s old)")
                 return
             
@@ -2093,9 +2093,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 # Recompute NOW to ensure freshness check reflects actual alert moment
                 now_fresh = datetime.now(timezone.utc)
                 
-                # Verify price data is FRESH (≤5 seconds old)
+                # Verify price data is FRESH (≤30 seconds old)
                 price_age = (now_fresh - real_time_timestamp).total_seconds()
-                if price_age > 5:
+                if price_age > MAX_PRICE_AGE_SECONDS:
                     logger.info(f"[DIP PLAY BLOCKED] {symbol} - Real-time price is stale ({price_age:.1f}s old)")
                     return
                 
@@ -2390,7 +2390,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             
             # Block alert if no fresh price data available
             if current_price_ema is None:
-                logger.info(f"[EMA STACK BLOCKED] {symbol} - No fresh price data (all sources >5s old)")
+                logger.info(f"[EMA STACK BLOCKED] {symbol} - No fresh price data (all sources >{MAX_PRICE_AGE_SECONDS}s old)")
                 return
             
             # 🚨 CRITICAL VWAP CHECK - NEVER ALERT STOCKS UNDER VWAP!
@@ -2434,9 +2434,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema200_str = f", ema200={ema200:.2f}" if ema200 is not None else ""
             # Only log EMA stack info when alert actually fires (performance optimization)
 
-            # 🔥 STRICT MOMENTUM CONFIRMATION - require rising volume streaks
+            # 🔥 MOMENTUM CONFIRMATION - removed strict volume streak requirement
             momentum_confirmed = False
-            volume_streak_confirmed = False
             
             if base_ema_criteria:
                 # Check for 2+ green candles in last 3 candles (realistic recent momentum check)
@@ -2445,11 +2444,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     green_candles = sum(1 for c in recent_candles
                                         if c['close'] > c['open'])
                     momentum_confirmed = green_candles >= 2
-                    
-                    # 🔥 NEW: Require rising volume streak (not just threshold)
-                    recent_volumes = [c['volume'] for c in recent_candles]
-                    volume_streak_confirmed = all(recent_volumes[i] <= recent_volumes[i+1] 
-                                                  for i in range(len(recent_volumes)-1))
 
                 # Alternative: Check if real-time price is up 3%+ from 5 candles ago (more realistic sustained move)
                 if not momentum_confirmed and len(closes) >= 5:
@@ -2457,19 +2451,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     price_gain = (current_price_ema -
                                   price_5_ago) / price_5_ago
                     momentum_confirmed = price_gain >= 0.03  # 3%+ gain from 5 candles ago
-                    
-                    # 🔥 NEW: Also check volume trend for 5-candle lookback
-                    if len(list(candles_seq)) >= 5:
-                        recent_5_volumes = [c['volume'] for c in list(candles_seq)[-5:]]
-                        volume_streak_confirmed = recent_5_volumes[-1] > recent_5_volumes[0]  # Rising over 5 candles
 
                 # Fallback: If not enough history, allow alert if real-time price > EMA5 (basic confirmation)
                 if not momentum_confirmed and len(closes) < 5:
                     momentum_confirmed = current_price_ema > ema5
-                    volume_streak_confirmed = True  # Allow if limited data
 
-            # Final criteria: base EMA criteria AND momentum confirmation AND volume streak
-            ema_stack_criteria = base_ema_criteria and momentum_confirmed and volume_streak_confirmed
+            # Final criteria: base EMA criteria AND momentum confirmation (volume streak removed)
+            ema_stack_criteria = base_ema_criteria and momentum_confirmed
 
             if ema_stack_criteria and not ema_stack_was_true[symbol]:
                 vwap_margin = (current_price_ema -
@@ -2504,9 +2492,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 # Recompute NOW to ensure freshness check reflects actual alert moment
                 now_fresh_ema = datetime.now(timezone.utc)
                 
-                # Verify price data is FRESH (≤5 seconds old)
+                # Verify price data is FRESH (≤30 seconds old)
                 price_age_ema = (now_fresh_ema - real_time_timestamp_ema).total_seconds()
-                if price_age_ema > 5:
+                if price_age_ema > MAX_PRICE_AGE_SECONDS:
                     logger.info(f"[EMA STACK BLOCKED] {symbol} - Real-time price is stale ({price_age_ema:.1f}s old)")
                     return
                 
