@@ -1739,14 +1739,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
-    candles_seq.append({
-        'open': open_,
-        'high': high,
-        'low': low,
-        'close': close,
-        'volume': volume,
-        'start_time': start_time
-    })
+    
+    # 🚨 REMOVED DUPLICATE: candles already appended before calling on_new_candle()
+    # Local candle path appends at line 2816, Polygon path appends at line 2899
+    # DO NOT append here or we get duplicate candles corrupting EMAs and alerts!
 
     # Check if EMAs need backfilling for new symbols
     if not stored_emas[symbol][5].initialized:
@@ -1761,14 +1757,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     # Update stored EMAs with new candle close price
     current_emas = update_stored_emas(symbol, close)
-    vwap_candles[symbol].append({
-        'open': open_,
-        'high': high,
-        'low': low,
-        'close': close,
-        'volume': volume,
-        'start_time': start_time
-    })
+    
+    # 🚨 REMOVED DUPLICATE: vwap_candles already appended before calling on_new_candle()
+    # Local candle path appends at line 2840, Polygon path appends at line 2939
+    # DO NOT append here or we get duplicate candles corrupting VWAP!
 
     # Removed verbose debug logging for performance - only log critical events
 
