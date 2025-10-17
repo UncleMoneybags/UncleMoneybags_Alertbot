@@ -135,7 +135,7 @@ async def get_float_shares(ticker):
             else:
                 float_cache_none_retry[ticker] = now
                 save_float_cache()  # Debounced
-            await asyncio.sleep(0.5)
+            # Removed unnecessary 0.5s sleep - slows down float lookups
             return float_shares
     except Exception as e:
         float_cache_none_retry[ticker] = now
@@ -1172,6 +1172,11 @@ def escape_html(s):
     return html.escape(s or "")
 
 
+def fmt_price(p):
+    """Safe price formatter - returns 'N/A' if price is None to prevent crashes"""
+    return f"{p:.2f}" if p is not None else "N/A"
+
+
 CANDLE_MAXLEN = 30
 
 candles = defaultdict(lambda: deque(maxlen=CANDLE_MAXLEN))
@@ -1643,7 +1648,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
         alert_price = get_display_price(symbol, last_close, candle_time_ps)
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
-            f"<b>{escape_html(symbol)}</b> | ${alert_price:.2f} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
+            f"<b>{escape_html(symbol)}</b> | ${fmt_price(alert_price)} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
             f"Trend: EMA5 > EMA8 > EMA13\n"
             f"{'Above VWAP' if last_close > vwap_value else 'Below VWAP'}"
             f" | MACD↑"
@@ -1739,8 +1744,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # Regular alerting logic follows (float filter applies only to alerts, not to gainers list)
     if not isinstance(candles[symbol], deque):
         candles[symbol] = deque(candles[symbol], maxlen=20)
-    if not isinstance(vwap_candles[symbol], list):
-        vwap_candles[symbol] = list(vwap_candles[symbol])
+    # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
+    if not isinstance(vwap_candles[symbol], deque):
+        vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
     float_shares = await get_float_shares(symbol)
     # Check exception list first, then float range
     # 🚨 FIX: FAIL-OPEN for unknown float (consistent with is_eligible)
@@ -1941,7 +1947,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     "candle_price": close_wu,
                     "real_time_price": last_trade_price.get(symbol)
                 })
-            price_str = f"{alert_price:.2f}"
+            price_str = fmt_price(alert_price)
             alert_text = (f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
                           f"Current Price: ${price_str}")
             # Calculate alert score and add to pending alerts
@@ -2068,7 +2074,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     "real_time_price": last_trade_price.get(symbol),
                     "alert_score": score
                 })
-            price_str = f"{alert_price:.2f}"
+            price_str = fmt_price(alert_price)
             alert_text = (
                 f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
                 f"Current Price: ${price_str} (+{price_move_rn*100:.1f}%)")
@@ -2150,7 +2156,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                                           "candle_price": close,
                                           "real_time_price": last_trade_price.get(symbol)
                                       })
-                price_str = f"{alert_price:.2f}"
+                price_str = fmt_price(alert_price)
                 alert_text = (f"📉 <b>{escape_html(symbol)}</b> Dip Play\n"
                               f"Current Price: ${price_str}")
                 # Calculate alert score and add to pending alerts
@@ -2257,8 +2263,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     "candle_price": curr_candle['close'],
                     "real_time_price": last_trade_price.get(symbol)
                 })
-            price_str = f"{alert_price:.2f}"
-            vwap_str = f"{curr_vwap:.2f}" if curr_vwap is not None else "?"
+            price_str = fmt_price(alert_price)
+            vwap_str = fmt_price(curr_vwap) if curr_vwap is not None else "?"
             vol_str = f"{curr_candle['volume']:,}"
             rvol_str = f"{rvol:.2f}"
             alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
@@ -2327,7 +2333,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
         candle_time_vs = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
         alert_price = get_display_price(symbol, close, candle_time_vs)
-        price_str = f"{alert_price:.2f}"
+        price_str = fmt_price(alert_price)
         rvol_str = f"{spike_data['rvol']:.1f}"
         move_pct = spike_data['price_move'] * 100
 
@@ -2552,7 +2558,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         "session": session_type,
                         "real_time_price": last_trade_price.get(symbol)
                     })
-                price_str = f"{alert_price:.2f}"
+                price_str = fmt_price(alert_price)
                 ema_display = f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
 
                 alert_text = (
@@ -2843,8 +2849,9 @@ async def ingest_polygon_events():
                                         # Process the local candle through normal logic
                                         if not isinstance(candles[symbol], deque):
                                             candles[symbol] = deque(candles[symbol], maxlen=20)
-                                        if not isinstance(vwap_candles[symbol], list):
-                                            vwap_candles[symbol] = list(vwap_candles[symbol])
+                                        # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
+                                        if not isinstance(vwap_candles[symbol], deque):
+                                            vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
                                         
                                         candles[symbol].append(local_candle)
                                         session_date = get_session_date(local_candle['start_time'])
@@ -2926,9 +2933,10 @@ async def ingest_polygon_events():
                                 if not isinstance(candles[symbol], deque):
                                     candles[symbol] = deque(candles[symbol],
                                                             maxlen=20)
-                                if not isinstance(vwap_candles[symbol], list):
-                                    vwap_candles[symbol] = list(
-                                        vwap_candles[symbol])
+                                # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
+                                if not isinstance(vwap_candles[symbol], deque):
+                                    vwap_candles[symbol] = deque(
+                                        vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
                                 candles[symbol].append(candle)
                                 session_date = get_session_date(
                                     candle['start_time'])
@@ -3082,7 +3090,7 @@ async def ingest_polygon_events():
                                             # Format LULD halt alert
                                             alert_msg = f"""🛑 <b>LULD HALT ALERT</b> (Polygon Official)
                                             
-<b>Symbol:</b> ${symbol}
+<b>Symbol:</b> {symbol}
 <b>Price:</b> {price_display}
 <b>Float:</b> {float_display} shares
 <b>Halt Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}
@@ -3117,7 +3125,7 @@ async def ingest_polygon_events():
                                         logger.error(f"[🚨 LULD ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
                                         # 🚨 EMERGENCY: Try to send alert even on error
                                         try:
-                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> ${symbol}\n<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error getting details - check logs"
+                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error getting details - check logs"
                                             await send_all_alerts(emergency_msg)
                                             logger.warning(f"[LULD] Sent emergency halt alert for {symbol}")
                                         except:
