@@ -3152,6 +3152,14 @@ async def ingest_polygon_events():
                                                 logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
                                         
                                         if should_alert:
+                                            # 🔍 HALT VERIFICATION: Re-check NASDAQ before alerting
+                                            halt_time_str = halt_time_et.strftime('%H:%M:%S')
+                                            is_verified = await verify_halt_on_nasdaq(symbol, halt_time_str)
+                                            
+                                            if not is_verified:
+                                                logger.warning(f"[LULD BLOCKED] {symbol} - Halt NOT verified on NASDAQ, skipping alert (prevents false positive)")
+                                                continue
+                                            
                                             float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
                                             price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
                                             
@@ -3180,7 +3188,7 @@ async def ingest_polygon_events():
 
 🚀 <i>Real-time via Polygon LULD feed</i>"""
 
-                                            logger.warning(f"[🚨 HALT ALERT] Sending LULD halt for {symbol} @ {price_display} ({price_source})")
+                                            logger.warning(f"[🚨 HALT ALERT] Sending VERIFIED LULD halt for {symbol} @ {price_display} ({price_source})")
                                             await send_all_alerts(alert_msg)
 
                                             # Log halt event
@@ -3259,6 +3267,48 @@ async def ingest_polygon_events():
                     f"[CONNECTION] General error - reconnecting in 30 seconds..."
                 )
                 await asyncio.sleep(30)
+
+
+async def verify_halt_on_nasdaq(symbol, halt_time_str):
+    """🔍 HALT VERIFICATION: Re-check NASDAQ to confirm halt is still active
+    
+    Prevents false positives by verifying halt 10 seconds after initial detection.
+    Returns True if halt is confirmed on NASDAQ, False otherwise.
+    """
+    import aiohttp
+    from bs4 import BeautifulSoup
+    
+    try:
+        logger.info(f"[HALT VERIFY] Waiting 10s to verify {symbol} halt at {halt_time_str}...")
+        await asyncio.sleep(10)  # Wait 10 seconds
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://www.nasdaqtrader.com/trader.aspx?id=tradehalts", timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    table = soup.find('table', {'id': 'Trading_Halts'})
+                    
+                    if table:
+                        rows = table.find_all('tr')[1:]  # Skip header
+                        for row in rows:
+                            cols = row.find_all('td')
+                            if len(cols) >= 9:
+                                nasdaq_symbol = cols[0].text.strip()
+                                nasdaq_halt_time = cols[6].text.strip()
+                                
+                                # Match symbol and halt time
+                                if nasdaq_symbol == symbol and nasdaq_halt_time == halt_time_str:
+                                    logger.info(f"[HALT VERIFY] ✅ {symbol} halt CONFIRMED on NASDAQ")
+                                    return True
+        
+        logger.warning(f"[HALT VERIFY] ❌ {symbol} halt NOT found on NASDAQ - likely false positive")
+        return False
+        
+    except Exception as e:
+        logger.error(f"[HALT VERIFY] Error verifying {symbol}: {e}")
+        # If verification fails, assume halt is real (fail-safe)
+        return True
 
 
 async def nasdaq_halt_monitor():
@@ -3457,37 +3507,35 @@ async def nasdaq_halt_monitor():
                                         else:
                                             logger.warning(f"[HALT FLOAT] {symbol} - Could not get float data (will not block halt alert)")
                                         
-                                        # 🚨 SPECIAL HALT RULE: RELAXED price filter for halts (critical events!)
-                                        # Allow up to $20 for halts (vs $15 for regular alerts)
-                                        # If price unknown, send alert anyway (halts are critical!)
-                                        # If symbol was halted before, BYPASS price filter completely!
-                                        should_alert = True
+                                        # 🚨 STRICT HALT FILTERING: Only alert if stock meets bot criteria
+                                        # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
+                                        should_alert = False
                                         filter_reason = None
-                                        HALT_PRICE_THRESHOLD = 20.00  # Higher threshold for halts
                                         
-                                        if current_price:
-                                            logger.info(f"[NASDAQ] {symbol} - Price ${current_price:.2f} from {price_source}")
-                                            
-                                            # Bypass price filter if this symbol has been halted before
-                                            if symbol in ever_halted_symbols:
-                                                logger.warning(f"[NASDAQ] ✅ {symbol} BYPASSING price filter (previously halted, now ${current_price:.2f})")
-                                            elif current_price > HALT_PRICE_THRESHOLD:
-                                                should_alert = False
-                                                filter_reason = f"price ${current_price:.2f} > ${HALT_PRICE_THRESHOLD}"
-                                            else:
-                                                logger.warning(f"[NASDAQ] ✅ {symbol} PASSED price filter (${current_price:.2f} <= ${HALT_PRICE_THRESHOLD})")
+                                        # Price must be known and ≤$15 to alert
+                                        if not current_price:
+                                            filter_reason = "no price data available"
+                                            logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                                        elif current_price > PRICE_THRESHOLD:
+                                            should_alert = False
+                                            filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
+                                            logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
                                         else:
-                                            logger.warning(f"[NASDAQ] {symbol} - NO PRICE DATA - will alert anyway (halt is critical)")
-                                        
-                                        # Check float only if we should alert based on price
-                                        if should_alert and float_shares is not None:
-                                            if not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
-                                                should_alert = False
-                                                filter_reason = f"float {float_shares/1e6:.1f}M out of range"
+                                            # Price is valid, check float
+                                            if float_shares is None:
+                                                filter_reason = "no float data available"
+                                                logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                                            elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
+                                                filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
+                                                logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
                                             else:
-                                                logger.warning(f"[NASDAQ] ✅ {symbol} PASSED float filter ({float_shares/1e6:.1f}M <= {MAX_FLOAT_SHARES/1e6:.0f}M)")
+                                                # Stock meets all criteria!
+                                                should_alert = True
+                                                logger.info(f"[NASDAQ PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
                                         
                                         if should_alert:
+                                            # 🔍 HALT VERIFICATION: Already on NASDAQ, no need to re-verify
+                                            # (This IS the NASDAQ scraper, so halt is already confirmed)
                                             float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
                                             price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
                                             
