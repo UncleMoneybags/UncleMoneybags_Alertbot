@@ -172,8 +172,10 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         filter_counts["price_too_high"] += 1
         if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT", "GLTO"
                       ] or filter_counts["price_too_high"] % 50 == 1:
+            using_str = "entry_price" if use_entry_price and entry_price.get(symbol) else "last_price"
             logger.info(
-                f"[FILTER DEBUG] {symbol} filtered: price ${check_price:.2f} > ${PRICE_THRESHOLD} (count: {filter_counts['price_too_high']}) [using {'entry' if use_entry_price and entry_price.get(symbol) else 'current'} price]"
+                f"[FILTER DEBUG] {symbol} filtered: price ${check_price:.2f} > ${PRICE_THRESHOLD} "
+                f"(count: {filter_counts['price_too_high']}) [using {using_str}]"
             )
         return False
 
@@ -650,9 +652,9 @@ def get_valid_vwap(symbol):
     vwap_val = vwap_candles_numpy(vwap_candles[symbol])
 
     # 🚨 FINAL VALIDATION: Ensure VWAP result is reasonable
-    if vwap_val <= 0 or vwap_val > 10000:  # Sanity check - no stock should be > $10,000
-        logger.error(
-            f"[VWAP ERROR] {symbol} - Unreasonable VWAP value: {vwap_val}")
+    # Treat zero, negative, infinite or unreasonably large VWAP as "no VWAP"
+    if vwap_val is None or (not np.isfinite(vwap_val)) or vwap_val <= 0 or vwap_val > 10000:
+        logger.error(f"[VWAP ERROR] {symbol} - Unreasonable or missing VWAP value: {vwap_val}")
         return None
 
     # Verify VWAP is within reasonable range of current prices
@@ -1217,6 +1219,7 @@ recent_high = defaultdict(float)
 volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
+halt_last_alert_time = {}  # Track last halt alert time per symbol to prevent spam on reconnects
 
 ALERT_COOLDOWN_MINUTES = 1  # 🚨 REDUCED to 1 minute - catch rapid momentum shifts
 # 🚨 NEW: Track last alert time PER ALERT TYPE (not just per symbol)
@@ -1341,6 +1344,10 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     Args:
         float_shares: Float size for adaptive thresholds - catches micro-float spikes like ULY
     """
+    # 🚨 CRITICAL: Guard against None vwap_value - prevents TypeError in comparisons
+    if vwap_value is None:
+        return False, {}
+    
     # 🚨 FIX: Convert to list immediately to prevent slice errors
     if isinstance(candles_seq, deque):
         candles_list = list(candles_seq)
@@ -1359,6 +1366,12 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     curr_volume = curr_candle['volume']
     symbol = curr_candle.get('symbol', '?')
 
+    # If we don't have a valid VWAP, we cannot reliably evaluate "above VWAP" conditions.
+    # Fail-open earlier in the pipeline may allow processing, but this detector needs VWAP.
+    if vwap_value is None:
+        logger.debug(f"[VOLUME SPIKE] {symbol} - No VWAP available, skipping volume spike check")
+        return False, {}
+
     # ADAPTIVE: Use 3 trailing candles for early detection (4 total needed)
     trailing_volumes = [c['volume'] for c in candles_list[-4:-1]]
     trailing_avg = sum(trailing_volumes) / 3 if len(
@@ -1366,7 +1379,7 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
     # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
     current_price_spike = last_trade_price.get(symbol)
-    above_vwap = current_price_spike is not None and current_price_spike > vwap_value
+    above_vwap = (current_price_spike is not None and vwap_value is not None and current_price_spike > vwap_value)
 
     # 🚨 ADAPTIVE volume threshold - catches ULY-type micro-float spikes (8-18k shares/min)
     min_volume = get_min_volume_for_float(float_shares)  # 7.5k for micro-floats, 25k for regular
@@ -1505,6 +1518,10 @@ def validate_price_above_vwap_strict(symbol, vwap_value, alert_type, max_age_sec
     if real_time_price is None or real_time_timestamp is None:
         return (False, None, f"[{alert_type.upper()} BLOCKED] {symbol} - No real-time price available for VWAP validation")
     
+    # If VWAP is not available, block strict VWAP validation — we require VWAP for this guard
+    if vwap_value is None:
+        return (False, real_time_price, f"[{alert_type.upper()} BLOCKED] {symbol} - VWAP data unavailable for strict VWAP validation")
+
     # Check freshness - MUST be within max age
     price_age = (now - real_time_timestamp).total_seconds()
     if price_age > max_age_seconds:
@@ -2124,9 +2141,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             runner_alerted_today[symbol] = today
             last_alert_time[symbol]['runner'] = now
 
-    # DIP PLAY LOGIC
-    MIN_DIP_PCT = 0.10
-    DIP_LOOKBACK = 10
+    # DIP PLAY LOGIC - 🚀 FASTER ALERTS: Reduced requirements for earlier detection
+    MIN_DIP_PCT = 0.06  # REDUCED from 10% to 6% for earlier alerts
+    DIP_LOOKBACK = 8    # REDUCED from 10 to 8 for faster recent high tracking
     if len(candles_seq) >= DIP_LOOKBACK:
         highs = [c["high"] for c in list(candles_seq)[-DIP_LOOKBACK:]]
         rhigh = max(highs)
@@ -2144,11 +2161,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dip_pct >= MIN_DIP_PCT and close <= 20.00
             and close > current_vwap  # ✅ NOW PROPERLY PROTECTED!
         )
-        if dip_play_criteria and len(candles_list) >= 3:
-            c1, c2, c3 = candles_list[-3:]
-            higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
-            rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2[
-                "volume"]
+        # 🚀 FASTER: Only need 2 candles for confirmation (reduced from 3)
+        if dip_play_criteria and len(candles_list) >= 2:
+            c1, c2 = candles_list[-2:]  # REDUCED: Only check last 2 candles
+            higher_lows = c2["low"] > c1["low"]  # SIMPLIFIED: Just 1 higher low
+            rising_volume = c2["volume"] > c1["volume"]  # SIMPLIFIED: Just 1 volume increase
             dip_play_criteria = dip_play_criteria and higher_lows and rising_volume
             logger.info(
                 f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}"
@@ -2178,7 +2195,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     return
                 
                 # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
-                candle_time_dp = c3['start_time'] + timedelta(minutes=1)
+                candle_time_dp = c2['start_time'] + timedelta(minutes=1)  # FIXED: Use c2 instead of c3 (only 2 candles now)
                 alert_price = get_display_price(symbol, close, candle_time_dp)
                 log_event(
                     "dip_play", symbol,
@@ -2472,8 +2489,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Use validated real-time price for alert (guaranteed fresh and above VWAP)
             current_price_ema = real_time_price_ema
             
-            # Additional VWAP sanity check
-            if vwap_value <= 0:
+            # Additional VWAP sanity check - guard against None first
+            if vwap_value is None or vwap_value <= 0:
                 logger.debug(
                     f"[EMA STACK FILTERED] {symbol} - invalid VWAP {vwap_value}"
                 )
@@ -2490,10 +2507,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
             # STRENGTHENED EMA stack criteria (5,8,13) - MUCH more selective for higher quality alerts
             # NOTE: VWAP check moved above - real-time price already confirmed > VWAP
+            # 🚨 CRITICAL: Guard vwap_value against None in multiplication
             base_ema_criteria = (
                 ema5 > ema8 > ema13 and ema5 >= 1.011 * ema13
                 and  # Keep original 1.1% spread - just ensure EMAs moving up
-                current_price_ema >= 1.015 * vwap_value
+                (vwap_value is not None and current_price_ema >= 1.015 * vwap_value)
                 and  # 🚨 REAL-TIME price must be at least 1.5% above VWAP 
                 current_price_ema >= 1.005 * ema13
                 and  # 🚨 REAL-TIME price must be at least 0.5% above EMA13 
@@ -2534,8 +2552,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema_stack_criteria = base_ema_criteria and momentum_confirmed
 
             if ema_stack_criteria and not ema_stack_was_true[symbol]:
-                vwap_margin = (current_price_ema -
-                               vwap_value) / vwap_value * 100
+                # 🚨 CRITICAL: Guard against None vwap_value in calculation
+                vwap_margin = ((current_price_ema - vwap_value) / vwap_value * 100) if vwap_value else 0
                 ema13_margin = (current_price_ema - ema13) / ema13 * 100
                 logger.info(
                     f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, real_time={current_price_ema:.2f}, candle_close={candle_close:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}, vwap_margin={vwap_margin:.1f}%, ema13_margin={ema13_margin:.1f}%"
@@ -2576,8 +2594,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if real_time_price_ema <= vwap_value:
                     logger.info(f"[EMA STACK BLOCKED] {symbol} - Real-time price ${real_time_price_ema:.2f} NOT above VWAP ${vwap_value:.2f}")
                     return
-                # 🚨 FIX: Use real-time price if fresh, otherwise candle close
-                alert_price = get_display_price(symbol, candle_close)  # Fallback to candle close
+                # 🚨 FIX: Use real-time price if fresh, otherwise candle close with timestamp
+                candle_time_ema = last_candle['start_time'] + timedelta(minutes=1)
+                alert_price = get_display_price(symbol, candle_close, candle_time_ema)
                 log_event(
                     "ema_stack", symbol,
                     alert_price, last_volume,
@@ -2827,7 +2846,8 @@ async def ingest_polygon_events():
                                     logger.info(f"[GRANDFATHERING] {symbol} now eligible - locked entry price: ${price:.2f}")
 
                                 # 🚨 FIX: Use Polygon's timestamp to reject stale trades
-                                trade_time = datetime.fromtimestamp(trade_timestamp / 1000, tz=timezone.utc)
+                                # Polygon timestamps are in nanoseconds, divide by 1,000,000 to get seconds
+                                trade_time = datetime.fromtimestamp(trade_timestamp / 1_000_000, tz=timezone.utc)
                                 now_utc = datetime.now(timezone.utc)
                                 trade_age_seconds = (now_utc - trade_time).total_seconds()
                                 
@@ -2871,8 +2891,8 @@ async def ingest_polygon_events():
                                     prev_builder = local_candle_builder[symbol]
                                     prev_minute = prev_builder['minute']
                                     
-                                    # Only create local candle if we had enough trades (min 5)
-                                    if prev_builder['trade_count'] >= 5:
+                                    # Only create local candle if we had trades (min 1 for early detection)
+                                    if prev_builder['trade_count'] >= 1:
                                         local_candle = {
                                             "open": prev_builder['open'],
                                             "high": prev_builder['high'],
@@ -3053,13 +3073,25 @@ async def ingest_polygon_events():
                                 
                                 if symbol and timestamp:
                                     # Format halt key for deduplication
+                                    # 🚨 CRITICAL FIX: Polygon LULD timestamps are in NANOSECONDS, divide by 1,000,000,000 to get seconds
+                                    eastern = pytz.timezone("America/New_York")
                                     halt_time = datetime.fromtimestamp(
-                                        timestamp / 1000, tz=timezone.utc)
+                                        timestamp / 1_000_000_000, tz=timezone.utc)
                                     halt_time_et = halt_time.astimezone(eastern)
                                     halt_key = f"{symbol}_{halt_time_et.strftime('%H:%M:%S')}_LULD"
 
-                                    # Skip if already processed
+                                    # 🚨 TIME-BASED DEDUPLICATION: Skip if we alerted on this symbol in last 5 minutes
+                                    # This prevents spam when scanner reconnects and Polygon resends old LULD events
+                                    now = datetime.now(timezone.utc)
+                                    last_halt_time = halt_last_alert_time.get(symbol)
+                                    if last_halt_time and (now - last_halt_time).total_seconds() < 300:  # 5 minutes
+                                        time_since = int((now - last_halt_time).total_seconds())
+                                        logger.info(f"[LULD SKIP] {symbol} - Already alerted {time_since}s ago (within 5min window)")
+                                        continue
+                                    
+                                    # Skip if already processed this exact halt
                                     if halt_key in halted_symbols:
+                                        logger.info(f"[LULD SKIP] {symbol} - Duplicate halt key: {halt_key}")
                                         continue
 
                                     halted_symbols.add(halt_key)
@@ -3093,24 +3125,31 @@ async def ingest_polygon_events():
 
                                         float_shares = await get_float_shares(symbol)
                                         
-                                        # 🚨 SPECIAL HALT RULE: Only filter if price is KNOWN and >$15
-                                        # If price unknown, send alert anyway (halts are critical!)
-                                        should_alert = True
+                                        # 🚨 STRICT HALT FILTERING: Only alert if stock meets bot criteria
+                                        # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
+                                        should_alert = False
                                         filter_reason = None
                                         
-                                        if current_price:
-                                            logger.info(f"[LULD] {symbol} - Price ${current_price:.2f} from {price_source}")
-                                            if current_price > PRICE_THRESHOLD:
-                                                should_alert = False
-                                                filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
+                                        # Price must be known and ≤$15 to alert
+                                        if not current_price:
+                                            filter_reason = "no price data available"
+                                            logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
+                                        elif current_price > PRICE_THRESHOLD:
+                                            should_alert = False
+                                            filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
+                                            logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
                                         else:
-                                            logger.warning(f"[LULD] {symbol} - NO PRICE DATA - will alert anyway (halt is critical)")
-                                        
-                                        # Check float only if we should alert based on price
-                                        if should_alert and float_shares is not None:
-                                            if not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
-                                                should_alert = False
-                                                filter_reason = f"float {float_shares/1e6:.1f}M out of range"
+                                            # Price is valid, check float
+                                            if float_shares is None:
+                                                filter_reason = "no float data available"
+                                                logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
+                                            elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
+                                                filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
+                                                logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
+                                            else:
+                                                # Stock meets all criteria!
+                                                should_alert = True
+                                                logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
                                         
                                         if should_alert:
                                             float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
@@ -3157,6 +3196,8 @@ async def ingest_polygon_events():
                                                     "data_source": "polygon_luld"
                                                 })
 
+                                            # Track when we sent this halt alert (prevents spam on reconnects)
+                                            halt_last_alert_time[symbol] = datetime.now(timezone.utc)
                                             logger.warning(f"[✅ LULD SENT] {symbol} @ {price_display} - {halt_reason}")
                                         else:
                                             logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
@@ -3167,6 +3208,7 @@ async def ingest_polygon_events():
                                         try:
                                             emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error getting details - check logs"
                                             await send_all_alerts(emergency_msg)
+                                            halt_last_alert_time[symbol] = datetime.now(timezone.utc)
                                             logger.warning(f"[LULD] Sent emergency halt alert for {symbol}")
                                         except:
                                             pass
@@ -3295,35 +3337,70 @@ async def nasdaq_halt_monitor():
                                             try:
                                                 # Get current price
                                                 current_price = last_trade_price.get(symbol)
+                                                price_source = "last_trade"
+                                                
                                                 if not current_price and symbol in candles and len(candles[symbol]) > 0:
                                                     current_price = candles[symbol][-1]['close']
+                                                    price_source = "candle"
                                                 
-                                                price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
+                                                # Get float data
+                                                float_shares = await get_float_shares(symbol)
                                                 
-                                                # Send resume alert (no filtering - resumes are important!)
-                                                alert_msg = f"""🟢 <b>TRADING RESUMED</b> (NASDAQ)
+                                                # 🚨 STRICT RESUME FILTERING: Only alert if stock meets bot criteria
+                                                # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
+                                                should_alert = False
+                                                filter_reason = None
+                                                
+                                                # Price must be known and ≤$15 to alert
+                                                if not current_price:
+                                                    filter_reason = "no price data available"
+                                                    logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
+                                                elif current_price > PRICE_THRESHOLD:
+                                                    filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
+                                                    logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
+                                                else:
+                                                    # Price is valid, check float
+                                                    if float_shares is None:
+                                                        filter_reason = "no float data available"
+                                                        logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
+                                                    elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
+                                                        filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
+                                                        logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
+                                                    else:
+                                                        # Stock meets all criteria!
+                                                        should_alert = True
+                                                        logger.info(f"[RESUME PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
+                                                
+                                                if should_alert:
+                                                    price_display = f"${current_price:.2f}"
+                                                    float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
+                                                    
+                                                    alert_msg = f"""🟢 <b>TRADING RESUMED</b> (NASDAQ)
 
 <b>Symbol:</b> {symbol}
 <b>Price:</b> {price_display}
+<b>Float:</b> {float_display} shares
 <b>Halted:</b> {halt_time_str} ET
 <b>Resumed:</b> {resume_time_str} ET
 <b>Reason:</b> {halt_reason_code}
 <b>Status:</b> BACK TO TRADING ▶️
 
 🚀 <i>Real-time via NASDAQ feed</i>"""
-                                                
-                                                logger.warning(f"[🟢 RESUME ALERT] Sending resume for {symbol} @ {price_display}")
-                                                await send_all_alerts(alert_msg)
-                                                
-                                                # Log resume event
-                                                log_event(
-                                                    "nasdaq_resume", symbol,
-                                                    current_price if current_price else 0, 0, now, {
-                                                        "halt_time": halt_time_str,
-                                                        "resume_time": resume_time_str,
-                                                        "halt_code": halt_reason_code,
-                                                        "data_source": "nasdaq_scrape"
-                                                    })
+                                                    
+                                                    logger.warning(f"[🟢 RESUME ALERT] Sending resume for {symbol} @ {price_display}")
+                                                    await send_all_alerts(alert_msg)
+                                                    
+                                                    # Log resume event
+                                                    log_event(
+                                                        "nasdaq_resume", symbol,
+                                                        current_price if current_price else 0, 0, now, {
+                                                            "halt_time": halt_time_str,
+                                                            "resume_time": resume_time_str,
+                                                            "halt_code": halt_reason_code,
+                                                            "data_source": "nasdaq_scrape",
+                                                            "float_shares": float_shares,
+                                                            "price_source": price_source
+                                                        })
                                             except Exception as e:
                                                 logger.error(f"[RESUME ERROR] Error processing resume for {symbol}: {e}")
                                         continue  # Don't process as halt
