@@ -1185,13 +1185,12 @@ last_volume_spike_time = defaultdict(
     lambda: datetime.min.replace(tzinfo=timezone.utc))
 last_runner_alert_time = defaultdict(
     lambda: datetime.min.replace(tzinfo=timezone.utc))
-runner_alerted_today = set()
 
 pending_runner_alert = {}
 HALT_LOG_FILE = "halt_event_log.csv"
 
 alerted_symbols = {}
-runner_alerted_today = {}
+runner_alerted_today = {}  # Dict to store alert timestamp per symbol
 below_vwap_streak = defaultdict(int)
 vwap_reclaimed_once = defaultdict(bool)
 dip_play_seen = set()
@@ -1744,9 +1743,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         vwap_candles[symbol] = list(vwap_candles[symbol])
     float_shares = await get_float_shares(symbol)
     # Check exception list first, then float range
-    if symbol not in FLOAT_EXCEPTION_SYMBOLS and (
-            float_shares is None
-            or not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)):
+    # 🚨 FIX: FAIL-OPEN for unknown float (consistent with is_eligible)
+    if symbol not in FLOAT_EXCEPTION_SYMBOLS and float_shares is not None and (
+            not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)):
         if symbol == "OCTO":
             logger.info(
                 f"[🚨 OCTO DEBUG] FILTERED OUT due to float {float_shares} (range: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES})"
@@ -2786,8 +2785,8 @@ async def ingest_polygon_events():
                                 now_utc = datetime.now(timezone.utc)
                                 trade_age_seconds = (now_utc - trade_time).total_seconds()
                                 
-                                # Reject trades older than 3 seconds (stale data)
-                                if trade_age_seconds > 3:
+                                # Reject trades older than 8 seconds (allows for network jitter)
+                                if trade_age_seconds > 8:
                                     logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting")
                                     continue
                                 
