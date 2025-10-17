@@ -1269,6 +1269,7 @@ def get_scanned_tickers():
 
 vwap_candles = defaultdict(lambda: deque(maxlen=CANDLE_MAXLEN))
 vwap_session_date = defaultdict(lambda: None)
+vwap_reset_done = defaultdict(bool)  # Track if VWAP reset at 9:30 AM for each symbol
 
 
 def get_session_date(dt):
@@ -2822,6 +2823,7 @@ async def ingest_polygon_events():
                                         if last_session != session_date:
                                             vwap_candles[symbol] = []
                                             vwap_session_date[symbol] = session_date
+                                            vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                         
                                         # Process VWAP reset at market open
                                         eastern = pytz.timezone("America/New_York")
@@ -2830,6 +2832,8 @@ async def ingest_polygon_events():
                                         if candle_time >= market_open_time:
                                             if not vwap_reset_done[symbol]:
                                                 vwap_candles[symbol] = []
+                                                vwap_cum_vol[symbol] = 0
+                                                vwap_cum_pv[symbol] = 0
                                                 vwap_reset_done[symbol] = True
                                                 logger.info(f"[VWAP RESET] {symbol} - Cleared pre-market VWAP data at market open (9:30 AM)")
                                         
@@ -2903,6 +2907,7 @@ async def ingest_polygon_events():
                                 if last_session != session_date:
                                     vwap_candles[symbol] = []
                                     vwap_session_date[symbol] = session_date
+                                    vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                 
                                 # 🚨 FIX: Reset VWAP at 9:30 AM to exclude pre-market data
                                 candle_time = start_time.astimezone(eastern).time()
