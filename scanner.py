@@ -862,7 +862,8 @@ def track_alert_for_outcome(symbol, alert_type, price):
 
 def auto_label_success(symbol, entry_price, current_price, minutes_elapsed):
     """Automatically determine if alert was profitable"""
-    if entry_price <= 0:
+    # 🚨 FIX: Guard against None or invalid prices
+    if entry_price is None or entry_price <= 0 or current_price is None:
         return {"return_pct": 0, "is_successful": False, "quality_score": 0}
 
     return_pct = (current_price - entry_price) / entry_price
