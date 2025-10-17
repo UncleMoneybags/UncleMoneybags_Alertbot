@@ -656,7 +656,9 @@ def get_valid_vwap(symbol):
         return None
 
     # Verify VWAP is within reasonable range of current prices
-    recent_prices = [candle['close'] for candle in candles[-3:]]
+    # 🚨 FIX: Convert deque to list before slicing to prevent "sequence index must be integer, not 'slice'" error
+    candles_list = list(candles) if isinstance(candles, deque) else candles
+    recent_prices = [candle['close'] for candle in candles_list[-3:]]
     min_recent = min(recent_prices)
     max_recent = max(recent_prices)
     if not (min_recent * 0.5 <= vwap_val <= max_recent *
