@@ -573,7 +573,7 @@ def vwap_candles_numpy(candles):
         return 0.0
 
     try:
-        # Extract typical prices and volumes with validation
+        # 🚨 FIX: Filter out zero-volume candles BEFORE calculation
         prices = []
         volumes = []
         for i, candle in enumerate(candles):
@@ -584,11 +584,21 @@ def vwap_candles_numpy(candles):
                     raise ValueError(
                         f"Candle {i} missing required field: {field}")
 
+            # 🚨 FIX: Skip zero/negative volume candles to prevent ValueError
+            if candle['volume'] <= 0:
+                logger.debug(f"[VWAP SKIP] Candle {i} has zero/negative volume: {candle['volume']}")
+                continue
+
             # Calculate typical price (HLC/3)
             typical_price = (candle['high'] + candle['low'] +
                              candle['close']) / 3
             prices.append(typical_price)
             volumes.append(candle['volume'])
+
+        # 🚨 FIX: Check if we have any valid candles after filtering
+        if not prices or not volumes:
+            logger.warning("[VWAP ERROR] No non-zero volume candles available")
+            return 0.0
 
         logger.info(f"[VWAP DEBUG] Prices used: {prices}")
         logger.info(f"[VWAP DEBUG] Volumes used: {volumes}")
@@ -2766,7 +2776,12 @@ async def ingest_polygon_events():
                                 symbol = event["sym"]
                                 price = event["p"]
                                 size = event.get('s', 0)
-                                trade_timestamp = event.get('t', 0)  # Polygon's event timestamp (milliseconds)
+                                trade_timestamp = event.get('t')  # 🚨 FIX: Don't default to 0
+                                
+                                # 🚨 FIX: Skip trades with missing timestamp (don't fake to epoch 1970)
+                                if not trade_timestamp:
+                                    logger.debug(f"[TRADE SKIP] {symbol} - Missing timestamp, cannot validate freshness")
+                                    continue
 
                                 # Check eligibility BEFORE processing/logging
                                 float_shares = await get_float_shares(symbol)
