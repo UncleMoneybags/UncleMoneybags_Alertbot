@@ -1559,9 +1559,14 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                               candles_seq, vwap_value):
     # Debug prints for ALL alert processing - MAIN LOOP
     print(f"[MAIN LOOP DEBUG] Processing symbol: {symbol}")
-    # 🚨 FIX: candles_seq is already a list here (passed from on_new_candle)
-    if candles_seq and len(candles_seq) >= 6:
-        last_6 = candles_seq[-6:]
+    # 🚨 FIX: Convert to list if it's a deque to prevent slice errors
+    if isinstance(candles_seq, deque):
+        candles_list = list(candles_seq)
+    else:
+        candles_list = candles_seq if isinstance(candles_seq, list) else list(candles_seq)
+    
+    if candles_list and len(candles_list) >= 6:
+        last_6 = candles_list[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5 if volumes_5 else 0
         last_candle = last_6[-1]
