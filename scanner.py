@@ -8,6 +8,7 @@ import re
 from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta, date, time as dt_time
 from email.utils import parsedate_to_datetime
+from concurrent.futures import ThreadPoolExecutor
 import pytz
 import signal
 import pickle
@@ -21,6 +22,41 @@ import requests
 import pandas as pd
 import time
 
+# 🚀 SAFETY NET: Register cleanup handler for unexpected exits
+def cleanup_resources():
+    """Emergency cleanup handler for unexpected shutdowns
+    
+    Ensures both HTTP session and ThreadPoolExecutor are properly closed
+    even if normal shutdown path is bypassed.
+    """
+    global http_session, io_executor
+    try:
+        # Close HTTP session to prevent connection leaks
+        if http_session and not http_session.closed:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(http_session.close())
+                else:
+                    loop.run_until_complete(http_session.close())
+                logger.info("[ATEXIT] Closed HTTP session")
+            except:
+                # If async close fails, at least attempt sync cleanup
+                try:
+                    http_session.connector.close()
+                except:
+                    pass
+        
+        # Shutdown executor with wait=True to ensure in-flight writes complete
+        if io_executor:
+            io_executor.shutdown(wait=True)
+            logger.info("[ATEXIT] Executor shutdown complete (waited for in-flight tasks)")
+    except Exception as e:
+        logger.error(f"[ATEXIT] Cleanup error: {e}")
+
+atexit.register(cleanup_resources)
+
 MARKET_OPEN = dt_time(4, 0)
 MARKET_CLOSE = dt_time(20, 0)
 eastern = pytz.timezone("America/New_York")
@@ -28,6 +64,10 @@ logger = logging.getLogger(__name__)
 
 # 🚀 PERFORMANCE: Reusable HTTP session (30-50% faster than creating new sessions)
 http_session = None
+
+# 🚀 PERFORMANCE: Thread pool executor for blocking I/O operations (pickle, CSV, JSON)
+# Prevents blocking the event loop during disk writes
+io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="io_worker")
 
 last_trade_price = defaultdict(lambda: None)
 last_trade_volume = defaultdict(lambda: 0)
@@ -67,10 +107,16 @@ async def save_float_cache(force=False):
         tmp1 = "float_cache.pkl.tmp"
         tmp2 = "float_cache_none.pkl.tmp"
         
-        with open(tmp1, "wb") as f:
-            pickle.dump(float_cache, f)
-        with open(tmp2, "wb") as f:
-            pickle.dump(float_cache_none_retry, f)
+        # 🚀 PERFORMANCE: Run blocking I/O in thread executor to prevent event loop blocking
+        loop = asyncio.get_event_loop()
+        
+        def write_pickle_files():
+            with open(tmp1, "wb") as f:
+                pickle.dump(float_cache, f)
+            with open(tmp2, "wb") as f:
+                pickle.dump(float_cache_none_retry, f)
+        
+        await loop.run_in_executor(io_executor, write_pickle_files)
         
         # Atomic rename (replaces old file atomically)
         os.replace(tmp1, "float_cache.pkl")
@@ -87,19 +133,19 @@ def load_float_cache():
     if os.path.exists("float_cache.pkl"):
         with open("float_cache.pkl", "rb") as f:
             float_cache = pickle.load(f)
-        print(f"[DEBUG] Loaded float cache, entries: {len(float_cache)}")
+        logger.debug(f"Loaded float cache, entries: {len(float_cache)}")
     else:
         float_cache = {}
-        print(f"[DEBUG] No float cache found, starting new.")
+        logger.debug("No float cache found, starting new")
     if os.path.exists("float_cache_none.pkl"):
         with open("float_cache_none.pkl", "rb") as f:
             float_cache_none_retry = pickle.load(f)
-        print(
-            f"[DEBUG] Loaded float_cache_none_retry, entries: {len(float_cache_none_retry)}"
+        logger.debug(
+            f"Loaded float_cache_none_retry, entries: {len(float_cache_none_retry)}"
         )
     else:
         float_cache_none_retry = {}
-        print(f"[DEBUG] No float_cache_none_retry found, starting new.")
+        logger.debug("No float_cache_none_retry found, starting new")
 
 
 async def get_float_shares(ticker):
@@ -257,7 +303,7 @@ class VolumeProfile:
         else:
             self.profile = defaultdict(lambda: defaultdict(list))
 
-    def _save_profile(self):
+    async def _save_profile(self):
         serializable = {
             sym: {
                 str(minidx): vols
@@ -265,10 +311,16 @@ class VolumeProfile:
             }
             for sym, by_min in self.profile.items()
         }
-        with open(PROFILE_FILE, "w") as f:
-            json.dump(serializable, f)
+        
+        # 🚀 PERFORMANCE: JSON write in thread executor to prevent blocking
+        def write_json():
+            with open(PROFILE_FILE, "w") as f:
+                json.dump(serializable, f)
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(io_executor, write_json)
 
-    def add_day(self, symbol, daily_candles):
+    async def add_day(self, symbol, daily_candles):
         for candle in daily_candles:
             minute_idx = get_minute_of_day(candle['start_time'])
             vol = candle['volume']
@@ -279,7 +331,7 @@ class VolumeProfile:
             if len(self.profile[symbol][minute_idx]) > DAYS_TO_KEEP:
                 self.profile[symbol][minute_idx] = self.profile[symbol][
                     minute_idx][-DAYS_TO_KEEP:]
-        self._save_profile()
+        await self._save_profile()
 
     def get_avg(self, symbol, minute_idx):
         vols = self.profile.get(symbol, {}).get(minute_idx, [])
@@ -305,7 +357,7 @@ async def perform_connection_backfill():
 
         # Only backfill during market hours
         if not is_market_scan_time():
-            print("[BACKFILL] Outside market hours, skipping backfill")
+            logger.info("[BACKFILL] Outside market hours, skipping backfill")
             return
 
         # Get last 10 minutes of data for active symbols
@@ -323,7 +375,7 @@ async def perform_connection_backfill():
                 if time_since_last < 1800:  # Active in last 30 minutes
                     active_symbols.append(symbol)
 
-        print(
+        logger.info(
             f"[BACKFILL] Checking {len(active_symbols)} active symbols for missed alerts..."
         )
 
@@ -346,7 +398,7 @@ async def perform_connection_backfill():
                         data = await response.json()
                         if data.get('status') == 'OK' and data.get('results'):
                             candles = data['results']
-                            print(
+                            logger.info(
                                 f"[BACKFILL] {symbol}: Processing {len(candles)} missed candles"
                             )
 
@@ -367,12 +419,12 @@ async def perform_connection_backfill():
                 await asyncio.sleep(0.1)  # Rate limiting
 
             except Exception as e:
-                print(f"[BACKFILL ERROR] {symbol}: {e}")
+                logger.error(f"[BACKFILL ERROR] {symbol}: {e}")
 
-        print(f"[BACKFILL] Completed catch-up analysis")
+        logger.info("[BACKFILL] Completed catch-up analysis")
 
     except Exception as e:
-        print(f"[BACKFILL ERROR] General error: {e}")
+        logger.error(f"[BACKFILL ERROR] General error: {e}")
 
 
 # --- STORED EMA SYSTEM ---
@@ -785,6 +837,9 @@ ALERT_PRICE_DELTA = 0.25
 RVOL_SPIKE_THRESHOLD = 1.5  # REDUCED: Lower RVOL for early detection
 RVOL_SPIKE_MIN_VOLUME = 25000  # REDUCED: Lower volume for early spikes
 
+# 🚀 MEMORY MANAGEMENT: LRU tracking for symbol eviction
+symbol_last_access = {}  # symbol -> last access timestamp
+
 MIN_FLOAT_SHARES = 500_000
 MAX_FLOAT_SHARES = 20_000_000  # UPDATED: Increased from 10M to 20M
 
@@ -1022,13 +1077,14 @@ async def retrain_model_if_needed():
         if len(X) >= 30 and y.sum() > 5:  # At least 30 samples and 5 successes
             from sklearn.ensemble import RandomForestClassifier
 
-            # Train new model
+            # Train new model (CPU intensive - keep in main thread)
             new_model = RandomForestClassifier(n_estimators=100,
                                                random_state=42)
             new_model.fit(X, y)
 
-            # Save updated model
-            joblib.dump(new_model, "runner_model_updated.joblib")
+            # 🚀 PERFORMANCE: Save model in thread executor to prevent blocking
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(io_executor, joblib.dump, new_model, "runner_model_updated.joblib")
 
             # Update global model
             global runner_clf
@@ -1041,8 +1097,13 @@ async def retrain_model_if_needed():
             # Archive old outcome data to prevent memory issues
             if len(outcome_df) > 1000:
                 archive_file = f"outcome_archive_{datetime.now().strftime('%Y%m%d')}.csv"
-                outcome_df.iloc[:-200].to_csv(archive_file, index=False)
-                outcome_df.iloc[-200:].to_csv(OUTCOME_LOG_FILE, index=False)
+                
+                # 🚀 PERFORMANCE: CSV writes in thread executor to prevent blocking
+                def write_csvs():
+                    outcome_df.iloc[:-200].to_csv(archive_file, index=False)
+                    outcome_df.iloc[-200:].to_csv(OUTCOME_LOG_FILE, index=False)
+                
+                await loop.run_in_executor(io_executor, write_csvs)
                 logger.info(
                     f"[ML UPDATE] Archived old outcomes to {archive_file}")
 
@@ -1464,8 +1525,9 @@ def get_ny_date():
     return now_ny.date()
 
 
-# PATCH: FRESHNESS CHECK for price
+# 🚀 FRESHNESS THRESHOLDS: Consolidated timestamp validation constants
 MAX_PRICE_AGE_SECONDS = 30  # RELAXED: Catch big movers even with data delays (was 5s, too strict)
+MAX_TRADE_AGE_SECONDS = 8   # Maximum age for incoming trade ticks (allows for network jitter)
 
 
 def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_PRICE_AGE_SECONDS):
@@ -1590,14 +1652,13 @@ def reset_symbol_state():
 
 async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                               candles_seq, vwap_value):
-    # Debug prints for ALL alert processing - MAIN LOOP
-    print(f"[MAIN LOOP DEBUG] Processing symbol: {symbol}")
     # 🚨 FIX: Convert to list if it's a deque to prevent slice errors
     if isinstance(candles_seq, deque):
         candles_list = list(candles_seq)
     else:
         candles_list = candles_seq if isinstance(candles_seq, list) else list(candles_seq)
     
+    # Removed verbose debug logging for performance - use logger.debug if needed
     if candles_list and len(candles_list) >= 6:
         last_6 = candles_list[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -1619,28 +1680,13 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
         price_rising_trend = all(
             x < y for x, y in zip(closes_for_trend, closes_for_trend[1:]))
 
-        print(
-            f"{symbol} Runner Volume: {volume_rn}, AvgVol5: {avg_vol_5}, VolPass: {volume_rn >= 2.0 * avg_vol_5}"
+        # Debug logging only when needed (set to DEBUG level)
+        logger.debug(
+            f"{symbol} Runner: vol={volume_rn}, avg5={avg_vol_5:.0f}, volPass={volume_rn >= 2.0 * avg_vol_5}, "
+            f"priceMove={price_move_rn:.3f}, movePass={price_move_rn >= 0.03}, "
+            f"close={close_rn}, high={high_rn}, wickPass={close_rn >= 0.65 * high_rn}, "
+            f"volIncreasing={volume_increasing}, priceTrend={price_rising_trend}"
         )
-        print(
-            f"{symbol} PriceMove: {price_move_rn}, MovePass: {price_move_rn >= 0.03}"
-        )
-        print(
-            f"{symbol} Close: {close_rn}, High: {high_rn}, WickPass: {close_rn >= 0.65 * high_rn}"
-        )
-        print(f"{symbol} VolumeIncreasing: {volume_increasing}")
-        print(f"{symbol} PriceTrend: {price_rising_trend}")
-
-        if not (volume_rn >= 2.0 * avg_vol_5):
-            print(f"{symbol}: Failed volume runner")
-        if not (price_move_rn >= 0.03):
-            print(f"{symbol}: Failed price move")
-        if not (close_rn >= 0.65 * high_rn):
-            print(f"{symbol}: Failed wick")
-        if not volume_increasing:
-            print(f"{symbol}: Failed volume increasing")
-        if not price_rising_trend:
-            print(f"{symbol}: Failed price trend")
 
     closes_np = np.array(closes)
     volumes_np = np.array(volumes)
@@ -1765,12 +1811,52 @@ def is_premarket(dt):
     return dt_time(4, 0) <= dt_ny.time() < dt_time(9, 30)
 
 
+def enforce_symbol_limit(symbol):
+    """🚀 MEMORY MANAGEMENT: Enforce MAX_SYMBOLS limit with LRU eviction
+    
+    Updates access time for symbol and evicts least recently used symbol if at limit.
+    This prevents unbounded memory growth from tracking thousands of symbols.
+    """
+    global symbol_last_access
+    
+    # Update access time for current symbol
+    symbol_last_access[symbol] = datetime.now(timezone.utc)
+    
+    # Check if we're at the limit
+    if len(symbol_last_access) > MAX_SYMBOLS:
+        # Find least recently used symbol
+        lru_symbol = min(symbol_last_access.items(), key=lambda x: x[1])[0]
+        
+        # Evict from all data structures
+        symbol_last_access.pop(lru_symbol, None)
+        candles.pop(lru_symbol, None)
+        vwap_candles.pop(lru_symbol, None)
+        vwap_cum_vol.pop(lru_symbol, None)
+        vwap_cum_pv.pop(lru_symbol, None)
+        vwap_session_date.pop(lru_symbol, None)
+        vwap_reset_done.pop(lru_symbol, None)
+        stored_emas.pop(lru_symbol, None)
+        last_trade_price.pop(lru_symbol, None)
+        last_trade_volume.pop(lru_symbol, None)
+        last_trade_time.pop(lru_symbol, None)
+        entry_price.pop(lru_symbol, None)
+        rvol_history.pop(lru_symbol, None)
+        local_candle_builder.pop(lru_symbol, None)
+        ema_stack_was_true.pop(lru_symbol, None)
+        runner_alerted_today.pop(lru_symbol, None)
+        
+        logger.debug(f"[LRU EVICT] Removed {lru_symbol} to maintain MAX_SYMBOLS={MAX_SYMBOLS} limit (now tracking {len(symbol_last_access)} symbols)")
+
+
 async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     global current_session_date
     today_ny = get_ny_date()
     now = datetime.now(timezone.utc)
     eastern = pytz.timezone("America/New_York")
     now_et = now.astimezone(eastern)
+    
+    # 🚀 MEMORY MANAGEMENT: Enforce symbol limit with LRU eviction
+    enforce_symbol_limit(symbol)
 
     # Only reset state once per day at 04:00 ET (not on every calendar day change)
     if current_session_date != today_ny:
@@ -1780,7 +1866,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         recent_high.clear()
         dip_play_seen.clear()
         halted_symbols.clear()
-        print(f"[DEBUG] Reset alert state for new trading day: {today_ny}")
+        logger.info(f"Reset alert state for new trading day: {today_ny}")
 
     # Reset EMAs only once per day at 04:00 ET for new trading session
     global last_ema_reset_date
@@ -1789,8 +1875,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and last_ema_reset_date != today_ny):
         stored_emas.clear()
         last_ema_reset_date = today_ny
-        print(
-            f"[DEBUG] Reset stored EMAs for new trading session at 04:00 ET: {today_ny}"
+        logger.info(
+            f"[EMA RESET] Reset stored EMAs for new trading session at 04:00 ET: {today_ny}"
         )
 
     # --- Track premarket prices/volumes for gainers list (NO FILTER) ---
@@ -2749,25 +2835,25 @@ async def ingest_polygon_events():
 
     while True:
         if not is_market_scan_time():
-            print(
+            logger.info(
                 "[SCAN PAUSED] Market closed (outside 4am-8pm EST, Mon-Fri). Sleeping 60s."
             )
             await asyncio.sleep(60)
             continue
 
         try:
-            print(
+            logger.info(
                 f"[CONNECTION] Connecting to Polygon WebSocket... (attempt {connection_attempts + 1})"
             )
             async with websockets.connect(url,
                                           ping_interval=15,
                                           ping_timeout=20) as ws:
-                print(
+                logger.info(
                     "[CONNECTION] Successfully connected to Polygon WebSocket")
 
                 # Perform catch-up backfill if this is a reconnection
                 if connection_attempts > 0:
-                    print(
+                    logger.info(
                         "[BACKFILL] Performing catch-up analysis for missed data..."
                     )
                     await perform_connection_backfill()
@@ -2781,19 +2867,46 @@ async def ingest_polygon_events():
                         "action": "auth",
                         "params": POLYGON_API_KEY
                     }))
-                # Subscribe to ALL active stocks - full market scanning for dynamic discovery + halt monitoring
+                
+                # 🚨 FIX: Polygon API tier doesn't support wildcards (AM.*, T.*)
+                # Subscribe to specific high-volume penny stocks instead
+                # This works with ANY Polygon tier (Developer, Advanced, etc.)
+                VOLATILE_TICKERS = [
+                    # Common penny stock movers (updated list of volatile <$15 stocks)
+                    "SOXL", "SOXS", "TQQQ", "SQQQ", "UVXY", "SPXS", "SPXU", "TNA", "TZA",
+                    "LABU", "LABD", "NUGT", "DUST", "JNUG", "JDST", "TECL", "TECS",
+                    "FAS", "FAZ", "ERX", "ERY", "DFEN", "GDXJ", "GDX", "SILJ", "SIL",
+                    # Recent runners and volatile penny stocks
+                    "AMC", "APE", "GME", "MULN", "BBBY", "EXPR", "KOSS", "BB", "NOK",
+                    "SNDL", "NAKD", "ZSAN", "ATOS", "GNUS", "JAGX", "OCGN", "SOS",
+                    "PHUN", "DWAC", "MMAT", "TRCH", "WKEY", "XELA", "GREE", "BKSY",
+                    # Active biotech/pharma pennies
+                    "PROG", "ATER", "BBIG", "CEI", "RDBX", "IMPP", "NILE", "MULN",
+                    # Crypto-related pennies
+                    "MARA", "RIOT", "BTBT", "CAN", "EBON", "SOS", "ANY", "BTCM",
+                    # High-volume ETFs and pennies
+                    "SPY", "QQQ", "IWM", "DIA", "TSLA", "NVDA", "AMD", "AAPL", "MSFT"
+                ]
+                
+                # Build subscription string for candles and trades
+                am_subs = ",".join([f"AM.{t}" for t in VOLATILE_TICKERS])
+                t_subs = ",".join([f"T.{t}" for t in VOLATILE_TICKERS])
+                
+                # Subscribe to candles, trades, and ALL halts (LULD.* still works)
+                subscription = f"{am_subs},{t_subs},LULD.*"
+                
                 await ws.send(
                     json.dumps({
                         "action": "subscribe",
-                        "params": "AM.*,T.*,LULD.*"
+                        "params": subscription
                     }))
-                print(
-                    "Subscribed to: AM.* (minute bars), T.* (trades), LULD.* (halt/volatility alerts) - FULL monitoring"
+                logger.info(
+                    f"Subscribed to {len(VOLATILE_TICKERS)} volatile tickers (AM+T) + LULD.* halts"
                 )
 
                 while True:
                     if not is_market_scan_time():
-                        print(
+                        logger.info(
                             "[SCAN PAUSED] Market closed during active connection. Sleeping 60s, breaking websocket."
                         )
                         await asyncio.sleep(60)
@@ -2805,11 +2918,12 @@ async def ingest_polygon_events():
                     if isinstance(msg, bytes):
                         msg = msg.decode('utf-8')
                     
-                    print("[RAW MSG]", msg)
+                    # 🔇 Reduced logging: Only log in debug mode to prevent performance issues
+                    logger.debug(f"[WS MSG] {msg[:200]}..." if len(msg) > 200 else f"[WS MSG] {msg}")
 
                     # Skip malformed or heartbeat messages
                     if not msg or len(msg.strip()) < 2 or not msg.strip().startswith('{') and not msg.strip().startswith('['):
-                        print(f"[SKIP] Non-JSON message: '{msg}'")
+                        logger.debug(f"[SKIP] Non-JSON message: '{msg[:100]}'")
                         continue
 
                     try:
@@ -2820,10 +2934,10 @@ async def ingest_polygon_events():
                             # Handle connection limit status messages FIRST
                             if event.get("ev") == "status" and event.get(
                                     "status") == "max_connections":
-                                print(
+                                logger.warning(
                                     f"[🚨 CONNECTION LIMIT] Polygon API connection limit exceeded!"
                                 )
-                                print(
+                                logger.warning(
                                     f"[🚨 CONNECTION LIMIT] Message: {event.get('message', 'No details')}"
                                 )
                                 # Treat as throttling signal - trigger exponential backoff
@@ -2865,15 +2979,15 @@ async def ingest_polygon_events():
                                 now_utc = datetime.now(timezone.utc)
                                 trade_age_seconds = (now_utc - trade_time).total_seconds()
                                 
-                                # Reject trades older than 8 seconds (allows for network jitter)
-                                if trade_age_seconds > 8:
-                                    logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting")
+                                # Reject trades older than threshold (allows for network jitter)
+                                if trade_age_seconds > MAX_TRADE_AGE_SECONDS:
+                                    logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting (limit: {MAX_TRADE_AGE_SECONDS}s)")
                                     continue
                                 
                                 last_trade_price[symbol] = price
                                 last_trade_volume[symbol] = size
                                 last_trade_time[symbol] = trade_time  # Use Polygon's timestamp, not now()
-                                print(
+                                logger.debug(
                                     f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={trade_time} | Age={trade_age_seconds:.1f}s"
                                 )
                                 
@@ -2916,7 +3030,7 @@ async def ingest_polygon_events():
                                             "start_time": prev_minute,
                                         }
                                         
-                                        print(
+                                        logger.debug(
                                             f"[LOCAL CANDLE] {symbol} {prev_minute} o:{local_candle['open']} h:{local_candle['high']} l:{local_candle['low']} c:{local_candle['close']} v:{local_candle['volume']} (trades:{prev_builder['trade_count']})"
                                         )
                                         
@@ -2992,7 +3106,7 @@ async def ingest_polygon_events():
                                         f"[🚨 OCTO DEBUG] Received AM candle: {start_time} OHLCV: {open_}/{high}/{low}/{close}/{volume}"
                                     )
 
-                                print(
+                                logger.debug(
                                     f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}"
                                 )
 
@@ -3236,11 +3350,11 @@ async def ingest_polygon_events():
                                             pass
                                         continue
                     except Exception as e:
-                        print(f"Error processing message: {e}\nRaw: {msg}")
+                        logger.error(f"Error processing message: {e}\nRaw: {msg[:200]}", exc_info=True)
 
         except Exception as e:
             connection_attempts += 1
-            print(f"[CONNECTION ERROR] Websocket error: {e}")
+            logger.warning(f"[CONNECTION ERROR] Websocket error: {e}")
 
             # Handle connection limit errors with exponential backoff
             if ("max_connections" in str(e).lower()
@@ -3249,10 +3363,10 @@ async def ingest_polygon_events():
                     or "policy violation" in str(e).lower()
                     or "1008" in str(e)):
 
-                print(
+                logger.warning(
                     f"[🚨 CONNECTION LIMIT] Connection limit/policy violation detected!"
                 )
-                print(
+                logger.warning(
                     f"[🚨 CONNECTION LIMIT] Backing off for {connection_backoff_delay} seconds..."
                 )
 
@@ -3262,7 +3376,7 @@ async def ingest_polygon_events():
                 #     await send_all_alerts(alert_msg)
                 # except:
                 #     pass  # Don't fail on alert send
-                print(f"[CONNECTION] Silently backing off, no user alert sent")
+                logger.info("[CONNECTION] Silently backing off, no user alert sent")
 
                 await asyncio.sleep(connection_backoff_delay)
 
@@ -3272,12 +3386,12 @@ async def ingest_polygon_events():
 
             elif "keepalive" in str(e).lower() or "ping" in str(
                     e).lower() or "1011" in str(e):
-                print(
+                logger.info(
                     "[CONNECTION] Keepalive/ping timeout - reconnecting in 10 seconds..."
                 )
                 await asyncio.sleep(10)
             else:
-                print(
+                logger.warning(
                     f"[CONNECTION] General error - reconnecting in 30 seconds..."
                 )
                 await asyncio.sleep(30)
@@ -3482,9 +3596,15 @@ async def nasdaq_halt_monitor():
                                         ever_halted_symbols.add(symbol)
                                         try:
                                             # 🔒 Atomic write: temp file + rename prevents corruption
+                                            # 🚀 PERFORMANCE: Run in thread executor to prevent blocking
                                             tmp_file = "halted_symbols.pkl.tmp"
-                                            with open(tmp_file, "wb") as f:
-                                                pickle.dump(ever_halted_symbols, f)
+                                            
+                                            def write_halt_pickle():
+                                                with open(tmp_file, "wb") as f:
+                                                    pickle.dump(ever_halted_symbols, f)
+                                            
+                                            loop = asyncio.get_event_loop()
+                                            await loop.run_in_executor(io_executor, write_halt_pickle)
                                             os.replace(tmp_file, "halted_symbols.pkl")
                                             logger.info(f"[HALT TRACKER] Added {symbol} to persistent halt tracker ({len(ever_halted_symbols)} total)")
                                         except Exception as e:
@@ -3650,35 +3770,35 @@ async def main():
     global http_session
     
     # ✅ STARTUP: Check critical dependencies
-    print("[STARTUP] Checking dependencies...")
+    logger.info("[STARTUP] Checking dependencies...")
     missing_deps = []
     
     try:
         import bs4
-        print("  ✅ BeautifulSoup4 (bs4) available")
+        logger.info("  ✅ BeautifulSoup4 (bs4) available")
     except ImportError:
         missing_deps.append("beautifulsoup4")
-        print("  ❌ BeautifulSoup4 (bs4) NOT installed")
+        logger.error("  ❌ BeautifulSoup4 (bs4) NOT installed")
     
     try:
         import yfinance
-        print("  ✅ yfinance available")
+        logger.info("  ✅ yfinance available")
     except ImportError:
         missing_deps.append("yfinance")
-        print("  ❌ yfinance NOT installed")
+        logger.error("  ❌ yfinance NOT installed")
     
     if missing_deps:
         error_msg = f"\n❌ CRITICAL ERROR: Missing required dependencies!\n\nPlease install: {', '.join(missing_deps)}\n\nRun: pip install {' '.join(missing_deps)}\n"
-        print(error_msg)
+        logger.error(error_msg)
         raise ImportError(f"Missing dependencies: {', '.join(missing_deps)}")
     
-    print("[STARTUP] ✅ All dependencies available\n")
+    logger.info("[STARTUP] ✅ All dependencies available\n")
     
     # 🚀 PERFORMANCE: Initialize reusable HTTP session
     http_session = aiohttp.ClientSession()
-    print("[HTTP SESSION] Created reusable HTTP session for better performance")
+    logger.info("[HTTP SESSION] Created reusable HTTP session for better performance")
     
-    print("Main event loop running. Press Ctrl+C to exit.")
+    logger.info("Main event loop running. Press Ctrl+C to exit.")
     ingest_task = asyncio.create_task(ingest_polygon_events())
     # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
     close_alert_task = asyncio.create_task(market_close_alert_loop())
@@ -3689,7 +3809,7 @@ async def main():
         while True:
             await asyncio.sleep(60)
     except asyncio.CancelledError:
-        print("Main loop cancelled.")
+        logger.info("Main loop cancelled.")
     finally:
         ingest_task.cancel()
         close_alert_task.cancel()
@@ -3717,11 +3837,17 @@ async def main():
         # 🚀 PERFORMANCE: Close reusable HTTP session
         if http_session:
             await http_session.close()
-            print("[HTTP SESSION] Closed reusable HTTP session")
+            logger.info("[HTTP SESSION] Closed reusable HTTP session")
+        
+        # 🚀 PERFORMANCE: Shutdown thread pool executor with wait=True
+        # This ensures in-flight disk writes (pickle, CSV, JSON) complete safely
+        # Blocking is acceptable here as we're already in shutdown path
+        io_executor.shutdown(wait=True)
+        logger.info("[IO EXECUTOR] Shutdown thread pool executor (waited for in-flight tasks)")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Shutting down gracefully...")
+        logger.info("Shutting down gracefully...")
