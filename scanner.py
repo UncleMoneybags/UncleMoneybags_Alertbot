@@ -2747,11 +2747,15 @@ async def ingest_polygon_events():
                         break
 
                     msg = await ws.recv()
+                    
+                    # 🚨 FIX: Convert bytes to string if needed
+                    if isinstance(msg, bytes):
+                        msg = msg.decode('utf-8')
+                    
                     print("[RAW MSG]", msg)
 
                     # Skip malformed or heartbeat messages
-                    if not msg or len(msg.strip()) < 2 or not msg.strip(
-                    ).startswith('{') and not msg.strip().startswith('['):
+                    if not msg or len(msg.strip()) < 2 or not msg.strip().startswith('{') and not msg.strip().startswith('['):
                         print(f"[SKIP] Non-JSON message: '{msg}'")
                         continue
 
