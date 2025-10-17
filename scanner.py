@@ -1339,16 +1339,26 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     Args:
         float_shares: Float size for adaptive thresholds - catches micro-float spikes like ULY
     """
-    if len(candles_seq) < 4:  # REDUCED: Only need 4 candles to detect early spikes
+    # 🚨 FIX: Convert to list immediately to prevent slice errors
+    if isinstance(candles_seq, deque):
+        candles_list = list(candles_seq)
+    else:
+        # If not a deque, try to convert or return early
+        try:
+            candles_list = list(candles_seq)
+        except:
+            return False, {}
+    
+    if len(candles_list) < 4:  # REDUCED: Only need 4 candles to detect early spikes
         return False, {}
 
-    curr_candle = list(candles_seq)[-1]
-    prev_candle = list(candles_seq)[-2]
+    curr_candle = candles_list[-1]
+    prev_candle = candles_list[-2]
     curr_volume = curr_candle['volume']
     symbol = curr_candle.get('symbol', '?')
 
     # ADAPTIVE: Use 3 trailing candles for early detection (4 total needed)
-    trailing_volumes = [c['volume'] for c in list(candles_seq)[-4:-1]]
+    trailing_volumes = [c['volume'] for c in candles_list[-4:-1]]
     trailing_avg = sum(trailing_volumes) / 3 if len(
         trailing_volumes) == 3 else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
@@ -1549,8 +1559,9 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                               candles_seq, vwap_value):
     # Debug prints for ALL alert processing - MAIN LOOP
     print(f"[MAIN LOOP DEBUG] Processing symbol: {symbol}")
+    # 🚨 FIX: candles_seq is already a list here (passed from on_new_candle)
     if candles_seq and len(candles_seq) >= 6:
-        last_6 = list(candles_seq)[-6:]
+        last_6 = candles_seq[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5 if volumes_5 else 0
         last_candle = last_6[-1]
@@ -1819,11 +1830,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # Removed verbose debug logging for performance - only log critical events
 
     # --- PERFECT SETUP SCANNER ---
-    if len(candles_seq) >= 30:
-        closes = [c['close'] for c in list(candles_seq)[-30:]]
-        highs = [c['high'] for c in list(candles_seq)[-30:]]
-        lows = [c['low'] for c in list(candles_seq)[-30:]]
-        volumes = [c['volume'] for c in list(candles_seq)[-30:]]
+    # 🚨 FIX: Convert deque to list once to prevent slice errors
+    candles_list = list(candles_seq)
+    if len(candles_list) >= 30:
+        closes = [c['close'] for c in candles_list[-30:]]
+        highs = [c['high'] for c in candles_list[-30:]]
+        lows = [c['low'] for c in candles_list[-30:]]
+        volumes = [c['volume'] for c in candles_list[-30:]]
         # 🚨 CRITICAL FIX: Use centralized VWAP guard for perfect setup
         vwap_value = get_valid_vwap(symbol)
         if vwap_value is None:
@@ -1833,12 +1846,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             return  # Block perfect setup alerts without valid VWAP
         if not ema_stack_was_true[symbol]:
             await alert_perfect_setup(symbol, closes, volumes, highs, lows,
-                                      list(candles_seq)[-30:], vwap_value)
+                                      candles_list[-30:], vwap_value)
 
     # --- Warming Up Logic with STRICT MOMENTUM REQUIREMENTS ---
-    if len(candles_seq) >= 3:
-        available = min(6, len(candles_seq))
-        last_candles = list(candles_seq)[-available:]
+    if len(candles_list) >= 3:
+        available = min(6, len(candles_list))
+        last_candles = candles_list[-available:]
         volumes_prev = [c["volume"] for c in last_candles[:-1]]
         avg_vol_5 = sum(volumes_prev) / len(volumes_prev) if volumes_prev else 1
         last_candle = last_candles[-1]
@@ -1984,8 +1997,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_alert_time[symbol]['warming_up'] = now
 
     # --- Runner Logic with trend check, upper wick filter, real-time price in alert, and debug logging ---
-    if len(candles_seq) >= 6:
-        last_6 = list(candles_seq)[-6:]
+    if len(candles_list) >= 6:
+        last_6 = candles_list[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
         avg_vol_5 = sum(volumes_5) / 5
         last_candle = last_6[-1]
@@ -2124,8 +2137,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             dip_pct >= MIN_DIP_PCT and close <= 20.00
             and close > current_vwap  # ✅ NOW PROPERLY PROTECTED!
         )
-        if dip_play_criteria and len(candles_seq) >= 3:
-            c1, c2, c3 = list(candles_seq)[-3:]
+        if dip_play_criteria and len(candles_list) >= 3:
+            c1, c2, c3 = candles_list[-3:]
             higher_lows = c2["low"] > c1["low"] and c3["low"] > c2["low"]
             rising_volume = c2["volume"] > c1["volume"] and c3["volume"] > c2[
                 "volume"]
@@ -2205,7 +2218,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             return  # Block VWAP reclaim if insufficient data
         prev_vwap = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
         curr_vwap = vwap_candles_numpy(list(vwap_candles[symbol]))
-        trailing_vols = [c['volume'] for c in list(candles_seq)[:-1]]
+        trailing_vols = [c['volume'] for c in candles_list[:-1]]
         rvol = 0
         if trailing_vols:
             avg_trailing = sum(trailing_vols[-20:]) / min(
@@ -2493,8 +2506,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             
             if base_ema_criteria:
                 # Check for 2+ green candles in last 3 candles (realistic recent momentum check)
-                if len(list(candles_seq)) >= 3:
-                    recent_candles = list(candles_seq)[-3:]
+                if len(candles_list) >= 3:
+                    recent_candles = candles_list[-3:]
                     green_candles = sum(1 for c in recent_candles
                                         if c['close'] > c['open'])
                     momentum_confirmed = green_candles >= 2
