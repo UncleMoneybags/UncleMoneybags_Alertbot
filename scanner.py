@@ -40,13 +40,29 @@ entry_price = defaultdict(lambda: None)
 float_cache = {}
 float_cache_none_retry = {}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
+FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS = 300  # Only save every 5 minutes to reduce disk I/O
+_last_float_cache_save = datetime.min.replace(tzinfo=timezone.utc)
 
 
-def save_float_cache():
+def save_float_cache(force=False):
+    """Save float cache to disk with debouncing to reduce I/O overhead.
+    
+    Args:
+        force: If True, save immediately regardless of debounce timer
+    """
+    global _last_float_cache_save
+    now = datetime.now(timezone.utc)
+    
+    # Debounce: only save if enough time has passed or forced
+    if not force and (now - _last_float_cache_save).total_seconds() < FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS:
+        return
+    
     with open("float_cache.pkl", "wb") as f:
         pickle.dump(float_cache, f)
     with open("float_cache_none.pkl", "wb") as f:
         pickle.dump(float_cache_none_retry, f)
+    
+    _last_float_cache_save = now
     print(
         f"[DEBUG] Saved float cache, entries: {len(float_cache)}, none cache: {len(float_cache_none_retry)}"
     )
@@ -73,6 +89,11 @@ def load_float_cache():
 
 
 async def get_float_shares(ticker):
+    """Non-blocking float share lookup using thread executor for yfinance.
+    
+    Runs blocking yfinance call in thread pool to prevent event loop stalling.
+    Uses debounced cache saving to reduce disk I/O overhead.
+    """
     now = datetime.now(timezone.utc)
     # Check positive/real float first
     if ticker in float_cache and float_cache[ticker] is not None:
@@ -82,26 +103,43 @@ async def get_float_shares(ticker):
         last_none = float_cache_none_retry[ticker]
         if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
             return None
+    
+    # Run blocking yfinance call in thread executor to avoid blocking event loop
+    def _fetch_float():
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info
+            return info.get('floatShares', None)
+        except Exception as e:
+            return None, e
+    
     try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).info
-        float_shares = info.get('floatShares', None)
-        if float_shares is not None:
-            float_cache[ticker] = float_shares
-            save_float_cache()
-            if ticker in float_cache_none_retry:
-                del float_cache_none_retry[ticker]
-        else:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _fetch_float)
+        
+        # Handle result
+        if isinstance(result, tuple):  # Error case
+            float_shares, error = result
             float_cache_none_retry[ticker] = now
-            save_float_cache()
-        await asyncio.sleep(0.5)
-        return float_shares
+            save_float_cache()  # Debounced
+            if error and "Rate limited" in str(error):
+                await asyncio.sleep(5)  # Backoff for rate limits
+            return float_cache.get(ticker, None)
+        else:
+            float_shares = result
+            if float_shares is not None:
+                float_cache[ticker] = float_shares
+                save_float_cache()  # Debounced
+                if ticker in float_cache_none_retry:
+                    del float_cache_none_retry[ticker]
+            else:
+                float_cache_none_retry[ticker] = now
+                save_float_cache()  # Debounced
+            await asyncio.sleep(0.5)
+            return float_shares
     except Exception as e:
         float_cache_none_retry[ticker] = now
-        save_float_cache()
-        if "Rate limited" in str(e):
-            # Adaptive backoff for API rate limits - VPS optimization
-            await asyncio.sleep(5)  # Start with 5s for VPS
+        save_float_cache()  # Debounced
         return float_cache.get(ticker, None)
 
 
@@ -2934,16 +2972,15 @@ async def ingest_polygon_events():
                                     (high + low + close) / 3) * volume
                                 
                                 # 🚨 CRITICAL FIX: Update last_trade_price/time from candle as fallback
-                                # Use CURRENT time to pass freshness validation (not candle time which could be stale)
-                                now_utc = datetime.now(timezone.utc)
+                                # Use REAL candle close time for freshness validation (don't fake timestamps)
                                 current_trade_time = last_trade_time.get(symbol)
                                 candle_close_time = start_time + timedelta(minutes=1)
                                 
                                 # Update ONLY if: no trade data OR trade data is older than candle close
                                 if current_trade_time is None or current_trade_time < candle_close_time:
                                     last_trade_price[symbol] = close
-                                    last_trade_time[symbol] = now_utc  # Use NOW so freshness check passes!
-                                    logger.info(f"[PRICE FALLBACK] {symbol} - Using candle close ${close:.2f} with current timestamp (no fresh trades)")
+                                    last_trade_time[symbol] = candle_close_time  # Use REAL candle time, not now()
+                                    logger.info(f"[PRICE FALLBACK] {symbol} - Using candle close ${close:.2f} at {candle_close_time} (no fresh trades)")
                                 
                                 await on_new_candle(symbol, open_, high, low,
                                                     close, volume, start_time)
@@ -2955,8 +2992,8 @@ async def ingest_polygon_events():
                                 await send_best_alert(symbol)
                             elif event.get("ev") == "LULD":
                                 # Handle LULD (Limit Up/Limit Down) events - Polygon's official halt detection!
-                                symbol = event.get(
-                                    "T")  # LULD uses 'T' for ticker symbol
+                                # Robust symbol extraction - Polygon uses different keys across feeds
+                                symbol = event.get("sym") or event.get("T") or event.get("ticker") or event.get("symbol")
                                 high_limit = event.get("h")  # High price limit
                                 low_limit = event.get("l")  # Low price limit
                                 timestamp = event.get(
@@ -2964,6 +3001,9 @@ async def ingest_polygon_events():
                                 indicators = event.get("i",
                                                        [])  # Indicators array
 
+                                # 🔍 DEBUG: Log raw LULD event for diagnosis
+                                logger.info(f"[LULD RAW EVENT] keys={list(event.keys())} symbol={symbol} event={event}")
+                                
                                 if symbol and timestamp:
                                     # Format halt key for deduplication
                                     halt_time = datetime.fromtimestamp(
@@ -2986,11 +3026,15 @@ async def ingest_polygon_events():
                                         price_source = "last_trade"
                                         
                                         if not current_price:
-                                            logger.info(f"[LULD] {symbol} - No last_trade_price, trying yfinance...")
+                                            logger.info(f"[LULD] {symbol} - No last_trade_price, trying yfinance (non-blocking)...")
                                             try:
-                                                import yfinance as yf
-                                                ticker_info = yf.Ticker(symbol).info
-                                                current_price = ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
+                                                def _fetch_price():
+                                                    import yfinance as yf
+                                                    ticker_info = yf.Ticker(symbol).info
+                                                    return ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
+                                                
+                                                loop = asyncio.get_running_loop()
+                                                current_price = await loop.run_in_executor(None, _fetch_price)
                                                 price_source = "yfinance"
                                             except Exception as yf_error:
                                                 logger.warning(f"[LULD] {symbol} - yfinance failed: {yf_error}")
@@ -3032,6 +3076,10 @@ async def ingest_polygon_events():
                                             elif 2 in indicators:
                                                 halt_reason = "Limit Down Halt"
 
+                                            # Format price limits safely (fix f-string ternary bug)
+                                            high_limit_display = f"${high_limit:.2f}" if high_limit else "N/A"
+                                            low_limit_display = f"${low_limit:.2f}" if low_limit else "N/A"
+
                                             # Format LULD halt alert
                                             alert_msg = f"""🛑 <b>LULD HALT ALERT</b> (Polygon Official)
                                             
@@ -3040,8 +3088,8 @@ async def ingest_polygon_events():
 <b>Float:</b> {float_display} shares
 <b>Halt Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}
 <b>Reason:</b> {halt_reason}
-<b>High Limit:</b> ${high_limit:.2f if high_limit else 'N/A'}
-<b>Low Limit:</b> ${low_limit:.2f if low_limit else 'N/A'}
+<b>High Limit:</b> {high_limit_display}
+<b>Low Limit:</b> {low_limit_display}
 <b>Status:</b> VOLATILITY HALT ⚠️
 
 🚀 <i>Real-time via Polygon LULD feed</i>"""
@@ -3168,8 +3216,9 @@ async def nasdaq_halt_monitor():
                         from bs4 import BeautifulSoup
                         soup = BeautifulSoup(html, 'html.parser')
                         
-                        # Find halt table
+                        # 🔍 DEBUG: Log NASDAQ scrape status
                         table = soup.find('table', {'id': 'Trading_Halts'})
+                        logger.info(f"[NASDAQ SCRAPE] status={response.status} content_len={len(html)} table_found={bool(table)}")
                         if table:
                             rows = table.find_all('tr')[1:]  # Skip header
                             
@@ -3180,6 +3229,9 @@ async def nasdaq_halt_monitor():
                                     halt_time_str = cols[6].text.strip()       # Column 6: Halt Time (ET)
                                     resume_time_str = cols[8].text.strip()     # Column 8: Resume Time (ET)
                                     halt_reason_code = cols[3].text.strip()    # Column 3: Reason Code
+                                    
+                                    # 🔍 DEBUG: Log extracted halt data
+                                    logger.debug(f"[NASDAQ ROW] symbol={symbol} halt_time={halt_time_str} resume_time={resume_time_str} reason={halt_reason_code}")
                                     
                                     # Create unique keys
                                     halt_key = f"{symbol}_{halt_time_str}_{halt_reason_code}"
@@ -3254,11 +3306,15 @@ async def nasdaq_halt_monitor():
                                         price_source = "last_trade"
                                         
                                         if not current_price:
-                                            logger.info(f"[HALT PRICE] {symbol} - No last_trade_price, trying yfinance...")
+                                            logger.info(f"[HALT PRICE] {symbol} - No last_trade_price, trying yfinance (non-blocking)...")
                                             try:
-                                                import yfinance as yf
-                                                ticker_info = yf.Ticker(symbol).info
-                                                current_price = ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
+                                                def _fetch_price():
+                                                    import yfinance as yf
+                                                    ticker_info = yf.Ticker(symbol).info
+                                                    return ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
+                                                
+                                                loop = asyncio.get_running_loop()
+                                                current_price = await loop.run_in_executor(None, _fetch_price)
                                                 price_source = "yfinance"
                                                 if current_price:
                                                     logger.info(f"[HALT PRICE] {symbol} - Got ${current_price:.2f} from yfinance")
