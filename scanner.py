@@ -42,10 +42,14 @@ float_cache_none_retry = {}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
 FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS = 300  # Only save every 5 minutes to reduce disk I/O
 _last_float_cache_save = datetime.min.replace(tzinfo=timezone.utc)
+_float_cache_lock = asyncio.Lock()  # 🔒 Prevent concurrent write corruption
 
 
-def save_float_cache(force=False):
+async def save_float_cache(force=False):
     """Save float cache to disk with debouncing to reduce I/O overhead.
+    
+    🔒 THREAD-SAFE: Uses asyncio.Lock to prevent concurrent writes that could corrupt files.
+    Uses atomic writes (temp file + rename) to prevent partial writes on crash.
     
     Args:
         force: If True, save immediately regardless of debounce timer
@@ -57,15 +61,25 @@ def save_float_cache(force=False):
     if not force and (now - _last_float_cache_save).total_seconds() < FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS:
         return
     
-    with open("float_cache.pkl", "wb") as f:
-        pickle.dump(float_cache, f)
-    with open("float_cache_none.pkl", "wb") as f:
-        pickle.dump(float_cache_none_retry, f)
-    
-    _last_float_cache_save = now
-    print(
-        f"[DEBUG] Saved float cache, entries: {len(float_cache)}, none cache: {len(float_cache_none_retry)}"
-    )
+    # 🔒 Acquire lock to prevent concurrent writes
+    async with _float_cache_lock:
+        # Atomic write: write to temp file then rename (prevents corruption on crash)
+        tmp1 = "float_cache.pkl.tmp"
+        tmp2 = "float_cache_none.pkl.tmp"
+        
+        with open(tmp1, "wb") as f:
+            pickle.dump(float_cache, f)
+        with open(tmp2, "wb") as f:
+            pickle.dump(float_cache_none_retry, f)
+        
+        # Atomic rename (replaces old file atomically)
+        os.replace(tmp1, "float_cache.pkl")
+        os.replace(tmp2, "float_cache_none.pkl")
+        
+        _last_float_cache_save = now
+        logger.debug(
+            f"Saved float cache, entries: {len(float_cache)}, none cache: {len(float_cache_none_retry)}"
+        )
 
 
 def load_float_cache():
@@ -121,7 +135,7 @@ async def get_float_shares(ticker):
         if isinstance(result, tuple):  # Error case
             float_shares, error = result
             float_cache_none_retry[ticker] = now
-            save_float_cache()  # Debounced
+            await save_float_cache()  # Debounced, thread-safe
             if error and "Rate limited" in str(error):
                 await asyncio.sleep(5)  # Backoff for rate limits
             return float_cache.get(ticker, None)
@@ -129,17 +143,17 @@ async def get_float_shares(ticker):
             float_shares = result
             if float_shares is not None:
                 float_cache[ticker] = float_shares
-                save_float_cache()  # Debounced
+                await save_float_cache()  # Debounced, thread-safe
                 if ticker in float_cache_none_retry:
                     del float_cache_none_retry[ticker]
             else:
                 float_cache_none_retry[ticker] = now
-                save_float_cache()  # Debounced
+                await save_float_cache()  # Debounced, thread-safe
             # Removed unnecessary 0.5s sleep - slows down float lookups
             return float_shares
     except Exception as e:
         float_cache_none_retry[ticker] = now
-        save_float_cache()  # Debounced
+        await save_float_cache()  # Debounced, thread-safe
         return float_cache.get(ticker, None)
 
 
@@ -3274,33 +3288,35 @@ async def verify_halt_on_nasdaq(symbol, halt_time_str):
     
     Prevents false positives by verifying halt 10 seconds after initial detection.
     Returns True if halt is confirmed on NASDAQ, False otherwise.
+    
+    🚀 PERFORMANCE: Reuses global http_session instead of creating new session.
     """
-    import aiohttp
     from bs4 import BeautifulSoup
     
     try:
         logger.info(f"[HALT VERIFY] Waiting 10s to verify {symbol} halt at {halt_time_str}...")
         await asyncio.sleep(10)  # Wait 10 seconds
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://www.nasdaqtrader.com/trader.aspx?id=tradehalts", timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
-                    table = soup.find('table', {'id': 'Trading_Halts'})
-                    
-                    if table:
-                        rows = table.find_all('tr')[1:]  # Skip header
-                        for row in rows:
-                            cols = row.find_all('td')
-                            if len(cols) >= 9:
-                                nasdaq_symbol = cols[0].text.strip()
-                                nasdaq_halt_time = cols[6].text.strip()
-                                
-                                # Match symbol and halt time
-                                if nasdaq_symbol == symbol and nasdaq_halt_time == halt_time_str:
-                                    logger.info(f"[HALT VERIFY] ✅ {symbol} halt CONFIRMED on NASDAQ")
-                                    return True
+        # 🚀 Reuse global http_session for better performance
+        async with http_session.get("https://www.nasdaqtrader.com/trader.aspx?id=tradehalts", 
+                                     timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status == 200:
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                table = soup.find('table', {'id': 'Trading_Halts'})
+                
+                if table:
+                    rows = table.find_all('tr')[1:]  # Skip header
+                    for row in rows:
+                        cols = row.find_all('td')
+                        if len(cols) >= 9:
+                            nasdaq_symbol = cols[0].text.strip()
+                            nasdaq_halt_time = cols[6].text.strip()
+                            
+                            # Match symbol and halt time
+                            if nasdaq_symbol == symbol and nasdaq_halt_time == halt_time_str:
+                                logger.info(f"[HALT VERIFY] ✅ {symbol} halt CONFIRMED on NASDAQ")
+                                return True
         
         logger.warning(f"[HALT VERIFY] ❌ {symbol} halt NOT found on NASDAQ - likely false positive")
         return False
@@ -3465,8 +3481,11 @@ async def nasdaq_halt_monitor():
                                     if symbol not in ever_halted_symbols:
                                         ever_halted_symbols.add(symbol)
                                         try:
-                                            with open("halted_symbols.pkl", "wb") as f:
+                                            # 🔒 Atomic write: temp file + rename prevents corruption
+                                            tmp_file = "halted_symbols.pkl.tmp"
+                                            with open(tmp_file, "wb") as f:
                                                 pickle.dump(ever_halted_symbols, f)
+                                            os.replace(tmp_file, "halted_symbols.pkl")
                                             logger.info(f"[HALT TRACKER] Added {symbol} to persistent halt tracker ({len(ever_halted_symbols)} total)")
                                         except Exception as e:
                                             logger.error(f"[HALT TRACKER] Failed to save halted symbols: {e}")
@@ -3629,6 +3648,31 @@ async def ml_training_loop():
 
 async def main():
     global http_session
+    
+    # ✅ STARTUP: Check critical dependencies
+    print("[STARTUP] Checking dependencies...")
+    missing_deps = []
+    
+    try:
+        import bs4
+        print("  ✅ BeautifulSoup4 (bs4) available")
+    except ImportError:
+        missing_deps.append("beautifulsoup4")
+        print("  ❌ BeautifulSoup4 (bs4) NOT installed")
+    
+    try:
+        import yfinance
+        print("  ✅ yfinance available")
+    except ImportError:
+        missing_deps.append("yfinance")
+        print("  ❌ yfinance NOT installed")
+    
+    if missing_deps:
+        error_msg = f"\n❌ CRITICAL ERROR: Missing required dependencies!\n\nPlease install: {', '.join(missing_deps)}\n\nRun: pip install {' '.join(missing_deps)}\n"
+        print(error_msg)
+        raise ImportError(f"Missing dependencies: {', '.join(missing_deps)}")
+    
+    print("[STARTUP] ✅ All dependencies available\n")
     
     # 🚀 PERFORMANCE: Initialize reusable HTTP session
     http_session = aiohttp.ClientSession()
