@@ -2867,41 +2867,14 @@ async def ingest_polygon_events():
                         "action": "auth",
                         "params": POLYGON_API_KEY
                     }))
-                
-                # 🚨 FIX: Polygon API tier doesn't support wildcards (AM.*, T.*)
-                # Subscribe to specific high-volume penny stocks instead
-                # This works with ANY Polygon tier (Developer, Advanced, etc.)
-                VOLATILE_TICKERS = [
-                    # Common penny stock movers (updated list of volatile <$15 stocks)
-                    "SOXL", "SOXS", "TQQQ", "SQQQ", "UVXY", "SPXS", "SPXU", "TNA", "TZA",
-                    "LABU", "LABD", "NUGT", "DUST", "JNUG", "JDST", "TECL", "TECS",
-                    "FAS", "FAZ", "ERX", "ERY", "DFEN", "GDXJ", "GDX", "SILJ", "SIL",
-                    # Recent runners and volatile penny stocks
-                    "AMC", "APE", "GME", "MULN", "BBBY", "EXPR", "KOSS", "BB", "NOK",
-                    "SNDL", "NAKD", "ZSAN", "ATOS", "GNUS", "JAGX", "OCGN", "SOS",
-                    "PHUN", "DWAC", "MMAT", "TRCH", "WKEY", "XELA", "GREE", "BKSY",
-                    # Active biotech/pharma pennies
-                    "PROG", "ATER", "BBIG", "CEI", "RDBX", "IMPP", "NILE", "MULN",
-                    # Crypto-related pennies
-                    "MARA", "RIOT", "BTBT", "CAN", "EBON", "SOS", "ANY", "BTCM",
-                    # High-volume ETFs and pennies
-                    "SPY", "QQQ", "IWM", "DIA", "TSLA", "NVDA", "AMD", "AAPL", "MSFT"
-                ]
-                
-                # Build subscription string for candles and trades
-                am_subs = ",".join([f"AM.{t}" for t in VOLATILE_TICKERS])
-                t_subs = ",".join([f"T.{t}" for t in VOLATILE_TICKERS])
-                
-                # Subscribe to candles, trades, and ALL halts (LULD.* still works)
-                subscription = f"{am_subs},{t_subs},LULD.*"
-                
+                # Subscribe to ALL active stocks - full market scanning for dynamic discovery + halt monitoring
                 await ws.send(
                     json.dumps({
                         "action": "subscribe",
-                        "params": subscription
+                        "params": "AM.*,T.*,LULD.*"
                     }))
                 logger.info(
-                    f"Subscribed to {len(VOLATILE_TICKERS)} volatile tickers (AM+T) + LULD.* halts"
+                    "Subscribed to: AM.* (minute bars), T.* (trades), LULD.* (halt/volatility alerts) - FULL monitoring"
                 )
 
                 while True:
