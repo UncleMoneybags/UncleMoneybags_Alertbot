@@ -2872,7 +2872,7 @@ async def ingest_polygon_events():
                                         session_date = get_session_date(local_candle['start_time'])
                                         last_session = vwap_session_date[symbol]
                                         if last_session != session_date:
-                                            vwap_candles[symbol] = []
+                                            vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
                                             vwap_session_date[symbol] = session_date
                                             vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                         
@@ -2882,7 +2882,7 @@ async def ingest_polygon_events():
                                         market_open_time = dt_time(9, 30)
                                         if candle_time >= market_open_time:
                                             if not vwap_reset_done[symbol]:
-                                                vwap_candles[symbol] = []
+                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
                                                 vwap_cum_vol[symbol] = 0
                                                 vwap_cum_pv[symbol] = 0
                                                 vwap_reset_done[symbol] = True
@@ -2957,7 +2957,7 @@ async def ingest_polygon_events():
                                     candle['start_time'])
                                 last_session = vwap_session_date[symbol]
                                 if last_session != session_date:
-                                    vwap_candles[symbol] = []
+                                    vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
                                     vwap_session_date[symbol] = session_date
                                     vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                 
@@ -2971,7 +2971,7 @@ async def ingest_polygon_events():
                                     # Reset if crossing from pre-market into regular session
                                     if last_candle_time < market_open_time <= candle_time:
                                         logger.info(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing pre-market data")
-                                        vwap_candles[symbol] = []
+                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
                                         vwap_cum_vol[symbol] = 0
                                         vwap_cum_pv[symbol] = 0
                                 
@@ -2986,7 +2986,7 @@ async def ingest_polygon_events():
                                             f"price jumped from ${last_close:.2f} to ${current_close:.2f} "
                                             f"({price_change_pct*100:.1f}% change). Resetting VWAP."
                                         )
-                                        vwap_candles[symbol] = []
+                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
                                 
                                 vwap_candles[symbol].append(candle)
                                 vwap_cum_vol[symbol] += volume
@@ -3502,10 +3502,23 @@ async def main():
         premarket_alert_task.cancel()
         nasdaq_halt_task.cancel()
 
-        await ingest_task
-        await close_alert_task
-        await premarket_alert_task
-        await nasdaq_halt_task
+        # 🚨 FIX: Await cancelled tasks with error handling
+        try:
+            await ingest_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await close_alert_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await premarket_alert_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await nasdaq_halt_task
+        except asyncio.CancelledError:
+            pass
         
         # 🚀 PERFORMANCE: Close reusable HTTP session
         if http_session:
