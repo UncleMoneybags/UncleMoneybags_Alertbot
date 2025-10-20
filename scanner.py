@@ -82,8 +82,14 @@ float_cache_none_retry = {}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
 FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS = 300  # Only save every 5 minutes to reduce disk I/O
 _last_float_cache_save = datetime.min.replace(tzinfo=timezone.utc)
-_float_cache_lock = asyncio.Lock()  # 🔒 Prevent concurrent write corruption
+# Lazy-create lock to avoid binding to event loop at import time
+_float_cache_lock = None  # will be created via _ensure_float_cache_lock()
 
+async def _ensure_float_cache_lock():
+    global _float_cache_lock
+    if _float_cache_lock is None:
+        _float_cache_lock = asyncio.Lock()
+    return _float_cache_lock
 
 async def save_float_cache(force=False):
     """Save float cache to disk with debouncing to reduce I/O overhead.
@@ -102,7 +108,8 @@ async def save_float_cache(force=False):
         return
     
     # 🔒 Acquire lock to prevent concurrent writes
-    async with _float_cache_lock:
+    lock = await _ensure_float_cache_lock()
+    async with lock:
         # Atomic write: write to temp file then rename (prevents corruption on crash)
         tmp1 = "float_cache.pkl.tmp"
         tmp2 = "float_cache_none.pkl.tmp"
@@ -119,8 +126,11 @@ async def save_float_cache(force=False):
         await loop.run_in_executor(io_executor, write_pickle_files)
         
         # Atomic rename (replaces old file atomically)
-        os.replace(tmp1, "float_cache.pkl")
-        os.replace(tmp2, "float_cache_none.pkl")
+        try:
+            os.replace(tmp1, "float_cache.pkl")
+            os.replace(tmp2, "float_cache_none.pkl")
+        except Exception as e:
+            logger.warning(f"[SAVE FLOAT CACHE] Atomic replace failed: {e}")
         
         _last_float_cache_save = now
         logger.debug(
@@ -251,10 +261,14 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             # ALLOW symbol through when float data unavailable
         elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
             filter_counts["float_out_of_range"] += 1
-            if symbol in ["OCTO", "GRND", "EQS"
-                          ] or filter_counts["float_out_of_range"] % 50 == 1:
+            # Use safe logging to avoid formatting None
+            try:
                 logger.info(
-                    f"[FILTER DEBUG] {symbol} filtered: float_shares {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M (count: {filter_counts['float_out_of_range']})"
+                    f"[FILTER DEBUG] {symbol} filtered: float_shares {(float_shares/1e6):.1f}M not in range {(MIN_FLOAT_SHARES/1e6):.1f}M-{(MAX_FLOAT_SHARES/1e6):.1f}M (count: {filter_counts['float_out_of_range']})"
+                )
+            except Exception:
+                logger.info(
+                    f"[FILTER DEBUG] {symbol} filtered: float_shares={float_shares} (count: {filter_counts['float_out_of_range']})"
                 )
             return False
     else:
@@ -668,12 +682,12 @@ def vwap_candles_numpy(candles):
             logger.warning("[VWAP ERROR] No non-zero volume candles available")
             return 0.0
 
-        logger.info(f"[VWAP DEBUG] Prices used: {prices}")
-        logger.info(f"[VWAP DEBUG] Volumes used: {volumes}")
+        logger.debug(f"[VWAP DEBUG] Prices used: {prices}")
+        logger.debug(f"[VWAP DEBUG] Volumes used: {volumes}")
 
         # Use enhanced VWAP calculation
         vwap_val = vwap_numpy(prices, volumes)
-        logger.info(f"[VWAP DEBUG] VWAP result: {vwap_val}")
+        logger.debug(f"[VWAP DEBUG] VWAP result: {vwap_val}")
         return vwap_val
 
     except Exception as e:
@@ -727,6 +741,8 @@ def get_valid_vwap(symbol):
     # 🚨 FIX: Convert deque to list before slicing to prevent "sequence index must be integer, not 'slice'" error
     candles_list = list(candles) if isinstance(candles, deque) else candles
     recent_prices = [candle['close'] for candle in candles_list[-3:]]
+    if len(recent_prices) == 0:
+        return None
     min_recent = min(recent_prices)
     max_recent = max(recent_prices)
     if not (min_recent * 0.5 <= vwap_val <= max_recent *
@@ -742,24 +758,52 @@ def get_valid_vwap(symbol):
 
 
 def rsi(prices, period=14):
+    """
+    Robust RSI:
+      - returns a numpy array of same length as prices
+      - handles all-gains and all-losses correctly
+      - uses Wilder smoothing for rolling values
+    """
     prices = np.asarray(prices, dtype=float)
-    if len(prices) < period + 1:
-        return np.full_like(prices, np.nan)
+    n = len(prices)
+    if n < period + 1:
+        return np.full(n, np.nan)
+
     deltas = np.diff(prices)
     seed = deltas[:period]
     up = seed[seed > 0].sum() / period
     down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else 0
-    rsi_arr = np.zeros_like(prices)
-    rsi_arr[:period] = 100. - 100. / (1. + rs)
-    for i in range(period, len(prices)):
+
+    # Determine the very first RSI value
+    if down == 0 and up == 0:
+        rsi_first = 50.0
+    elif down == 0:
+        rsi_first = 100.0
+    elif up == 0:
+        rsi_first = 0.0
+    else:
+        rs0 = up / down
+        rsi_first = 100. - 100. / (1. + rs0)
+
+    rsi_arr = np.empty(n, dtype=float)
+    rsi_arr[:period] = np.nan
+    rsi_arr[period] = rsi_first
+
+    avg_gain = up
+    avg_loss = down
+
+    for i in range(period + 1, n):
         delta = deltas[i - 1]
-        upval = delta if delta > 0 else 0
-        downval = -delta if delta < 0 else 0
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down if down != 0 else 0
-        rsi_arr[i] = 100. - 100. / (1. + rs)
+        gain = max(delta, 0.0)
+        loss = -min(delta, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        if avg_loss == 0:
+            rsi_arr[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_arr[i] = 100. - 100. / (1. + rs)
+
     return rsi_arr
 
 
@@ -780,8 +824,53 @@ def bollinger_bands(prices, period=20, num_std=2):
     return lower_band, sma, upper_band
 
 
+def _polygon_ts_to_datetime(ts):
+    """
+    Convert a Polygon timestamp (which may be in seconds, ms, us, or ns) to a timezone-aware UTC datetime.
+    Heuristics:
+      - if ts > 1e18 -> treat as nanoseconds
+      - if ts > 1e15 -> treat as microseconds
+      - if ts > 1e12 -> treat as milliseconds
+      - else treat as seconds
+    Returns datetime with tz=timezone.utc or None on failure.
+    """
+    if ts is None:
+        return None
+    try:
+        ts_int = int(ts)
+    except Exception:
+        try:
+            ts_int = int(float(ts))
+        except Exception:
+            return None
+
+    if ts_int > 10**18:
+        scale = 1_000_000_000  # ns -> seconds
+    elif ts_int > 10**15:
+        scale = 1_000_000  # μs -> seconds
+    elif ts_int > 10**12:
+        scale = 1_000  # ms -> seconds
+    else:
+        scale = 1  # already seconds
+
+    try:
+        return datetime.fromtimestamp(ts_int / scale, tz=timezone.utc)
+    except Exception:
+        # Conservative fallback: try ms
+        try:
+            return datetime.fromtimestamp(ts_int / 1000.0, tz=timezone.utc)
+        except Exception:
+            return None
+
+
 def polygon_time_to_utc(ts):
-    return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
+    dt = _polygon_ts_to_datetime(ts)
+    if dt is not None:
+        return dt
+    try:
+        return datetime.utcfromtimestamp(ts / 1000.0).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 logging.basicConfig(level=logging.INFO,
@@ -1720,19 +1809,17 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
     bullish_engulf = is_bullish_engulfing(candles_seq)
 
     logger.info(
-        f"[ALERT DEBUG] {symbol} | Perfect Setup Check | EMA5={ema5}, EMA8={ema8}, EMA13={ema13}, VWAP={vwap_value}, Last Close={last_close}, Last Volume={last_volume}, RVOL={rvol}, RSI={last_rsi}, MACD Hist={last_macd_hist}, Bullish Engulf={bullish_engulf}"
+        f"[ALERT DEBUG] {symbol} | Perfect Setup Check | EMA5={ema5}, EMA8={ema8}, EMA13={ema13}, VWAP={vwap_value}, Last Close={last_close}, Last Volume={last_volume}, RVOL={rvol}, RSI={last_rsi}"
     )
-    logger.info(
+    logger.debug(
         f"[DEBUG] {symbol} | Session candles: {len(candles_seq)} | Candle times: {candles_seq[0]['start_time'] if candles_seq else 'n/a'} - {candles_seq[-1]['start_time'] if candles_seq else 'n/a'}"
     )
-    logger.info(f"[DEBUG] {symbol} | All candle closes: {closes}")
-    logger.info(f"[DEBUG] {symbol} | All candle volumes: {volumes}")
 
     # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
     current_price_perfect = last_trade_price.get(symbol)
     perfect = ((ema5 > ema8 > ema13) and (ema5 >= 1.011 * ema13) and
                (current_price_perfect is not None
-                and current_price_perfect > vwap_value)  # 🚨 REAL-TIME PRICE!
+                and vwap_value is not None and current_price_perfect > vwap_value)  # 🚨 REAL-TIME PRICE!
                and (last_volume >= 100000) and (rvol > 2.0) and (last_rsi < 70)
                and (last_macd_hist > 0) and bullish_engulf)
 
@@ -1756,7 +1843,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
             f"<b>{escape_html(symbol)}</b> | ${fmt_price(alert_price)} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
             f"Trend: EMA5 > EMA8 > EMA13\n"
-            f"{'Above VWAP' if last_close > vwap_value else 'Below VWAP'}"
+            f"{'Above VWAP' if (vwap_value is not None and last_close > vwap_value) else 'Below VWAP'}"
             f" | MACD↑"
             f" | RSI: {int(round(last_rsi))}")
         # Calculate alert score and add to pending alerts
@@ -2018,7 +2105,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and  # Green candle OR rising from previous
             0.20 <= close_wu <= 25.00
             and
-            current_price_wu is not None and current_price_wu > vwap_wu
+            current_price_wu is not None and vwap_wu is not None and current_price_wu > vwap_wu
             and  # Above VWAP
             dollar_volume_wu >= 50_000
             and  # Lower dollar volume for early detection
@@ -2034,7 +2121,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             f"DollarVol=${dollar_volume_wu:.0f}")
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
-        logger.info(
+        logger.debug(
             f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
         # 🚨 EXTRA SAFETY CHECK - Log when criteria would fire
@@ -2157,12 +2244,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[RUNNER DEBUG] {symbol} | Closes: {closes_for_trend} | Rising closes: {rising_closes}/2 | Price trend: {price_rising_trend} | Volume trend: {volume_rising_trend}"
         )
-        logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Real-time Price={current_price_rn} | Candle Close={close_rn} | Above VWAP={current_price_rn is not None and current_price_rn > vwap_rn} | Volume={volume_rn}"
+        logger.debug(
+            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn if vwap_rn is not None else 'N/A'} | Real-time Price={current_price_rn if current_price_rn is not None else 'N/A'} | Candle Close={close_rn} | Above VWAP={(current_price_rn is not None and vwap_rn is not None and current_price_rn > vwap_rn)}"
         )
         # Use stored EMAs for Runner Detection
         emas = get_stored_emas(symbol, [5, 8, 13])
-        logger.info(
+        logger.debug(
             f"[STORED EMA] {symbol} | Runner | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
 
@@ -2175,7 +2262,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and  # CONFIRMED: 5% move - established momentum!
             current_price_rn is not None and current_price_rn >= 0.10
             and  # Use real-time price
-            current_price_rn is not None and current_price_rn > vwap_rn
+            current_price_rn is not None and vwap_rn is not None and current_price_rn > vwap_rn
             and  # Above VWAP
             price_rising_trend
             and  # At least 2 out of 3 candles rising
@@ -2270,12 +2357,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             logger.info(
                 f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}"
             )
-            logger.info(
-                f"[ALERT DEBUG] {symbol} | Alert Type: dip_play | VWAP={vwap_candles_numpy(vwap_candles[symbol]):.4f} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
+            logger.debug(
+                f"[ALERT DEBUG] {symbol} | Alert Type: dip_play | VWAP={vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 'N/A'} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
             )
             # Use stored EMAs for Dip Play
             emas = get_stored_emas(symbol, [5, 8, 13])
-            logger.info(
+            logger.debug(
                 f"[STORED EMA] {symbol} | Dip Play | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
             )
             if dip_play_criteria and not dip_play_was_true[symbol]:
@@ -2377,14 +2464,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # DEBUG: Show VWAP reclaim detection logic
         if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
             logger.info(
-                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < prev_vwap={prev_vwap:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > curr_vwap={curr_vwap:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
+                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < prev_vwap={prev_vwap:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > curr_vwap={curr_vwap:.2f} = {curr_above_vwap}"
             )
-        logger.info(
-            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={prev_vwap:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
+        logger.debug(
+            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={prev_vwap if prev_vwap is not None else 'N/A'} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap if curr_vwap is not None else 'N/A'} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
-        logger.info(
+        logger.debug(
             f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
         if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
@@ -2429,12 +2516,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
         return  # Block all alerts if no VWAP data
     vwap_value = vwap_candles_numpy(vwap_candles[symbol])
-    logger.info(
-        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value:.4f} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
+    logger.debug(
+        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value if vwap_value is not None else 'N/A'} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
     )
     # Use stored EMAs for Volume Spike
     emas = get_stored_emas(symbol, [5, 8, 13])
-    logger.info(
+    logger.debug(
         f"[STORED EMA] {symbol} | Volume Spike | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
     )
     spike_detected, spike_data = check_volume_spike(candles_seq, vwap_value, float_shares)
@@ -2443,7 +2530,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX",
                   "EBMT"]:  # Debug key symbols
         logger.info(
-            f"[🔥 VOLUME SPIKE DEBUG] {symbol} | spike_detected={spike_detected} | volume_spike_was_true={volume_spike_was_true[symbol]} | last_trade_volume={last_trade_volume[symbol]} | cooldown_ok={(now - last_alert_time[symbol]['volume_spike']).total_seconds() > ALERT_COOLDOWN_MINUTES * 60}"
+            f"[🔥 VOLUME SPIKE DEBUG] {symbol} | spike_detected={spike_detected} | volume_spike_was_true={volume_spike_was_true[symbol]} | last_trade_volume={last_trade_volume[symbol]}"
         )
         if spike_detected:
             logger.info(
@@ -2546,12 +2633,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # Get stored EMAs (much faster and more accurate)
             if use_200_ema:
                 ema_periods = [5, 8, 13, 200]
-                logger.info(
+                logger.debug(
                     f"[EMA STACK] {symbol}: Using stored 5,8,13,200 EMAs (after 11am, {len(closes)} candles)"
                 )
             else:
                 ema_periods = [5, 8, 13]
-                logger.info(
+                logger.debug(
                     f"[EMA STACK] {symbol}: Using stored 5,8,13 EMAs only (before 11am, {len(closes)} candles)"
                 )
 
@@ -2656,7 +2743,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 vwap_margin = ((current_price_ema - vwap_value) / vwap_value * 100) if vwap_value else 0
                 ema13_margin = (current_price_ema - ema13) / ema13 * 100
                 logger.info(
-                    f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, real_time={current_price_ema:.2f}, candle_close={candle_close:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}, vwap_margin={vwap_margin:.1f}%, ema13_margin={ema13_margin:.1f}%"
+                    f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, real_time={current_price_ema:.2f}"
                 )
                 if ema5 / ema13 < 1.011:
                     logger.error(
@@ -2947,8 +3034,11 @@ async def ingest_polygon_events():
                                     logger.info(f"[GRANDFATHERING] {symbol} now eligible - locked entry price: ${price:.2f}")
 
                                 # 🚨 FIX: Use Polygon's timestamp to reject stale trades
-                                # Polygon timestamps are in nanoseconds, divide by 1,000,000 to get seconds
-                                trade_time = datetime.fromtimestamp(trade_timestamp / 1_000_000, tz=timezone.utc)
+                                # Use robust converter that detects ms/us/ns
+                                trade_time = _polygon_ts_to_datetime(trade_timestamp)
+                                if trade_time is None:
+                                    logger.debug(f"[TRADE SKIP] {symbol} - Unparseable trade timestamp: {trade_timestamp}")
+                                    continue
                                 now_utc = datetime.now(timezone.utc)
                                 trade_age_seconds = (now_utc - trade_time).total_seconds()
                                 
@@ -2988,7 +3078,6 @@ async def ingest_polygon_events():
                                     builder['volume'] += size
                                     builder['trade_count'] += 1
                                 else:
-                                    # New minute - create candle from previous minute and start new builder
                                     prev_builder = local_candle_builder[symbol]
                                     prev_minute = prev_builder['minute']
                                     
@@ -3004,7 +3093,7 @@ async def ingest_polygon_events():
                                         }
                                         
                                         logger.debug(
-                                            f"[LOCAL CANDLE] {symbol} {prev_minute} o:{local_candle['open']} h:{local_candle['high']} l:{local_candle['low']} c:{local_candle['close']} v:{local_candle['volume']} (trades:{prev_builder['trade_count']})"
+                                            f"[LOCAL CANDLE] {symbol} {prev_minute} o:{local_candle['open']} h:{local_candle['high']} l:{local_candle['low']} c:{local_candle['close']} v:{local_candle['volume']}"
                                         )
                                         
                                         # Process the local candle through normal logic
@@ -3175,9 +3264,11 @@ async def ingest_polygon_events():
                                 if symbol and timestamp:
                                     # Format halt key for deduplication
                                     # 🚨 CRITICAL FIX: Polygon LULD timestamps are in NANOSECONDS, divide by 1,000,000,000 to get seconds
+                                    halt_time = _polygon_ts_to_datetime(timestamp)
+                                    if halt_time is None:
+                                        logger.debug(f"[LULD SKIP] {symbol} - Unparseable LULD timestamp: {timestamp}")
+                                        continue
                                     eastern = pytz.timezone("America/New_York")
-                                    halt_time = datetime.fromtimestamp(
-                                        timestamp / 1_000_000_000, tz=timezone.utc)
                                     halt_time_et = halt_time.astimezone(eastern)
                                     halt_key = f"{symbol}_{halt_time_et.strftime('%H:%M:%S')}_LULD"
 
@@ -3315,7 +3406,7 @@ async def ingest_polygon_events():
                                         logger.error(f"[🚨 LULD ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
                                         # 🚨 EMERGENCY: Try to send alert even on error
                                         try:
-                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error getting details - check logs"
+                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error getting details, sending emergency alert."
                                             await send_all_alerts(emergency_msg)
                                             halt_last_alert_time[symbol] = datetime.now(timezone.utc)
                                             logger.warning(f"[LULD] Sent emergency halt alert for {symbol}")
@@ -3344,11 +3435,6 @@ async def ingest_polygon_events():
                 )
 
                 # Connection alerts DISABLED - user only wants trade alerts, not infrastructure spam
-                # alert_msg = f"🚨 <b>SCANNER CONNECTION ISSUE</b>\n\nPolygon connection limit exceeded. Backing off for {connection_backoff_delay}s.\nAttempt: {connection_attempts}"
-                # try:
-                #     await send_all_alerts(alert_msg)
-                # except:
-                #     pass  # Don't fail on alert send
                 logger.info("[CONNECTION] Silently backing off, no user alert sent")
 
                 await asyncio.sleep(connection_backoff_delay)
@@ -3388,8 +3474,8 @@ async def verify_halt_on_nasdaq(symbol, halt_time_str):
         async with http_session.get("https://www.nasdaqtrader.com/trader.aspx?id=tradehalts", 
                                      timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
+                html_text = await response.text()
+                soup = BeautifulSoup(html_text, 'html.parser')
                 table = soup.find('table', {'id': 'Trading_Halts'})
                 
                 if table:
@@ -3452,15 +3538,15 @@ async def nasdaq_halt_monitor():
             timeout = aiohttp.ClientTimeout(total=10)
             async with http_session.get(url, timeout=timeout) as response:
                 if response.status == 200:
-                        html = await response.text()
+                        html_text = await response.text()
                         
                         # Parse halt data (NASDAQ uses table format)
                         from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(html, 'html.parser')
+                        soup = BeautifulSoup(html_text, 'html.parser')
                         
                         # 🔍 DEBUG: Log NASDAQ scrape status
                         table = soup.find('table', {'id': 'Trading_Halts'})
-                        logger.info(f"[NASDAQ SCRAPE] status={response.status} content_len={len(html)} table_found={bool(table)}")
+                        logger.info(f"[NASDAQ SCRAPE] status={response.status} content_len={len(html_text)} table_found={bool(table)}")
                         if table:
                             rows = table.find_all('tr')[1:]  # Skip header
                             
@@ -3706,7 +3792,7 @@ async def nasdaq_halt_monitor():
                                         logger.error(f"[🚨 NASDAQ ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
                                         # 🚨 EMERGENCY: Try to send alert even on error
                                         try:
-                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_str} ET\n<b>Source:</b> NASDAQ\n\n⚠️ Error getting details - check logs"
+                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_str} ET\n<b>Source:</b> NASDAQ\n\n⚠️ Error getting details, sending emergency alert."
                                             await send_all_alerts(emergency_msg)
                                             logger.warning(f"[NASDAQ] Sent emergency halt alert for {symbol}")
                                         except:
@@ -3778,6 +3864,7 @@ async def main():
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     # Enable NASDAQ halt monitoring (catches T1, T2, T5, T12 halts that Polygon LULD misses)
     nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
+    ml_task = asyncio.create_task(ml_training_loop())
     try:
         while True:
             await asyncio.sleep(60)
@@ -3788,6 +3875,7 @@ async def main():
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         nasdaq_halt_task.cancel()
+        ml_task.cancel()
 
         # 🚨 FIX: Await cancelled tasks with error handling
         try:
@@ -3804,6 +3892,10 @@ async def main():
             pass
         try:
             await nasdaq_halt_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await ml_task
         except asyncio.CancelledError:
             pass
         
