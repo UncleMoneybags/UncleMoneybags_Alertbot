@@ -1498,7 +1498,7 @@ def get_ny_date():
 
 # 🚀 FRESHNESS THRESHOLDS: Consolidated timestamp validation constants
 MAX_PRICE_AGE_SECONDS = 30  # RELAXED: Catch big movers even with data delays (was 5s, too strict)
-MAX_TRADE_AGE_SECONDS = 8   # Maximum age for incoming trade ticks (allows for network jitter)
+MAX_TRADE_AGE_SECONDS = 15  # Tolerates network jitter/lag - prevents missing alerts due to delayed trades
 
 
 def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_PRICE_AGE_SECONDS):
