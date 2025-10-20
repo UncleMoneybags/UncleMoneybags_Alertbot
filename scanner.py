@@ -1353,23 +1353,11 @@ pending_alerts = defaultdict(list)  # Store multiple alerts per symbol
 
 async def send_best_alert(symbol):
     """Send only the highest scoring alert for a symbol"""
-    if symbol == "OCTO":
-        logger.info(
-            f"[🚨 OCTO DEBUG] send_best_alert called, pending alerts: {len(pending_alerts.get(symbol, []))}"
-        )
-
     if symbol not in pending_alerts or not pending_alerts[symbol]:
-        if symbol == "OCTO":
-            logger.info(f"[🚨 OCTO DEBUG] No pending alerts for {symbol}")
         return
 
     # Find highest scoring alert
     best_alert = max(pending_alerts[symbol], key=lambda x: x['score'])
-
-    if symbol == "OCTO":
-        logger.info(
-            f"[🚨 OCTO DEBUG] Best alert: {best_alert['type']} | Score: {best_alert['score']}"
-        )
 
     # Only send if score is high enough (LOWERED for faster alerts)
     if best_alert['score'] >= 20:  # 🚨 LOWERED from 30 to 20 - catch more valid setups
@@ -1726,8 +1714,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                 f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.011)"
             )
             return
-# REMOVED: last_trade_volume check - candle volume is sufficient validation
-        
+
         # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
         candle_time_ps = candles_seq[-1]['start_time'] + timedelta(minutes=1)
         alert_price = get_display_price(symbol, last_close, candle_time_ps)
@@ -1876,10 +1863,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # 🚨 FIX: FAIL-OPEN for unknown float (consistent with is_eligible)
     if symbol not in FLOAT_EXCEPTION_SYMBOLS and float_shares is not None and (
             not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)):
-        if symbol == "OCTO":
-            logger.info(
-                f"[🚨 OCTO DEBUG] FILTERED OUT due to float {float_shares} (range: {MIN_FLOAT_SHARES}-{MAX_FLOAT_SHARES})"
-            )
         logger.debug(f"Skipping {symbol} due to float {float_shares}")
         return
 
@@ -1890,10 +1873,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
 
     # OCTO-specific debug for successful processing
-    if symbol == "OCTO":
-        logger.info(
-            f"[🚨 OCTO DEBUG] PASSED float filter ({float_shares}), processing candle: {open_}/{high}/{low}/{close}/{volume}"
-        )
     # DEBUG: Show why symbols might be filtered
     if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"]:
         logger.info(
@@ -2020,16 +1999,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
-        # 🚨 EXTRA SAFETY CHECK - Log when criteria would fire
-        if (volume_wu >= 2.0 * avg_vol_5 and price_move_wu >= 0.03
-                and 0.20 <= close_wu <= 25.00 and current_price_wu is not None
-                and current_price_wu > vwap_wu
-                and dollar_volume_wu >= 50_000):  # 🚨 REAL-TIME PRICE!
-            logger.warning(
-                f"[⚠️ OLD CRITERIA] {symbol} would have fired under old criteria! "
-                f"Vol={volume_wu}, Move={price_move_wu*100:.1f}%, Close=${close_wu:.3f}, VWAP=${vwap_wu:.3f}"
-            )
-
         if warming_up_criteria and not warming_up_was_true[symbol]:
             if last_trade_volume[symbol] < 500:
                 logger.info(
@@ -2345,7 +2314,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
 
     if spike_detected and not volume_spike_was_true[symbol]:
-# REMOVED: last_trade_volume check - candle volume is sufficient validation
         if (now - last_alert_time[symbol]['volume_spike']) < timedelta(
                 minutes=ALERT_COOLDOWN_MINUTES):
             logger.info(
@@ -2960,15 +2928,6 @@ async def ingest_polygon_events():
                                 volume = event["v"]
                                 start_time = polygon_time_to_utc(event["s"])
 
-                                # DEBUG: Special logging for OCTO to track why no alerts
-                                if symbol == "OCTO":
-                                    logger.info(
-                                        f"[🚨 OCTO DEBUG] Processing AM event: {event}"
-                                    )
-                                    logger.info(
-                                        f"[🚨 OCTO DEBUG] Received AM candle: {start_time} OHLCV: {open_}/{high}/{low}/{close}/{volume}"
-                                    )
-
                                 logger.debug(
                                     f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}"
                                 )
@@ -3043,10 +3002,6 @@ async def ingest_polygon_events():
                                 await on_new_candle(symbol, open_, high, low,
                                                     close, volume, start_time)
                                 # Process all pending alerts and send only the best one
-                                if symbol == "OCTO":
-                                    logger.info(
-                                        f"[🚨 OCTO DEBUG] About to call send_best_alert for {symbol}"
-                                    )
                                 await send_best_alert(symbol)
                             elif event.get("ev") == "LULD":
                                 # Handle LULD (Limit Up/Limit Down) events - Polygon's official halt detection!
