@@ -1268,7 +1268,7 @@ def fmt_price(p):
     elif p < 1.0:
         return f"{p:.4f}"  # 4 decimals for penny stocks (shows $0.3398 instead of $0.34)
     elif p < 10.0:
-        return f"{p:.3f}"  # 3 decimals for $1-$10 stocks
+        return f"{p:.2f}"  # 2 decimals for $1-$10 stocks
     else:
         return f"{p:.2f}"  # 2 decimals for $10+ stocks
 
