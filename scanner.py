@@ -1443,12 +1443,12 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     prev_momentum = (curr_candle['close'] - prev_candle['close']
                      ) / prev_candle['close'] if prev_candle['close'] > 0 else 0
     
-    # Green candle with meaningful move OR rising from previous with meaningful move
+    # Green candle with meaningful move AND rising from previous with meaningful move
     is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005  # 0.5%+ for early detection
     rising_from_prev = curr_candle['close'] > prev_candle['close'] and prev_momentum >= 0.003  # 0.3%+ from previous
     
-    # Price must be moving UP (green candle OR rising from previous)
-    bullish_momentum = is_green_candle or rising_from_prev
+    # Price must be moving UP - BOTH conditions required to prevent false alerts on falling stocks
+    bullish_momentum = is_green_candle and rising_from_prev
 
     symbol = curr_candle.get('symbol', '?')
 
