@@ -2957,6 +2957,7 @@ async def ingest_polygon_events():
                                     vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                 
                                 # 🚨 FIX: Reset VWAP at 9:30 AM to exclude pre-market data
+                                eastern = pytz.timezone("America/New_York")
                                 candle_time = start_time.astimezone(eastern).time()
                                 market_open_time = dt_time(9, 30)
                                 
@@ -3087,8 +3088,9 @@ async def ingest_polygon_events():
                                         else:
                                             # Price is valid, check float
                                             if float_shares is None:
-                                                filter_reason = "no float data available"
-                                                logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
+                                                # FAIL-OPEN: Alert on unknown floats for halts (important events)
+                                                should_alert = True
+                                                logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float UNKNOWN - MEETS CRITERIA (fail-open)")
                                             elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
                                                 filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
                                                 logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
