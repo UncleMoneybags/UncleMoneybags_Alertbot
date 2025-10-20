@@ -834,7 +834,7 @@ MIN_3MIN_VOLUME = 25000
 MIN_PER_CANDLE_VOL = 25000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
-RVOL_SPIKE_THRESHOLD = 1.5  # REDUCED: Lower RVOL for early detection
+RVOL_SPIKE_THRESHOLD = 2.0  # REDUCED: Lower RVOL for early detection
 RVOL_SPIKE_MIN_VOLUME = 25000  # REDUCED: Lower volume for early spikes
 
 # 🚀 MEMORY MANAGEMENT: LRU tracking for symbol eviction
