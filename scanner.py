@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# Patched scanner.py - fixes syntax errors, robustifies async loop usage, avoids implicit defaultdict creation
+# and fixes run_in_executor usage to consistently use io_executor. Also hardens cleanup routine.
+# Source: https://github.com/UncleMoneybags/UncleMoneybags_Alertbot/blob/fb946d280fd4fa387e53006be94fd7897090d75a/scanner.py
 import logging
 import asyncio
 import websockets
@@ -32,28 +36,47 @@ def cleanup_resources():
     global http_session, io_executor
     try:
         # Close HTTP session to prevent connection leaks
-        if http_session and not http_session.closed:
-            import asyncio
+        if http_session and not getattr(http_session, "closed", True):
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(http_session.close())
-                else:
-                    loop.run_until_complete(http_session.close())
-                logger.info("[ATEXIT] Closed HTTP session")
-            except:
-                # If async close fails, at least attempt sync cleanup
+                # Try to close the session cleanly if there's a running loop
+                loop = None
                 try:
-                    http_session.connector.close()
-                except:
-                    pass
-        
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # schedule close on running loop
+                        loop.create_task(http_session.close())
+                    else:
+                        # create a temporary event loop to close the session synchronously
+                        try:
+                            asyncio.run(http_session.close())
+                        except RuntimeError:
+                            # If we cannot run a new loop, fall back to connector close if available
+                            try:
+                                if hasattr(http_session, "connector") and http_session.connector:
+                                    http_session.connector.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    # As a last-resort synchronous connector close
+                    try:
+                        if hasattr(http_session, "connector") and http_session.connector:
+                            http_session.connector.close()
+                    except Exception:
+                        pass
+
+                logging.getLogger(__name__).info("[ATEXIT] Closed HTTP session (best-effort)")
+            except Exception:
+                pass
+
         # Shutdown executor with wait=True to ensure in-flight writes complete
         if io_executor:
-            io_executor.shutdown(wait=True)
-            logger.info("[ATEXIT] Executor shutdown complete (waited for in-flight tasks)")
+            try:
+                io_executor.shutdown(wait=True)
+                logging.getLogger(__name__).info("[ATEXIT] Executor shutdown complete (waited for in-flight tasks)")
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[ATEXIT] Executor shutdown failed: {e}")
     except Exception as e:
-        logger.error(f"[ATEXIT] Cleanup error: {e}")
+        logging.getLogger(__name__).error(f"[ATEXIT] Cleanup error: {e}")
 
 atexit.register(cleanup_resources)
 
@@ -115,15 +138,25 @@ async def save_float_cache(force=False):
         tmp2 = "float_cache_none.pkl.tmp"
         
         # 🚀 PERFORMANCE: Run blocking I/O in thread executor to prevent event loop blocking
-        loop = asyncio.get_event_loop()
-        
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
         def write_pickle_files():
-            with open(tmp1, "wb") as f:
-                pickle.dump(float_cache, f)
-            with open(tmp2, "wb") as f:
-                pickle.dump(float_cache_none_retry, f)
-        
-        await loop.run_in_executor(io_executor, write_pickle_files)
+            try:
+                with open(tmp1, "wb") as f:
+                    pickle.dump(float_cache, f)
+                with open(tmp2, "wb") as f:
+                    pickle.dump(float_cache_none_retry, f)
+            except Exception as e:
+                logger.warning(f"[SAVE FLOAT CACHE] Write failed: {e}")
+
+        if loop:
+            await loop.run_in_executor(io_executor, write_pickle_files)
+        else:
+            # synchronous fallback
+            write_pickle_files()
         
         # Atomic rename (replaces old file atomically)
         try:
@@ -141,18 +174,26 @@ async def save_float_cache(force=False):
 def load_float_cache():
     global float_cache, float_cache_none_retry
     if os.path.exists("float_cache.pkl"):
-        with open("float_cache.pkl", "rb") as f:
-            float_cache = pickle.load(f)
-        logger.debug(f"Loaded float cache, entries: {len(float_cache)}")
+        try:
+            with open("float_cache.pkl", "rb") as f:
+                float_cache = pickle.load(f)
+            logger.debug(f"Loaded float cache, entries: {len(float_cache)}")
+        except Exception as e:
+            logger.warning(f"Failed to load float_cache.pkl: {e}")
+            float_cache = {}
     else:
         float_cache = {}
         logger.debug("No float cache found, starting new")
     if os.path.exists("float_cache_none.pkl"):
-        with open("float_cache_none.pkl", "rb") as f:
-            float_cache_none_retry = pickle.load(f)
-        logger.debug(
-            f"Loaded float_cache_none_retry, entries: {len(float_cache_none_retry)}"
-        )
+        try:
+            with open("float_cache_none.pkl", "rb") as f:
+                float_cache_none_retry = pickle.load(f)
+            logger.debug(
+                f"Loaded float_cache_none_retry, entries: {len(float_cache_none_retry)}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load float_cache_none.pkl: {e}")
+            float_cache_none_retry = {}
     else:
         float_cache_none_retry = {}
         logger.debug("No float_cache_none_retry found, starting new")
@@ -181,11 +222,12 @@ async def get_float_shares(ticker):
             info = yf.Ticker(ticker).info
             return info.get('floatShares', None)
         except Exception as e:
-            return None, e
+            # Return a tuple that the caller can detect as an error
+            return (None, e)
     
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _fetch_float)
+        result = await loop.run_in_executor(io_executor, _fetch_float)
         
         # Handle result
         if isinstance(result, tuple):  # Error case
@@ -235,7 +277,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         filter_counts["price_none"] += 1
         if filter_counts["price_none"] % 100 == 1:  # Log every 100th occurrence
             logger.info(
-                f"[FILTER DEBUG] {symbol} filtered: price is None (count: {filter_counts['price_none']})"
+                f"[FILTER DEBUG] {symbol} filtered: price is None (count: {filter_counts.get('price_none', 0)})"
             )
         return False
     elif check_price > PRICE_THRESHOLD:
@@ -245,7 +287,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             using_str = "entry_price" if use_entry_price and entry_price.get(symbol) else "last_price"
             logger.info(
                 f"[FILTER DEBUG] {symbol} filtered: price ${check_price:.2f} > ${PRICE_THRESHOLD} "
-                f"(count: {filter_counts['price_too_high']}) [using {using_str}]"
+                f"(count: {filter_counts.get('price_too_high', 0)}) [using {using_str}]"
             )
         return False
 
@@ -256,7 +298,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             filter_counts["float_none"] += 1
             if filter_counts["float_none"] % 100 == 1:
                 logger.info(
-                    f"[FLOAT UNKNOWN] {symbol} - no float data available, ALLOWING symbol to process (count: {filter_counts['float_none']})"
+                    f"[FLOAT UNKNOWN] {symbol} - no float data available, ALLOWING symbol to process (count: {filter_counts.get('float_none', 0)})"
                 )
             # ALLOW symbol through when float data unavailable
         elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
@@ -264,11 +306,11 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             # Use safe logging to avoid formatting None
             try:
                 logger.info(
-                    f"[FILTER DEBUG] {symbol} filtered: float_shares {(float_shares/1e6):.1f}M not in range {(MIN_FLOAT_SHARES/1e6):.1f}M-{(MAX_FLOAT_SHARES/1e6):.1f}M (count: {filter_counts['float_out_of_range']})"
+                    f"[FILTER DEBUG] {symbol} filtered: float_shares {(float_shares/1e6):.1f}M not in range {(MIN_FLOAT_SHARES/1e6):.1f}M-{(MAX_FLOAT_SHARES/1e6):.1f}M (count: {filter_counts.get('float_out_of_range', 0)})"
                 )
             except Exception:
                 logger.info(
-                    f"[FILTER DEBUG] {symbol} filtered: float_shares={float_shares} (count: {filter_counts['float_out_of_range']})"
+                    f"[FILTER DEBUG] {symbol} filtered: float_shares={float_shares} (count: {filter_counts.get('float_out_of_range', 0)})"
                 )
             return False
     else:
@@ -283,7 +325,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
     if symbol in ["OCTO", "GRND", "EQS"] or filter_counts["passed"] % 100 == 1:
         float_str = f"{float_shares/1e6:.1f}M" if float_shares is not None else "Unknown"
         logger.info(
-            f"[FILTER PASS] {symbol} eligible: price=${last_price:.2f}, float={float_str} (total passed: {filter_counts['passed']})"
+            f"[FILTER PASS] {symbol} eligible: price=${last_price:.2f}, float={float_str} (total passed: {filter_counts.get('passed', 0)})"
         )
 
     return True
@@ -307,13 +349,17 @@ class VolumeProfile:
 
     def _load_profile(self):
         if os.path.exists(PROFILE_FILE):
-            with open(PROFILE_FILE, "r") as f:
-                self.profile = json.load(f)
-            for sym, by_min in self.profile.items():
-                self.profile[sym] = {
-                    int(minidx): vols
-                    for minidx, vols in by_min.items()
-                }
+            try:
+                with open(PROFILE_FILE, "r") as f:
+                    self.profile = json.load(f)
+                for sym, by_min in self.profile.items():
+                    self.profile[sym] = {
+                        int(minidx): vols
+                        for minidx, vols in by_min.items()
+                    }
+            except Exception as e:
+                logger.warning(f"[PROFILE LOAD] Failed to load {PROFILE_FILE}: {e}")
+                self.profile = defaultdict(lambda: defaultdict(list))
         else:
             self.profile = defaultdict(lambda: defaultdict(list))
 
@@ -328,11 +374,18 @@ class VolumeProfile:
         
         # 🚀 PERFORMANCE: JSON write in thread executor to prevent blocking
         def write_json():
-            with open(PROFILE_FILE, "w") as f:
-                json.dump(serializable, f)
+            try:
+                with open(PROFILE_FILE, "w") as f:
+                    json.dump(serializable, f)
+            except Exception as e:
+                logger.warning(f"[PROFILE SAVE] Failed to write {PROFILE_FILE}: {e}")
         
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(io_executor, write_json)
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(io_executor, write_json)
+        except RuntimeError:
+            # Fallback synchronous write if no running loop
+            write_json()
 
     async def add_day(self, symbol, daily_candles):
         for candle in daily_candles:
@@ -406,6 +459,11 @@ async def perform_connection_backfill():
                     'limit': backfill_minutes,
                     'apikey': POLYGON_API_KEY
                 }
+
+                # Guard http_session usage
+                if http_session is None:
+                    logger.warning("[BACKFILL] No http_session available, skipping backfill")
+                    continue
 
                 async with http_session.get(url, params=params) as response:
                     if response.status == 200:
@@ -537,6 +595,10 @@ async def backfill_stored_emas(symbol):
             'limit': 200,
             'apikey': POLYGON_API_KEY
         }
+
+        if http_session is None:
+            logger.warning(f"[EMA BACKFILL] {symbol} - No http_session available")
+            return False
 
         async with http_session.get(url, params=params) as response:
             if response.status == 200:
@@ -682,8 +744,8 @@ def vwap_candles_numpy(candles):
             logger.warning("[VWAP ERROR] No non-zero volume candles available")
             return 0.0
 
-        logger.debug(f"[VWAP DEBUG] Prices used: {prices}")
-        logger.debug(f"[VWAP DEBUG] Volumes used: {volumes}")
+        logger.debug(f"[VWAP DEBUG] Prices used count: {len(prices)}")
+        logger.debug(f"[VWAP DEBUG] Volumes used count: {len(volumes)}")
 
         # Use enhanced VWAP calculation
         vwap_val = vwap_numpy(prices, volumes)
@@ -698,7 +760,7 @@ def vwap_candles_numpy(candles):
 
 def get_valid_vwap(symbol):
     """🚨 CENTRALIZED VWAP GUARD: Returns valid VWAP or None if insufficient data"""
-    if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
+    if symbol not in vwap_candles or not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
         logger.info(
             f"[VWAP GUARD] {symbol} - Insufficient VWAP data ({len(vwap_candles[symbol]) if symbol in vwap_candles else 0} candles)"
         )
@@ -738,7 +800,6 @@ def get_valid_vwap(symbol):
         return None
 
     # Verify VWAP is within reasonable range of current prices
-    # 🚨 FIX: Convert deque to list before slicing to prevent "sequence index must be integer, not 'slice'" error
     candles_list = list(candles) if isinstance(candles, deque) else candles
     recent_prices = [candle['close'] for candle in candles_list[-3:]]
     if len(recent_prices) == 0:
@@ -844,6 +905,7 @@ def _polygon_ts_to_datetime(ts):
         except Exception:
             return None
 
+    # Heuristics based on magnitude
     if ts_int > 10**18:
         scale = 1_000_000_000  # ns -> seconds
     elif ts_int > 10**15:
@@ -1056,7 +1118,7 @@ async def check_alert_outcomes():
     now = datetime.now(timezone.utc)
     completed_alerts = []
 
-    for symbol, alert_time in recent_alerts.items():
+    for symbol, alert_time in list(recent_alerts.items()):
         minutes_elapsed = (now - alert_time).total_seconds() / 60
 
         # Check outcomes at 5, 15, 30, and 60 minute marks
@@ -1110,11 +1172,14 @@ def log_outcome(symbol, alert_type, entry_price, current_price, alert_time,
     write_header = not os.path.exists(OUTCOME_LOG_FILE) or os.path.getsize(
         OUTCOME_LOG_FILE) == 0
 
-    with open(OUTCOME_LOG_FILE, "a", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=header)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    try:
+        with open(OUTCOME_LOG_FILE, "a", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=header)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        logger.error(f"[OUTCOME LOG] Failed to write outcome row: {e}")
 
 
 async def retrain_model_if_needed():
@@ -1172,8 +1237,12 @@ async def retrain_model_if_needed():
             new_model.fit(X, y)
 
             # 🚀 PERFORMANCE: Save model in thread executor to prevent blocking
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(io_executor, joblib.dump, new_model, "runner_model_updated.joblib")
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(io_executor, joblib.dump, new_model, "runner_model_updated.joblib")
+            except RuntimeError:
+                # fallback synchronous save
+                joblib.dump(new_model, "runner_model_updated.joblib")
 
             # Update global model
             global runner_clf
@@ -1189,12 +1258,20 @@ async def retrain_model_if_needed():
                 
                 # 🚀 PERFORMANCE: CSV writes in thread executor to prevent blocking
                 def write_csvs():
-                    outcome_df.iloc[:-200].to_csv(archive_file, index=False)
-                    outcome_df.iloc[-200:].to_csv(OUTCOME_LOG_FILE, index=False)
+                    try:
+                        outcome_df.iloc[:-200].to_csv(archive_file, index=False)
+                        outcome_df.iloc[-200:].to_csv(OUTCOME_LOG_FILE, index=False)
+                    except Exception as e:
+                        logger.error(f"[ML UPDATE] CSV archive write failed: {e}")
                 
-                await loop.run_in_executor(io_executor, write_csvs)
-                logger.info(
-                    f"[ML UPDATE] Archived old outcomes to {archive_file}")
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(io_executor, write_csvs)
+                    logger.info(
+                        f"[ML UPDATE] Archived old outcomes to {archive_file}")
+                except RuntimeError:
+                    # fallback synchronous
+                    write_csvs()
 
     except Exception as e:
         logger.error(f"[ML UPDATE] Error retraining model: {e}")
@@ -1232,11 +1309,14 @@ def log_event(event_type,
     header = list(row.keys())
     write_header = not os.path.exists(EVENT_LOG_FILE) or os.path.getsize(
         EVENT_LOG_FILE) == 0
-    with open(EVENT_LOG_FILE, "a", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=header)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    try:
+        with open(EVENT_LOG_FILE, "a", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=header)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        logger.error(f"[EVENT LOG] Failed to write event row: {e}")
 
 
 try:
@@ -1299,6 +1379,9 @@ def get_session_type(dt):
 
 async def send_telegram_async(message):
     logger.debug(f"[DEBUG] send_telegram_async called. Message: {message}")
+    if http_session is None:
+        logger.error("HTTP session not initialized, cannot send telegram")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -1324,6 +1407,9 @@ async def send_discord_async(message):
     if not DISCORD_WEBHOOK_URL:
         logger.debug(
             "No Discord webhook URL configured, skipping Discord notification")
+        return
+    if http_session is None:
+        logger.error("HTTP session not initialized, cannot send discord")
         return
     payload = {"content": message}
     try:
@@ -1530,12 +1616,6 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     curr_volume = curr_candle['volume']
     symbol = curr_candle.get('symbol', '?')
 
-    # If we don't have a valid VWAP, we cannot reliably evaluate "above VWAP" conditions.
-    # Fail-open earlier in the pipeline may allow processing, but this detector needs VWAP.
-    if vwap_value is None:
-        logger.debug(f"[VOLUME SPIKE] {symbol} - No VWAP available, skipping volume spike check")
-        return False, {}
-
     # ADAPTIVE: Use 3 trailing candles for early detection (4 total needed)
     trailing_volumes = [c['volume'] for c in candles_list[-4:-1]]
     trailing_avg = sum(trailing_volumes) / 3 if len(
@@ -1561,14 +1641,9 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     # Price must be moving UP (green candle OR rising from previous)
     bullish_momentum = is_green_candle or rising_from_prev
 
-    symbol = curr_candle.get('symbol', '?')
-
     logger.info(
-        f"[VOLUME SPIKE CHECK] {symbol} | "
-        f"Vol={curr_volume}, RVOL={rvol:.2f}, "
-        f"Green={is_green_candle} ({price_momentum*100:.1f}%), "
-        f"Rising={rising_from_prev}, Momentum={bullish_momentum}, "
-        f"Above VWAP={above_vwap}")
+        f"[VOLUME SPIKE CHECK] {symbol} | Vol={curr_volume}, RVOL={rvol:.2f}, AboveVWAP={above_vwap}, Momentum={bullish_momentum}"
+    )
 
     # Check each condition
     vol_ok = curr_volume >= min_volume
@@ -1587,11 +1662,8 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
 
     # Log detailed debug info
     logger.info(
-        f"[SPIKE DEBUG] {curr_candle.get('symbol', '?')} | "
-        f"vol_ok={vol_ok} ({curr_volume}>={min_volume}), "
-        f"rvol_ok={rvol_ok} ({rvol:.2f}>={RVOL_SPIKE_THRESHOLD}), "
-        f"vwap_ok={vwap_ok}, momentum_ok={momentum_ok}, "
-        f"FINAL: spike_detected={spike_detected}")
+        f"[SPIKE DEBUG] {curr_candle.get('symbol', '?')} | vol_ok={vol_ok} ({curr_volume}>={min_volume}), rvol_ok={rvol_ok} ({rvol:.2f}>={RVOL_SPIKE_THRESHOLD}), vwap_ok={vwap_ok}, momentum_ok={momentum_ok}, FINAL: spike_detected={spike_detected}"
+    )
 
     # Return both result and data for scoring
     data = {
@@ -1723,18 +1795,26 @@ def calc_macd_hist(closes):
 
 # PATCH: SESSION RESET FUNCTION
 def reset_symbol_state():
-    for d in [
-            candles, vwap_candles, last_trade_price, last_trade_volume,
-            last_trade_time, recent_high, last_alert_time, warming_up_was_true,
-            runner_was_true, dip_play_was_true, vwap_reclaim_was_true,
-            volume_spike_was_true, ema_stack_was_true, premarket_open_prices,
-            premarket_last_prices, premarket_volumes, alerted_symbols,
-            runner_alerted_today, below_vwap_streak, vwap_reclaimed_once,
-            dip_play_seen, volume_spike_alerted, rvol_spike_alerted,
-            halted_symbols, pending_runner_alert
-    ]:
-        if hasattr(d, "clear"):
-            d.clear()
+    # Some globals might not be defined at import-time when this function was loaded;
+    # defensively get from globals() and clear if present and has clear().
+    names = [
+        'candles', 'vwap_candles', 'last_trade_price', 'last_trade_volume',
+        'last_trade_time', 'recent_high', 'last_alert_time', 'warming_up_was_true',
+        'runner_was_true', 'dip_play_was_true', 'vwap_reclaim_was_true',
+        'volume_spike_was_true', 'ema_stack_was_true', 'premarket_open_prices',
+        'premarket_last_prices', 'premarket_volumes', 'alerted_symbols',
+        'runner_alerted_today', 'below_vwap_streak', 'vwap_reclaimed_once',
+        'dip_play_seen', 'volume_spike_alerted', 'rvol_spike_alerted',
+        'halted_symbols', 'pending_runner_alert'
+    ]
+    g = globals()
+    for name in names:
+        obj = g.get(name)
+        if obj is not None and hasattr(obj, "clear"):
+            try:
+                obj.clear()
+            except Exception:
+                pass
     # EMAs are NOT reset here - they persist throughout the trading session and only reset at 04:00 ET
     logger.info("Cleared all per-symbol session state for new trading day!")
 
@@ -1812,7 +1892,7 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
         f"[ALERT DEBUG] {symbol} | Perfect Setup Check | EMA5={ema5}, EMA8={ema8}, EMA13={ema13}, VWAP={vwap_value}, Last Close={last_close}, Last Volume={last_volume}, RVOL={rvol}, RSI={last_rsi}"
     )
     logger.debug(
-        f"[DEBUG] {symbol} | Session candles: {len(candles_seq)} | Candle times: {candles_seq[0]['start_time'] if candles_seq else 'n/a'} - {candles_seq[-1]['start_time'] if candles_seq else 'n/a'}"
+        f"[DEBUG] {symbol} | Session candles: {len(candles_seq)}"
     )
 
     # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
@@ -2219,7 +2299,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         volume_rn = last_candle['volume']
         price_move_rn = (close_rn - open_rn) / open_rn if open_rn > 0 else 0
         # 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
-        if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
+        if symbol not in vwap_candles or len(vwap_candles[symbol]) < 3:
             logger.info(
                 f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking runner alert"
             )
@@ -2236,7 +2316,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         price_rising_trend = rising_closes >= 2  # At least 2 out of 3 rising
         
         # Volume should be increasing (at least current > average of previous 2)
-        volume_rising_trend = volume_rn > sum(volumes_for_trend[:2]) / 2
+        volume_rising_trend = volume_rn > sum(volumes_for_trend[:2]) / 2 if len(volumes_for_trend) >= 2 else False
 
         # 🚨 CRITICAL: Get real-time price for criteria evaluation
         current_price_rn = last_trade_price.get(symbol)  # Real-time market price
@@ -2245,7 +2325,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             f"[RUNNER DEBUG] {symbol} | Closes: {closes_for_trend} | Rising closes: {rising_closes}/2 | Price trend: {price_rising_trend} | Volume trend: {volume_rising_trend}"
         )
         logger.debug(
-            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn if vwap_rn is not None else 'N/A'} | Real-time Price={current_price_rn if current_price_rn is not None else 'N/A'} | Candle Close={close_rn} | Above VWAP={(current_price_rn is not None and vwap_rn is not None and current_price_rn > vwap_rn)}"
+            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn if vwap_rn is not None else 'N/A'} | Real-time Price={current_price_rn if current_price_rn is not None else 'N/A'}"
         )
         # Use stored EMAs for Runner Detection
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2358,7 +2438,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[DIP PLAY DEBUG] {symbol}: dip_pct={dip_pct*100:.2f}% higher_lows={higher_lows} rising_volume={rising_volume}"
             )
             logger.debug(
-                f"[ALERT DEBUG] {symbol} | Alert Type: dip_play | VWAP={vwap_candles_numpy(vwap_candles[symbol]) if vwap_candles[symbol] else 'N/A'} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
+                f"[ALERT DEBUG] {symbol} | Alert Type: dip_play | VWAP={vwap_candles_numpy(vwap_candles[symbol]) if symbol in vwap_candles else 'N/A'} | Last Trade={last_trade_price.get(symbol)}"
             )
             # Use stored EMAs for Dip Play
             emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2418,11 +2498,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 last_alert_time[symbol]['dip_play'] = now
 
     # VWAP Reclaim Logic - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
-    if len(candles_seq) >= 2 and len(vwap_candles[symbol]) >= 3:
+    if len(candles_seq) >= 2 and (symbol in vwap_candles and len(vwap_candles[symbol]) >= 3):
         prev_candle = list(candles_seq)[-2]
         curr_candle = list(candles_seq)[-1]
         # Require sufficient VWAP data for both calculations
-        if len(vwap_candles[symbol]) < 3:
+        if symbol not in vwap_candles or len(vwap_candles[symbol]) < 3:
             logger.info(
                 f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data for reclaim, blocking alert"
             )
@@ -2464,10 +2544,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # DEBUG: Show VWAP reclaim detection logic
         if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
             logger.info(
-                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < prev_vwap={prev_vwap:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > curr_vwap={curr_vwap:.2f} = {curr_above_vwap}"
+                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} prev_vwap={prev_vwap if prev_vwap is not None else 0:.2f} | curr_close={curr_close:.2f} curr_vwap={curr_vwap if curr_vwap is not None else 0:.2f}"
             )
         logger.debug(
-            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={prev_vwap if prev_vwap is not None else 'N/A'} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap if curr_vwap is not None else 'N/A'} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
+            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={prev_vwap if prev_vwap is not None else 'N/A'} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap if curr_vwap is not None else 'N/A'} above={curr_above_vwap}"
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2510,14 +2590,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_alert_time[symbol]['vwap_reclaim'] = now
 
     # Volume Spike Logic PATCH - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
-    if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
+    if symbol not in vwap_candles or len(vwap_candles[symbol]) < 3:
         logger.info(
             f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking volume spike alert"
         )
         return  # Block all alerts if no VWAP data
     vwap_value = vwap_candles_numpy(vwap_candles[symbol])
     logger.debug(
-        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value if vwap_value is not None else 'N/A'} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
+        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value if vwap_value is not None else 'N/A'} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close}"
     )
     # Use stored EMAs for Volume Spike
     emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2534,7 +2614,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
         if spike_detected:
             logger.info(
-                f"[🔥 SPIKE DATA] {symbol} | RVOL={spike_data['rvol']:.2f} | Volume={spike_data['volume']} | Above_VWAP={spike_data['above_vwap']} | Price_move={spike_data['price_move']*100:.1f}%"
+                f"[🔥 SPIKE DATA] {symbol} | RVOL={spike_data.get('rvol', 0):.2f} | Volume={spike_data.get('volume', 0)} | Above_VWAP={spike_data.get('above_vwap', False)} | Price_move={spike_data.get('price_move', 0)*100:.1f}%"
             )
 
     if spike_detected and not volume_spike_was_true[symbol]:
@@ -2562,7 +2642,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # DEBUG: Log volume spike alert addition
         if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"]:
             logger.info(
-                f"[📊 VOLUME SPIKE] {symbol} | Adding to pending_alerts | Score: {score} | Volume: {spike_data['volume']} | RVOL: {spike_data['rvol']:.2f}"
+                f"[📊 VOLUME SPIKE] {symbol} | Adding to pending_alerts | Score: {score} | Volume: {spike_data.get('volume', 0)} | RVOL: {spike_data.get('rvol', 0):.2f}"
             )
 
         # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
@@ -2906,18 +2986,14 @@ async def market_close_alert_loop():
         # Reset flag for next trading day (only reset at midnight)
         if now_est.time().hour == 0 and now_est.time().minute < 1:
             sent_today = False
-
-        await asyncio.sleep(30)
-
-
-# Connection manager with exponential backoff
 connection_backoff_delay = 15  # Start with 15 seconds
 max_backoff_delay = 300  # Max 5 minutes
 connection_attempts = 0
 
 
 async def ingest_polygon_events():
-    global connection_backoff_delay, connection_attempts
+    """Connect to Polygon WebSocket and ingest events (trades, minute bars, LULD)."""
+    global connection_backoff_delay, connection_attempts, http_session
     url = "wss://socket.polygon.io/stocks"
 
     while True:
@@ -2932,6 +3008,8 @@ async def ingest_polygon_events():
             logger.info(
                 f"[CONNECTION] Connecting to Polygon WebSocket... (attempt {connection_attempts + 1})"
             )
+
+            # Use websockets.connect which returns an async context manager
             async with websockets.connect(url,
                                           ping_interval=15,
                                           ping_timeout=20) as ws:
@@ -2949,117 +3027,156 @@ async def ingest_polygon_events():
                 connection_backoff_delay = 15
                 connection_attempts = 0
 
+                # Authenticate
                 await ws.send(
                     json.dumps({
                         "action": "auth",
                         "params": POLYGON_API_KEY
                     }))
-                # Subscribe to ALL active stocks - full market scanning for dynamic discovery + halt monitoring
+                # Subscribe to necessary channels
                 await ws.send(
                     json.dumps({
                         "action": "subscribe",
                         "params": "AM.*,T.*,LULD.*"
                     }))
                 logger.info(
-                    "Subscribed to: AM.* (minute bars), T.* (trades), LULD.* (halt/volatility alerts) - FULL monitoring"
+                    "Subscribed to: AM.*,T.*,LULD.* - FULL monitoring"
                 )
 
                 while True:
                     if not is_market_scan_time():
                         logger.info(
-                            "[SCAN PAUSED] Market closed during active connection. Sleeping 60s, breaking websocket."
+                            "[SCAN PAUSED] Market closed during active connection. Breaking websocket."
                         )
                         await asyncio.sleep(60)
                         break
 
                     msg = await ws.recv()
-                    
-                    # 🚨 FIX: Convert bytes to string if needed
-                    if isinstance(msg, bytes):
-                        msg = msg.decode('utf-8')
-                    
-                    # 🔇 Reduced logging: Only log in debug mode to prevent performance issues
-                    logger.debug(f"[WS MSG] {msg[:200]}..." if len(msg) > 200 else f"[WS MSG] {msg}")
 
-                    # Skip malformed or heartbeat messages
-                    if not msg or len(msg.strip()) < 2 or not msg.strip().startswith('{') and not msg.strip().startswith('['):
-                        logger.debug(f"[SKIP] Non-JSON message: '{msg[:100]}'")
+                    # Convert bytes to string if needed
+                    if isinstance(msg, bytes):
+                        try:
+                            msg = msg.decode('utf-8')
+                        except Exception:
+                            # If cannot decode, skip
+                            logger.debug("[WS MSG] Received non-decodable bytes, skipping")
+                            continue
+
+                    # Lightweight skip for non-JSON-ish messages
+                    s = msg.strip() if isinstance(msg, str) else ""
+                    if not s or len(s) < 2 or (not s.startswith('{') and not s.startswith('[')):
+                        logger.debug(f"[SKIP] Non-JSON message or heartbeat: '{s[:100]}'")
                         continue
 
                     try:
-                        data = json.loads(msg)
+                        data = json.loads(s)
                         if isinstance(data, dict):
                             data = [data]
                         for event in data:
-                            # Handle connection limit status messages FIRST
-                            if event.get("ev") == "status" and event.get(
-                                    "status") == "max_connections":
+                            ev = event.get("ev")
+                            # CONNECTION STATUS messages (throttle / limited)
+                            if ev == "status" and event.get("status") == "max_connections":
                                 logger.warning(
                                     f"[🚨 CONNECTION LIMIT] Polygon API connection limit exceeded!"
                                 )
-                                logger.warning(
-                                    f"[🚨 CONNECTION LIMIT] Message: {event.get('message', 'No details')}"
-                                )
-                                # Treat as throttling signal - trigger exponential backoff
-                                raise ConnectionError(
-                                    "max_connections_exceeded")
+                                raise ConnectionError("max_connections_exceeded")
 
-                            elif event.get("ev") == "T":
-                                symbol = event["sym"]
-                                price = event["p"]
-                                size = event.get('s', 0)
-                                trade_timestamp = event.get('t')  # 🚨 FIX: Don't default to 0
-                                
-                                # 🚨 FIX: Skip trades with missing timestamp (don't fake to epoch 1970)
+                            # TRADE event
+                            if ev == "T":
+                                symbol = event.get("sym")
+                                price = event.get("p")
+                                size = event.get("s", 0)
+                                trade_timestamp = event.get("t")
+
+                                # Skip if missing essential data
+                                if not symbol or price is None:
+                                    logger.debug("[TRADE SKIP] Missing symbol/price")
+                                    continue
+
+                                # Skip trades without timestamps
                                 if not trade_timestamp:
-                                    logger.debug(f"[TRADE SKIP] {symbol} - Missing timestamp, cannot validate freshness")
+                                    logger.debug(f"[TRADE SKIP] {symbol} - Missing timestamp")
                                     continue
 
                                 # Check eligibility BEFORE processing/logging
                                 float_shares = await get_float_shares(symbol)
-                                
-                                # 🎯 GRANDFATHERING: Use entry price for already-tracked stocks
                                 is_tracked = symbol in entry_price and entry_price[symbol] is not None
-                                
+
                                 if not is_eligible(symbol, price, float_shares, use_entry_price=is_tracked):
                                     # If not eligible and was being tracked, clear entry price
                                     if is_tracked:
-                                        logger.info(f"[GRANDFATHERING] {symbol} no longer eligible, removing from tracking (entry: ${entry_price[symbol]:.2f}, current: ${price:.2f})")
+                                        logger.info(f"[GRANDFATHERING] {symbol} no longer eligible, removing from tracking (entry: {entry_price[symbol]:.2f} -> None)")
                                         entry_price[symbol] = None
-                                    continue  # Skip ineligible symbols completely
-                                
-                                # 🎯 NEW STOCK: Record entry price when first eligible
+                                    continue
+
+                                # New stock: lock entry price
                                 if not is_tracked:
                                     entry_price[symbol] = price
                                     logger.info(f"[GRANDFATHERING] {symbol} now eligible - locked entry price: ${price:.2f}")
 
-                                # 🚨 FIX: Use Polygon's timestamp to reject stale trades
-                                # Use robust converter that detects ms/us/ns
+                                # Robust timestamp conversion
                                 trade_time = _polygon_ts_to_datetime(trade_timestamp)
                                 if trade_time is None:
                                     logger.debug(f"[TRADE SKIP] {symbol} - Unparseable trade timestamp: {trade_timestamp}")
                                     continue
+
                                 now_utc = datetime.now(timezone.utc)
                                 trade_age_seconds = (now_utc - trade_time).total_seconds()
-                                
-                                # Reject trades older than threshold (allows for network jitter)
+                                # Reject stale trades
                                 if trade_age_seconds > MAX_TRADE_AGE_SECONDS:
-                                    logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting (limit: {MAX_TRADE_AGE_SECONDS}s)")
+                                    logger.debug(f"[STALE TRADE] {symbol} - {trade_age_seconds:.1f}s old, skipping")
                                     continue
-                                
+
+                                # Update last trade info
                                 last_trade_price[symbol] = price
                                 last_trade_volume[symbol] = size
-                                last_trade_time[symbol] = trade_time  # Use Polygon's timestamp, not now()
-                                logger.debug(
-                                    f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={trade_time} | Age={trade_age_seconds:.1f}s"
-                                )
-                                
-                                # 🚨 LOCAL CANDLE AGGREGATION: Build 1-min candles from trades when Polygon doesn't provide AM events
-                                # Track trades per minute for symbols missing Polygon candles
+                                last_trade_time[symbol] = trade_time
+                                logger.debug(f"[TRADE] {symbol} p={price} s={size} t={trade_time} age={trade_age_seconds:.1f}s")
+
+                                # Build local candle aggregation (per-minute) if needed
                                 current_minute = trade_time.replace(second=0, microsecond=0)
-                                
-                                # Initialize tracking structures if needed
-                                if symbol not in local_candle_builder:
+                                builder = local_candle_builder.get(symbol)
+                                if builder is None or builder.get('minute') != current_minute:
+                                    # Emit previous minute candle if present
+                                    if builder:
+                                        if builder.get('trade_count', 0) >= 1:
+                                            local_candle = {
+                                                "open": builder['open'],
+                                                "high": builder['high'],
+                                                "low": builder['low'],
+                                                "close": builder['close'],
+                                                "volume": builder['volume'],
+                                                "start_time": builder['minute'],
+                                            }
+                                            # Ensure deques exist
+                                            if not isinstance(candles.get(symbol), deque):
+                                                candles[symbol] = deque(candles[symbol], maxlen=CANDLE_MAXLEN)
+                                            if not isinstance(vwap_candles.get(symbol), deque):
+                                                vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
+                                            candles[symbol].append(local_candle)
+                                            # VWAP session handling
+                                            session_date = get_session_date(local_candle['start_time'])
+                                            if vwap_session_date.get(symbol) != session_date:
+                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
+                                                vwap_session_date[symbol] = session_date
+                                                vwap_reset_done[symbol] = False
+                                            # Reset VWAP at market open if crossing
+                                            et_time = local_candle['start_time'].astimezone(eastern).time()
+                                            if et_time >= dt_time(9, 30) and not vwap_reset_done[symbol]:
+                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
+                                                vwap_cum_vol[symbol] = 0
+                                                vwap_cum_pv[symbol] = 0
+                                                vwap_reset_done[symbol] = True
+                                                logger.info(f"[VWAP RESET] {symbol} - Market open VWAP reset")
+                                            vwap_candles[symbol].append(local_candle)
+
+                                            # Trigger analysis
+                                            await on_new_candle(symbol, local_candle['open'], local_candle['high'],
+                                                                local_candle['low'], local_candle['close'],
+                                                                local_candle['volume'], local_candle['start_time'])
+                                            if pending_alerts.get(symbol):
+                                                await send_best_alert(symbol)
+                                    # start new builder
                                     local_candle_builder[symbol] = {
                                         'minute': current_minute,
                                         'open': price,
@@ -3069,108 +3186,27 @@ async def ingest_polygon_events():
                                         'volume': size,
                                         'trade_count': 1
                                     }
-                                elif local_candle_builder[symbol]['minute'] == current_minute:
-                                    # Same minute - update OHLCV
-                                    builder = local_candle_builder[symbol]
+                                else:
+                                    # update existing builder
                                     builder['high'] = max(builder['high'], price)
                                     builder['low'] = min(builder['low'], price)
                                     builder['close'] = price
                                     builder['volume'] += size
-                                    builder['trade_count'] += 1
-                                else:
-                                    prev_builder = local_candle_builder[symbol]
-                                    prev_minute = prev_builder['minute']
-                                    
-                                    # Only create local candle if we had trades (min 1 for early detection)
-                                    if prev_builder['trade_count'] >= 1:
-                                        local_candle = {
-                                            "open": prev_builder['open'],
-                                            "high": prev_builder['high'],
-                                            "low": prev_builder['low'],
-                                            "close": prev_builder['close'],
-                                            "volume": prev_builder['volume'],
-                                            "start_time": prev_minute,
-                                        }
-                                        
-                                        logger.debug(
-                                            f"[LOCAL CANDLE] {symbol} {prev_minute} o:{local_candle['open']} h:{local_candle['high']} l:{local_candle['low']} c:{local_candle['close']} v:{local_candle['volume']}"
-                                        )
-                                        
-                                        # Process the local candle through normal logic
-                                        if not isinstance(candles[symbol], deque):
-                                            candles[symbol] = deque(candles[symbol], maxlen=20)
-                                        # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
-                                        if not isinstance(vwap_candles[symbol], deque):
-                                            vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
-                                        
-                                        candles[symbol].append(local_candle)
-                                        session_date = get_session_date(local_candle['start_time'])
-                                        last_session = vwap_session_date[symbol]
-                                        if last_session != session_date:
-                                            vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
-                                            vwap_session_date[symbol] = session_date
-                                            vwap_reset_done[symbol] = False  # Reset flag for new trading day
-                                        
-                                        # Process VWAP reset at market open
-                                        eastern = pytz.timezone("America/New_York")
-                                        candle_time = prev_minute.astimezone(eastern).time()
-                                        market_open_time = dt_time(9, 30)
-                                        if candle_time >= market_open_time:
-                                            if not vwap_reset_done[symbol]:
-                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
-                                                vwap_cum_vol[symbol] = 0
-                                                vwap_cum_pv[symbol] = 0
-                                                vwap_reset_done[symbol] = True
-                                                logger.info(f"[VWAP RESET] {symbol} - Cleared pre-market VWAP data at market open (9:30 AM)")
-                                        
-                                        vwap_candles[symbol].append(local_candle)
-                                        
-                                        # Trigger alert processing
-                                        await on_new_candle(
-                                            symbol,
-                                            local_candle['open'],
-                                            local_candle['high'],
-                                            local_candle['low'],
-                                            local_candle['close'],
-                                            local_candle['volume'],
-                                            prev_minute
-                                        )
-                                        
-                                        # Send best alert if any pending
-                                        if symbol in pending_alerts and pending_alerts[symbol]:
-                                            await send_best_alert(symbol)
-                                    
-                                    # Start new minute builder
-                                    local_candle_builder[symbol] = {
-                                        'minute': current_minute,
-                                        'open': price,
-                                        'high': price,
-                                        'low': price,
-                                        'close': price,
-                                        'volume': size,
-                                        'trade_count': 1
-                                    }
-                            elif event.get("ev") == "AM":
-                                symbol = event["sym"]
-                                open_ = event["o"]
-                                high = event["h"]
-                                low = event["l"]
-                                close = event["c"]
-                                volume = event["v"]
-                                start_time = polygon_time_to_utc(event["s"])
+                                    builder['trade_count'] = builder.get('trade_count', 0) + 1
 
-                                # DEBUG: Special logging for OCTO to track why no alerts
-                                if symbol == "OCTO":
-                                    logger.info(
-                                        f"[🚨 OCTO DEBUG] Processing AM event: {event}"
-                                    )
-                                    logger.info(
-                                        f"[🚨 OCTO DEBUG] Received AM candle: {start_time} OHLCV: {open_}/{high}/{low}/{close}/{volume}"
-                                    )
+                            # MINUTE AGGREGATE event
+                            elif ev == "AM":
+                                symbol = event.get("sym")
+                                open_ = event.get("o")
+                                high = event.get("h")
+                                low = event.get("l")
+                                close = event.get("c")
+                                volume = event.get("v")
+                                start_time = polygon_time_to_utc(event.get("s"))
 
-                                logger.debug(
-                                    f"[POLYGON] {symbol} {start_time} o:{open_} h:{high} l:{low} c:{close} v:{volume}"
-                                )
+                                if not symbol or start_time is None:
+                                    logger.debug("[AM SKIP] Missing symbol or start_time")
+                                    continue
 
                                 candle = {
                                     "open": open_,
@@ -3180,629 +3216,456 @@ async def ingest_polygon_events():
                                     "volume": volume,
                                     "start_time": start_time,
                                 }
-                                if not isinstance(candles[symbol], deque):
-                                    candles[symbol] = deque(candles[symbol],
-                                                            maxlen=20)
-                                # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
-                                if not isinstance(vwap_candles[symbol], deque):
-                                    vwap_candles[symbol] = deque(
-                                        vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
+                                # Ensure deques
+                                if not isinstance(candles.get(symbol), deque):
+                                    candles[symbol] = deque(candles[symbol], maxlen=CANDLE_MAXLEN)
+                                if not isinstance(vwap_candles.get(symbol), deque):
+                                    vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
                                 candles[symbol].append(candle)
-                                session_date = get_session_date(
-                                    candle['start_time'])
-                                last_session = vwap_session_date[symbol]
-                                if last_session != session_date:
-                                    vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                session_date = get_session_date(candle['start_time'])
+                                if vwap_session_date.get(symbol) != session_date:
+                                    vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
                                     vwap_session_date[symbol] = session_date
-                                    vwap_reset_done[symbol] = False  # Reset flag for new trading day
-                                
-                                # 🚨 FIX: Reset VWAP at 9:30 AM to exclude pre-market data
-                                candle_time = start_time.astimezone(eastern).time()
+                                    vwap_reset_done[symbol] = False
+
+                                # Reset VWAP when crossing into market open
+                                candle_time_et = start_time.astimezone(eastern).time()
                                 market_open_time = dt_time(9, 30)
-                                
-                                # If this is the first candle at or after 9:30 AM, reset VWAP
                                 if len(vwap_candles[symbol]) > 0:
                                     last_candle_time = vwap_candles[symbol][-1]['start_time'].astimezone(eastern).time()
-                                    # Reset if crossing from pre-market into regular session
-                                    if last_candle_time < market_open_time <= candle_time:
+                                    if last_candle_time < market_open_time <= candle_time_et:
                                         logger.info(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing pre-market data")
-                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
                                         vwap_cum_vol[symbol] = 0
                                         vwap_cum_pv[symbol] = 0
-                                
-                                # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
+
+                                # Detect corporate-action-style jumps >100% and reset VWAP
                                 if len(vwap_candles[symbol]) > 0:
                                     last_close = vwap_candles[symbol][-1]['close']
-                                    current_close = candle['close']
-                                    price_change_pct = abs(current_close - last_close) / last_close if last_close > 0 else 0
-                                    if price_change_pct > 1.0:  # >100% price change = likely corporate action
-                                        logger.warning(
-                                            f"[VWAP RESET] {symbol} - Corporate action detected: "
-                                            f"price jumped from ${last_close:.2f} to ${current_close:.2f} "
-                                            f"({price_change_pct*100:.1f}% change). Resetting VWAP."
-                                        )
-                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
-                                
+                                    if last_close and last_close > 0:
+                                        price_change_pct = abs(close - last_close) / last_close
+                                        if price_change_pct > 1.0:
+                                            logger.warning(f"[VWAP RESET] {symbol} - Corporate action detected: price changed {price_change_pct*100:.1f}%; resetting VWAP")
+                                            vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
+
                                 vwap_candles[symbol].append(candle)
                                 vwap_cum_vol[symbol] += volume
-                                vwap_cum_pv[symbol] += (
-                                    (high + low + close) / 3) * volume
-                                
-                                # 🚨 CRITICAL FIX: Update last_trade_price/time from candle as fallback
-                                # Use REAL candle close time for freshness validation (don't fake timestamps)
+                                vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+
+                                # Update last trade fallback if trades are stale
                                 current_trade_time = last_trade_time.get(symbol)
                                 candle_close_time = start_time + timedelta(minutes=1)
-                                
-                                # Update ONLY if: no trade data OR trade data is older than candle close
                                 if current_trade_time is None or current_trade_time < candle_close_time:
                                     last_trade_price[symbol] = close
-                                    last_trade_time[symbol] = candle_close_time  # Use REAL candle time, not now()
-                                    logger.info(f"[PRICE FALLBACK] {symbol} - Using candle close ${close:.2f} at {candle_close_time} (no fresh trades)")
-                                
-                                await on_new_candle(symbol, open_, high, low,
-                                                    close, volume, start_time)
-                                # Process all pending alerts and send only the best one
-                                if symbol == "OCTO":
-                                    logger.info(
-                                        f"[🚨 OCTO DEBUG] About to call send_best_alert for {symbol}"
-                                    )
-                                await send_best_alert(symbol)
-                            elif event.get("ev") == "LULD":
-                                # Handle LULD (Limit Up/Limit Down) events - Polygon's official halt detection!
-                                # Robust symbol extraction - Polygon uses different keys across feeds
-                                symbol = event.get("sym") or event.get("T") or event.get("ticker") or event.get("symbol")
-                                high_limit = event.get("h")  # High price limit
-                                low_limit = event.get("l")  # Low price limit
-                                timestamp = event.get(
-                                    "t", 0)  # Unix timestamp in milliseconds
-                                indicators = event.get("i",
-                                                       [])  # Indicators array
+                                    last_trade_time[symbol] = candle_close_time
+                                    logger.info(f"[PRICE FALLBACK] {symbol} - Using candle close ${close:.2f} at {candle_close_time}")
 
-                                # 🔍 DEBUG: Log raw LULD event for diagnosis
-                                logger.info(f"[LULD RAW EVENT] keys={list(event.keys())} symbol={symbol} event={event}")
-                                
-                                if symbol and timestamp:
-                                    # Format halt key for deduplication
-                                    # 🚨 CRITICAL FIX: Polygon LULD timestamps are in NANOSECONDS, divide by 1,000,000,000 to get seconds
-                                    halt_time = _polygon_ts_to_datetime(timestamp)
-                                    if halt_time is None:
-                                        logger.debug(f"[LULD SKIP] {symbol} - Unparseable LULD timestamp: {timestamp}")
-                                        continue
-                                    eastern = pytz.timezone("America/New_York")
-                                    halt_time_et = halt_time.astimezone(eastern)
-                                    halt_key = f"{symbol}_{halt_time_et.strftime('%H:%M:%S')}_LULD"
+                                await on_new_candle(symbol, open_, high, low, close, volume, start_time)
+                                if pending_alerts.get(symbol):
+                                    await send_best_alert(symbol)
 
-                                    # 🚨 TIME-BASED DEDUPLICATION: Skip if we alerted on this symbol in last 5 minutes
-                                    # This prevents spam when scanner reconnects and Polygon resends old LULD events
-                                    now = datetime.now(timezone.utc)
-                                    last_halt_time = halt_last_alert_time.get(symbol)
-                                    if last_halt_time and (now - last_halt_time).total_seconds() < 300:  # 5 minutes
-                                        time_since = int((now - last_halt_time).total_seconds())
-                                        logger.info(f"[LULD SKIP] {symbol} - Already alerted {time_since}s ago (within 5min window)")
-                                        continue
-                                    
-                                    # Skip if already processed this exact halt
-                                    if halt_key in halted_symbols:
-                                        logger.info(f"[LULD SKIP] {symbol} - Duplicate halt key: {halt_key}")
-                                        continue
+                            # LULD / HALT event
+                            elif ev == "LULD":
+                                # Robust extraction
+                                symbol = event.get("sym") or event.get("ticker") or event.get("T") or event.get("symbol")
+                                high_limit = event.get("h")
+                                low_limit = event.get("l")
+                                timestamp = event.get("t")
+                                indicators = event.get("i", [])
 
-                                    halted_symbols.add(halt_key)
+                                logger.info(f"[LULD RAW EVENT] keys={list(event.keys())} symbol={symbol}")
+                                if not symbol or not timestamp:
+                                    logger.debug("[LULD SKIP] Missing symbol or timestamp")
+                                    continue
 
-                                    # 🚨🚨 SPECIAL HALT HANDLING - BULLETPROOF 🚨🚨
-                                    logger.warning(f"[LULD DETECTED] {symbol} halt at {halt_time_et.strftime('%I:%M:%S %p ET')}")
-                                    
-                                    try:
-                                        # Try to get price from multiple sources
-                                        current_price = last_trade_price.get(symbol)
-                                        price_source = "last_trade"
-                                        
-                                        if not current_price:
-                                            logger.info(f"[LULD] {symbol} - No last_trade_price, trying yfinance (non-blocking)...")
-                                            try:
-                                                def _fetch_price():
-                                                    import yfinance as yf
-                                                    ticker_info = yf.Ticker(symbol).info
-                                                    return ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
-                                                
-                                                loop = asyncio.get_running_loop()
-                                                current_price = await loop.run_in_executor(None, _fetch_price)
-                                                price_source = "yfinance"
-                                            except Exception as yf_error:
-                                                logger.warning(f"[LULD] {symbol} - yfinance failed: {yf_error}")
-                                        
-                                        if not current_price and symbol in candles and len(candles[symbol]) > 0:
+                                halt_time = _polygon_ts_to_datetime(timestamp)
+                                if halt_time is None:
+                                    logger.debug(f"[LULD SKIP] {symbol} - Unparseable LULD timestamp: {timestamp}")
+                                    continue
+                                halt_time_et = halt_time.astimezone(eastern)
+                                halt_key = f"{symbol}_{halt_time_et.strftime('%H:%M:%S')}_LULD"
+
+                                # Deduplicate using halt_last_alert_time and halted_symbols
+                                now = datetime.now(timezone.utc)
+                                last_halt_time = halt_last_alert_time.get(symbol)
+                                if last_halt_time and (now - last_halt_time).total_seconds() < 300:
+                                    logger.info(f"[LULD SKIP] {symbol} - Recently alerted, skipping")
+                                    continue
+                                if halt_key in halted_symbols:
+                                    logger.info(f"[LULD SKIP] {symbol} - Duplicate halt key: {halt_key}")
+                                    continue
+                                halted_symbols.add(halt_key)
+
+                                logger.warning(f"[LULD DETECTED] {symbol} halt at {halt_time_et.strftime('%I:%M:%S %p ET')}")
+
+                                try:
+                                    # Attempt to get a price
+                                    current_price = last_trade_price.get(symbol)
+                                    price_source = "last_trade"
+
+                                    if not current_price:
+                                        # Try yfinance non-blocking via executor
+                                        try:
+                                            def _fetch_price():
+                                                import yfinance as yf
+                                                info = yf.Ticker(symbol).info
+                                                return info.get('currentPrice') or info.get('regularMarketPrice')
+                                            loop = asyncio.get_running_loop()
+                                            current_price = await loop.run_in_executor(io_executor, _fetch_price)
+                                            price_source = "yfinance"
+                                        except Exception as e:
+                                            logger.warning(f"[LULD] yfinance failed for {symbol}: {e}")
+
+                                    if not current_price and candles.get(symbol):
+                                        if len(candles[symbol]) > 0:
                                             current_price = candles[symbol][-1]['close']
                                             price_source = "candle"
                                             logger.info(f"[LULD] {symbol} - Using candle price ${current_price:.2f}")
 
-                                        float_shares = await get_float_shares(symbol)
-                                        
-                                        # 🚨 STRICT HALT FILTERING: Only alert if stock meets bot criteria
-                                        # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
-                                        should_alert = False
-                                        filter_reason = None
-                                        
-                                        # Price must be known and ≤$15 to alert
-                                        if not current_price:
-                                            filter_reason = "no price data available"
+                                    float_shares = await get_float_shares(symbol)
+
+                                    # Strict filtering: price <= PRICE_THRESHOLD and float within range or exception
+                                    should_alert = False
+                                    filter_reason = None
+                                    if not current_price:
+                                        filter_reason = "no price data available"
+                                        logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
+                                    elif current_price > PRICE_THRESHOLD:
+                                        filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
+                                        logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
+                                    else:
+                                        if float_shares is None and symbol not in FLOAT_EXCEPTION_SYMBOLS:
+                                            filter_reason = "no float data available"
                                             logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-                                        elif current_price > PRICE_THRESHOLD:
-                                            should_alert = False
-                                            filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
+                                        elif (float_shares is not None and not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)
+                                              and symbol not in FLOAT_EXCEPTION_SYMBOLS):
+                                            filter_reason = f"float {float_shares/1e6:.1f}M out of range"
                                             logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
                                         else:
-                                            # Price is valid, check float
-                                            if float_shares is None:
-                                                filter_reason = "no float data available"
-                                                logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-                                            elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
-                                                filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
-                                                logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-                                            else:
-                                                # Stock meets all criteria!
-                                                should_alert = True
-                                                logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
-                                        
-                                        if should_alert:
-                                            # 🔍 HALT VERIFICATION: Re-check NASDAQ before alerting
-                                            halt_time_str = halt_time_et.strftime('%H:%M:%S')
-                                            is_verified = await verify_halt_on_nasdaq(symbol, halt_time_str)
-                                            
-                                            if not is_verified:
-                                                logger.warning(f"[LULD BLOCKED] {symbol} - Halt NOT verified on NASDAQ, skipping alert (prevents false positive)")
-                                                continue
-                                            
-                                            float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
-                                            price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
-                                            
-                                            # Determine halt reason from indicators
-                                            halt_reason = "Volatility Halt"
-                                            if 1 in indicators:
-                                                halt_reason = "Limit Up Halt"
-                                            elif 2 in indicators:
-                                                halt_reason = "Limit Down Halt"
+                                            should_alert = True
+                                            logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6 if float_shares else 'Unknown'}")
 
-                                            # Format price limits safely (fix f-string ternary bug)
-                                            high_limit_display = f"${high_limit:.2f}" if high_limit else "N/A"
-                                            low_limit_display = f"${low_limit:.2f}" if low_limit else "N/A"
+                                    if should_alert:
+                                        # Double-check via NASDAQ scrape to avoid false positives
+                                        halt_time_str = halt_time_et.strftime('%H:%M:%S')
+                                        is_verified = await verify_halt_on_nasdaq(symbol, halt_time_str)
+                                        if not is_verified:
+                                            logger.warning(f"[LULD BLOCKED] {symbol} - Halt not verified on NASDAQ")
+                                            continue
 
-                                            # Format LULD halt alert
-                                            alert_msg = f"""🛑 <b>LULD HALT ALERT</b> (Polygon Official)
-                                            
-<b>Symbol:</b> {symbol}
-<b>Price:</b> {price_display}
-<b>Float:</b> {float_display} shares
-<b>Halt Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}
-<b>Reason:</b> {halt_reason}
-<b>High Limit:</b> {high_limit_display}
-<b>Low Limit:</b> {low_limit_display}
-<b>Status:</b> VOLATILITY HALT ⚠️
+                                        float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                                        price_display = f"${current_price:.2f}" if current_price else "Unknown"
+                                        halt_reason = "Volatility Halt"
+                                        if 1 in indicators:
+                                            halt_reason = "Limit Up Halt"
+                                        elif 2 in indicators:
+                                            halt_reason = "Limit Down Halt"
 
-🚀 <i>Real-time via Polygon LULD feed</i>"""
+                                        alert_msg = (
+                                            f"🛑 <b>LULD HALT ALERT</b>\n\n"
+                                            f"<b>Symbol:</b> {escape_html(symbol)}\n"
+                                            f"<b>Price:</b> {price_display}\n"
+                                            f"<b>Float:</b> {float_display} shares\n"
+                                            f"<b>Halt Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n"
+                                            f"<b>Reason:</b> {halt_reason}\n\n"
+                                            f"🚀 <i>Real-time via Polygon LULD feed</i>"
+                                        )
+                                        await send_all_alerts(alert_msg)
+                                        log_event(
+                                            "polygon_luld_halt", symbol,
+                                            current_price if current_price else 0, 0, halt_time, {
+                                                "halt_reason": halt_reason,
+                                                "high_limit": high_limit,
+                                                "low_limit": low_limit,
+                                                "indicators": indicators,
+                                                "float_shares": float_shares,
+                                                "price_source": price_source,
+                                                "data_source": "polygon_luld"
+                                            })
+                                        halt_last_alert_time[symbol] = datetime.now(timezone.utc)
+                                        logger.warning(f"[✅ LULD SENT] {symbol} @ {price_display}")
+                                    else:
+                                        logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
 
-                                            logger.warning(f"[🚨 HALT ALERT] Sending VERIFIED LULD halt for {symbol} @ {price_display} ({price_source})")
-                                            await send_all_alerts(alert_msg)
+                                except Exception as e:
+                                    logger.error(f"[LULD ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
+                                    try:
+                                        emergency_msg = (f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {escape_html(symbol)}\n"
+                                                         f"<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error processing halt details.")
+                                        await send_all_alerts(emergency_msg)
+                                        halt_last_alert_time[symbol] = datetime.now(timezone.utc)
+                                    except Exception:
+                                        pass
 
-                                            # Log halt event
-                                            log_event(
-                                                "polygon_luld_halt", symbol,
-                                                current_price if current_price else 0, 0, halt_time, {
-                                                    "halt_reason": halt_reason,
-                                                    "high_limit": high_limit,
-                                                    "low_limit": low_limit,
-                                                    "indicators": indicators,
-                                                    "float_shares": float_shares,
-                                                    "price_source": price_source,
-                                                    "data_source": "polygon_luld"
-                                                })
-
-                                            # Track when we sent this halt alert (prevents spam on reconnects)
-                                            halt_last_alert_time[symbol] = datetime.now(timezone.utc)
-                                            logger.warning(f"[✅ LULD SENT] {symbol} @ {price_display} - {halt_reason}")
-                                        else:
-                                            logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-
-                                    except Exception as e:
-                                        logger.error(f"[🚨 LULD ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
-                                        # 🚨 EMERGENCY: Try to send alert even on error
-                                        try:
-                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error getting details, sending emergency alert."
-                                            await send_all_alerts(emergency_msg)
-                                            halt_last_alert_time[symbol] = datetime.now(timezone.utc)
-                                            logger.warning(f"[LULD] Sent emergency halt alert for {symbol}")
-                                        except:
-                                            pass
-                                        continue
                     except Exception as e:
-                        logger.error(f"Error processing message: {e}\nRaw: {msg[:200]}", exc_info=True)
+                        logger.error(f"[WS ERROR] Error processing message: {e} | Raw: {s[:200]}", exc_info=True)
 
         except Exception as e:
             connection_attempts += 1
             logger.warning(f"[CONNECTION ERROR] Websocket error: {e}")
 
-            # Handle connection limit errors with exponential backoff
-            if ("max_connections" in str(e).lower()
-                    or "connection" in str(e).lower()
-                    or "limit" in str(e).lower()
-                    or "policy violation" in str(e).lower()
-                    or "1008" in str(e)):
-
-                logger.warning(
-                    f"[🚨 CONNECTION LIMIT] Connection limit/policy violation detected!"
-                )
-                logger.warning(
-                    f"[🚨 CONNECTION LIMIT] Backing off for {connection_backoff_delay} seconds..."
-                )
-
-                # Connection alerts DISABLED - user only wants trade alerts, not infrastructure spam
-                logger.info("[CONNECTION] Silently backing off, no user alert sent")
-
+            # Heuristic backoff handling
+            err_text = str(e).lower()
+            if ("max_connections" in err_text or "limit" in err_text or "policy violation" in err_text or "1008" in err_text):
+                logger.warning(f"[CONNECTION LIMIT] Backing off for {connection_backoff_delay}s (no user alert)")
                 await asyncio.sleep(connection_backoff_delay)
-
-                # Exponential backoff: 15s → 30s → 60s → 120s → 300s (max 5min)
-                connection_backoff_delay = min(connection_backoff_delay * 2,
-                                               max_backoff_delay)
-
-            elif "keepalive" in str(e).lower() or "ping" in str(
-                    e).lower() or "1011" in str(e):
-                logger.info(
-                    "[CONNECTION] Keepalive/ping timeout - reconnecting in 10 seconds..."
-                )
+                connection_backoff_delay = min(connection_backoff_delay * 2, max_backoff_delay)
+            elif ("keepalive" in err_text or "ping" in err_text or "1011" in err_text):
+                logger.info("[CONNECTION] Keepalive/ping issue - reconnecting in 10s")
                 await asyncio.sleep(10)
             else:
-                logger.warning(
-                    f"[CONNECTION] General error - reconnecting in 30 seconds..."
-                )
+                logger.warning("[CONNECTION] General error - reconnecting in 30s")
                 await asyncio.sleep(30)
 
 
 async def verify_halt_on_nasdaq(symbol, halt_time_str):
-    """🔍 HALT VERIFICATION: Re-check NASDAQ to confirm halt is still active
-    
-    Prevents false positives by verifying halt 10 seconds after initial detection.
-    Returns True if halt is confirmed on NASDAQ, False otherwise.
-    
-    🚀 PERFORMANCE: Reuses global http_session instead of creating new session.
-    """
+    """Verify a halt exists on NASDAQ halts page (simple HTML scrape). Returns True if found."""
     from bs4 import BeautifulSoup
-    
     try:
         logger.info(f"[HALT VERIFY] Waiting 10s to verify {symbol} halt at {halt_time_str}...")
-        await asyncio.sleep(10)  # Wait 10 seconds
-        
-        # 🚀 Reuse global http_session for better performance
-        async with http_session.get("https://www.nasdaqtrader.com/trader.aspx?id=tradehalts", 
-                                     timeout=aiohttp.ClientTimeout(total=10)) as response:
-            if response.status == 200:
-                html_text = await response.text()
-                soup = BeautifulSoup(html_text, 'html.parser')
-                table = soup.find('table', {'id': 'Trading_Halts'})
-                
-                if table:
-                    rows = table.find_all('tr')[1:]  # Skip header
-                    for row in rows:
-                        cols = row.find_all('td')
-                        if len(cols) >= 9:
-                            nasdaq_symbol = cols[0].text.strip()
-                            nasdaq_halt_time = cols[6].text.strip()
-                            
-                            # Match symbol and halt time
-                            if nasdaq_symbol == symbol and nasdaq_halt_time == halt_time_str:
-                                logger.info(f"[HALT VERIFY] ✅ {symbol} halt CONFIRMED on NASDAQ")
-                                return True
-        
-        logger.warning(f"[HALT VERIFY] ❌ {symbol} halt NOT found on NASDAQ - likely false positive")
-        return False
-        
+        await asyncio.sleep(10)
+        if http_session is None:
+            logger.warning("[HALT VERIFY] No http_session available, assuming halt true (fail-safe)")
+            return True
+        url = "https://www.nasdaqtrader.com/trader.aspx?id=tradehalts"
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with http_session.get(url, timeout=timeout) as response:
+            if response.status != 200:
+                logger.warning(f"[HALT VERIFY] NASDAQ returned status {response.status}, assuming halt true")
+                return True
+            html_text = await response.text()
+            soup = BeautifulSoup(html_text, 'html.parser')
+            table = soup.find('table', {'id': 'Trading_Halts'})
+            if not table:
+                logger.info("[HALT VERIFY] NASDAQ table not found; assuming halt true")
+                return True
+            rows = table.find_all('tr')[1:]
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) >= 7:
+                    nasdaq_symbol = cols[0].text.strip()
+                    nasdaq_halt_time = cols[6].text.strip()
+                    if nasdaq_symbol == symbol and nasdaq_halt_time == halt_time_str:
+                        logger.info(f"[HALT VERIFY] ✅ {symbol} halt confirmed on NASDAQ")
+                        return True
+            logger.warning(f"[HALT VERIFY] ❌ {symbol} halt NOT found on NASDAQ")
+            return False
     except Exception as e:
-        logger.error(f"[HALT VERIFY] Error verifying {symbol}: {e}")
-        # If verification fails, assume halt is real (fail-safe)
+        logger.error(f"[HALT VERIFY] Error verifying {symbol}: {e}", exc_info=True)
+        # Fail-safe: assume halt is real to avoid missed critical alerts
         return True
 
 
 async def nasdaq_halt_monitor():
-    """🚨 PRIMARY HALT SOURCE: Monitor NASDAQ every 15 seconds (more reliable than WebSocket)
-    Catches ALL halt types (T1, T2, T5, T12, LUDP, etc.) with relaxed $20 price threshold
-    Also alerts on RESUMES and tracks previously halted stocks to bypass price filter"""
+    """Poll NASDAQ halts page periodically to detect halts/resumes (primary halt source)."""
     import aiohttp
-    from datetime import datetime, timezone
-    import pickle
-    import os
-    
-    seen_halts = set()  # Track processed halts (halt_key)
-    seen_resumes = set()  # Track processed resumes (resume_key)
-    
-    # Load persisted halted symbols (survives restarts)
+    from bs4 import BeautifulSoup
+
+    seen_halts = set()
+    seen_resumes = set()
+
+    # Load persistent halted symbols
     ever_halted_symbols = set()
-    if os.path.exists("halted_symbols.pkl"):
+    halted_file = "halted_symbols.pkl"
+    if os.path.exists(halted_file):
         try:
-            with open("halted_symbols.pkl", "rb") as f:
+            with open(halted_file, "rb") as f:
                 ever_halted_symbols = pickle.load(f)
-            logger.info(f"[HALT TRACKER] Loaded {len(ever_halted_symbols)} previously halted symbols from disk")
-        except:
-            logger.warning("[HALT TRACKER] Could not load halted_symbols.pkl, starting fresh")
+            logger.info(f"[HALT TRACKER] Loaded {len(ever_halted_symbols)} persisted halted symbols")
+        except Exception:
+            logger.warning("[HALT TRACKER] Failed loading persisted halted symbols; starting fresh")
             ever_halted_symbols = set()
-    
+
     while True:
         try:
             ny_tz = pytz.timezone("America/New_York")
             now = datetime.now(timezone.utc).astimezone(ny_tz)
-            
-            # Only run during extended market hours (4am-8pm ET)
+            # Only run during extended market hours
             if not (4 <= now.hour < 20):
-                await asyncio.sleep(300)  # Check every 5 minutes when closed
+                await asyncio.sleep(300)
                 continue
-            
-            # Scrape NASDAQ halt page
+
             url = "https://www.nasdaqtrader.com/trader.aspx?id=tradehalts"
+            if http_session is None:
+                logger.warning("[NASDAQ HALT MONITOR] No http_session available, sleeping 15s")
+                await asyncio.sleep(15)
+                continue
             timeout = aiohttp.ClientTimeout(total=10)
             async with http_session.get(url, timeout=timeout) as response:
-                if response.status == 200:
-                        html_text = await response.text()
-                        
-                        # Parse halt data (NASDAQ uses table format)
-                        from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(html_text, 'html.parser')
-                        
-                        # 🔍 DEBUG: Log NASDAQ scrape status
-                        table = soup.find('table', {'id': 'Trading_Halts'})
-                        logger.info(f"[NASDAQ SCRAPE] status={response.status} content_len={len(html_text)} table_found={bool(table)}")
-                        if table:
-                            rows = table.find_all('tr')[1:]  # Skip header
-                            
-                            for row in rows:
-                                cols = row.find_all('td')
-                                if len(cols) >= 9:  # Need at least 9 columns
-                                    symbol = cols[0].text.strip()              # Column 0: Issue Symbol
-                                    halt_time_str = cols[6].text.strip()       # Column 6: Halt Time (ET)
-                                    resume_time_str = cols[8].text.strip()     # Column 8: Resume Time (ET)
-                                    halt_reason_code = cols[3].text.strip()    # Column 3: Reason Code
-                                    
-                                    # 🔍 DEBUG: Log extracted halt data
-                                    logger.debug(f"[NASDAQ ROW] symbol={symbol} halt_time={halt_time_str} resume_time={resume_time_str} reason={halt_reason_code}")
-                                    
-                                    # Create unique keys
-                                    halt_key = f"{symbol}_{halt_time_str}_{halt_reason_code}"
-                                    resume_key = f"{symbol}_{halt_time_str}_{resume_time_str}"
-                                    
-                                    # Check if this is a RESUME (has resume time and we haven't alerted on this resume yet)
-                                    if resume_time_str and resume_time_str != '':
-                                        if resume_key not in seen_resumes:
-                                            seen_resumes.add(resume_key)
-                                            
-                                            # 🟢 RESUME ALERT
-                                            logger.warning(f"[NASDAQ RESUME] {symbol} resumed at {resume_time_str} ET (halted at {halt_time_str})")
-                                            
-                                            try:
-                                                # Get current price
-                                                current_price = last_trade_price.get(symbol)
-                                                price_source = "last_trade"
-                                                
-                                                if not current_price and symbol in candles and len(candles[symbol]) > 0:
-                                                    current_price = candles[symbol][-1]['close']
-                                                    price_source = "candle"
-                                                
-                                                # Get float data
-                                                float_shares = await get_float_shares(symbol)
-                                                
-                                                # 🚨 STRICT RESUME FILTERING: Only alert if stock meets bot criteria
-                                                # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
-                                                should_alert = False
-                                                filter_reason = None
-                                                
-                                                # Price must be known and ≤$15 to alert
-                                                if not current_price:
-                                                    filter_reason = "no price data available"
-                                                    logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
-                                                elif current_price > PRICE_THRESHOLD:
-                                                    filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
-                                                    logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
-                                                else:
-                                                    # Price is valid, check float
-                                                    if float_shares is None:
-                                                        filter_reason = "no float data available"
-                                                        logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
-                                                    elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
-                                                        filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
-                                                        logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
-                                                    else:
-                                                        # Stock meets all criteria!
-                                                        should_alert = True
-                                                        logger.info(f"[RESUME PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
-                                                
-                                                if should_alert:
-                                                    price_display = f"${current_price:.2f}"
-                                                    float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
-                                                    
-                                                    alert_msg = f"""🟢 <b>TRADING RESUMED</b> (NASDAQ)
+                if response.status != 200:
+                    logger.warning(f"[NASDAQ SCRAPE] non-200 status: {response.status}")
+                    await asyncio.sleep(15)
+                    continue
+                html_text = await response.text()
+                soup = BeautifulSoup(html_text, 'html.parser')
+                table = soup.find('table', {'id': 'Trading_Halts'})
+                logger.info(f"[NASDAQ SCRAPE] status={response.status} table_found={bool(table)} content_len={len(html_text)}")
+                if not table:
+                    await asyncio.sleep(15)
+                    continue
+                rows = table.find_all('tr')[1:]
+                for row in rows:
+                    cols = row.find_all('td')
+                    if len(cols) < 9:
+                        continue
+                    symbol = cols[0].text.strip()
+                    halt_time_str = cols[6].text.strip()
+                    resume_time_str = cols[8].text.strip() if len(cols) > 8 else ""
+                    halt_reason_code = cols[3].text.strip()
 
-<b>Symbol:</b> {symbol}
-<b>Price:</b> {price_display}
-<b>Float:</b> {float_display} shares
-<b>Halted:</b> {halt_time_str} ET
-<b>Resumed:</b> {resume_time_str} ET
-<b>Reason:</b> {halt_reason_code}
-<b>Status:</b> BACK TO TRADING ▶️
+                    halt_key = f"{symbol}_{halt_time_str}_{halt_reason_code}"
+                    resume_key = f"{symbol}_{halt_time_str}_{resume_time_str}"
 
-🚀 <i>Real-time via NASDAQ feed</i>"""
-                                                    
-                                                    logger.warning(f"[🟢 RESUME ALERT] Sending resume for {symbol} @ {price_display}")
-                                                    await send_all_alerts(alert_msg)
-                                                    
-                                                    # Log resume event
-                                                    log_event(
-                                                        "nasdaq_resume", symbol,
-                                                        current_price if current_price else 0, 0, now, {
-                                                            "halt_time": halt_time_str,
-                                                            "resume_time": resume_time_str,
-                                                            "halt_code": halt_reason_code,
-                                                            "data_source": "nasdaq_scrape",
-                                                            "float_shares": float_shares,
-                                                            "price_source": price_source
-                                                        })
-                                            except Exception as e:
-                                                logger.error(f"[RESUME ERROR] Error processing resume for {symbol}: {e}")
-                                        continue  # Don't process as halt
-                                    
-                                    # Process as HALT (no resume time yet)
-                                    if halt_key in seen_halts:
-                                        continue
-                                    
-                                    seen_halts.add(halt_key)
-                                    
-                                    # Track and persist halted symbols (survives restarts)
-                                    if symbol not in ever_halted_symbols:
-                                        ever_halted_symbols.add(symbol)
-                                        try:
-                                            # 🔒 Atomic write: temp file + rename prevents corruption
-                                            # 🚀 PERFORMANCE: Run in thread executor to prevent blocking
-                                            tmp_file = "halted_symbols.pkl.tmp"
-                                            
-                                            def write_halt_pickle():
-                                                with open(tmp_file, "wb") as f:
-                                                    pickle.dump(ever_halted_symbols, f)
-                                            
-                                            loop = asyncio.get_event_loop()
-                                            await loop.run_in_executor(io_executor, write_halt_pickle)
-                                            os.replace(tmp_file, "halted_symbols.pkl")
-                                            logger.info(f"[HALT TRACKER] Added {symbol} to persistent halt tracker ({len(ever_halted_symbols)} total)")
-                                        except Exception as e:
-                                            logger.error(f"[HALT TRACKER] Failed to save halted symbols: {e}")
-                                    
-                                    # 🚨🚨 SPECIAL HALT HANDLING - BULLETPROOF 🚨🚨
-                                    logger.warning(f"[NASDAQ DETECTED] {symbol} halt at {halt_time_str} ET (Reason: {halt_reason_code})")
-                                    
-                                    try:
-                                        # Try to get price from multiple sources with detailed logging
-                                        current_price = last_trade_price.get(symbol)
-                                        price_source = "last_trade"
-                                        
-                                        if not current_price:
-                                            logger.info(f"[HALT PRICE] {symbol} - No last_trade_price, trying yfinance (non-blocking)...")
-                                            try:
-                                                def _fetch_price():
-                                                    import yfinance as yf
-                                                    ticker_info = yf.Ticker(symbol).info
-                                                    return ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
-                                                
-                                                loop = asyncio.get_running_loop()
-                                                current_price = await loop.run_in_executor(None, _fetch_price)
-                                                price_source = "yfinance"
-                                                if current_price:
-                                                    logger.info(f"[HALT PRICE] {symbol} - Got ${current_price:.2f} from yfinance")
-                                            except Exception as yf_error:
-                                                logger.warning(f"[HALT PRICE] {symbol} - yfinance failed: {yf_error}")
-                                        
-                                        if not current_price and symbol in candles and len(candles[symbol]) > 0:
-                                            current_price = candles[symbol][-1]['close']
-                                            price_source = "candle"
-                                            logger.info(f"[HALT PRICE] {symbol} - Using candle price ${current_price:.2f}")
-                                        
-                                        # Get float with detailed logging
-                                        float_shares = await get_float_shares(symbol)
-                                        if float_shares:
-                                            logger.info(f"[HALT FLOAT] {symbol} - Float: {float_shares/1e6:.2f}M shares")
-                                        else:
-                                            logger.warning(f"[HALT FLOAT] {symbol} - Could not get float data (will not block halt alert)")
-                                        
-                                        # 🚨 STRICT HALT FILTERING: Only alert if stock meets bot criteria
-                                        # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
-                                        should_alert = False
-                                        filter_reason = None
-                                        
-                                        # Price must be known and ≤$15 to alert
-                                        if not current_price:
-                                            filter_reason = "no price data available"
-                                            logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
-                                        elif current_price > PRICE_THRESHOLD:
-                                            should_alert = False
-                                            filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
-                                            logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
-                                        else:
-                                            # Price is valid, check float
-                                            if float_shares is None:
-                                                filter_reason = "no float data available"
-                                                logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
-                                            elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
-                                                filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
-                                                logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
-                                            else:
-                                                # Stock meets all criteria!
-                                                should_alert = True
-                                                logger.info(f"[NASDAQ PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
-                                        
-                                        if should_alert:
-                                            # 🔍 HALT VERIFICATION: Already on NASDAQ, no need to re-verify
-                                            # (This IS the NASDAQ scraper, so halt is already confirmed)
-                                            float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
-                                            price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
-                                            
-                                            logger.warning(f"[HALT APPROVED] {symbol} - Sending alert! Price: {price_display}, Float: {float_display}")
-                                            
-                                            # Decode halt reason
-                                            halt_reasons = {
-                                                'T1': 'News Pending',
-                                                'T2': 'News Released',
-                                                'T5': 'Single Security Trading Pause',
-                                                'T6': 'Regulatory Concern',
-                                                'T8': 'ETF Component Security Halt',
-                                                'T12': 'Additional Information Requested',
-                                                'LUDP': 'Volatility Trading Pause',
-                                                'LUDS': 'Straddle Condition',
-                                                'MWC': 'Market-Wide Circuit Breaker',
-                                                'IPO1': 'IPO Not Ready',
-                                                'M': 'Volatility Trading Pause',
-                                            }
-                                            halt_reason = halt_reasons.get(halt_reason_code, halt_reason_code)
-                                            
-                                            # Send alert
-                                            alert_msg = f"""🛑 <b>TRADING HALT</b> (NASDAQ)
+                    # Resume handling
+                    if resume_time_str:
+                        if resume_key in seen_resumes:
+                            continue
+                        seen_resumes.add(resume_key)
+                        logger.warning(f"[NASDAQ RESUME] {symbol} resumed at {resume_time_str} ET (halted at {halt_time_str})")
+                        try:
+                            current_price = last_trade_price.get(symbol)
+                            price_source = "last_trade"
+                            if not current_price and candles.get(symbol):
+                                if len(candles[symbol]) > 0:
+                                    current_price = candles[symbol][-1]['close']
+                                    price_source = "candle"
+                            float_shares = await get_float_shares(symbol)
+                            should_alert = False
+                            filter_reason = None
+                            if not current_price:
+                                filter_reason = "no price data"
+                            elif current_price > PRICE_THRESHOLD:
+                                filter_reason = f"price ${current_price:.2f} > {PRICE_THRESHOLD}"
+                            else:
+                                if float_shares is None and symbol not in FLOAT_EXCEPTION_SYMBOLS:
+                                    filter_reason = "no float data"
+                                elif (float_shares is not None and not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)
+                                      and symbol not in FLOAT_EXCEPTION_SYMBOLS):
+                                    filter_reason = f"float {float_shares/1e6:.1f}M out of range"
+                                else:
+                                    should_alert = True
+                            if should_alert:
+                                price_display = f"${current_price:.2f}" if current_price else "N/A"
+                                float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                                alert_msg = (
+                                    f"🟢 <b>TRADING RESUMED</b> (NASDAQ)\n\n"
+                                    f"<b>Symbol:</b> {escape_html(symbol)}\n"
+                                    f"<b>Price:</b> {price_display}\n"
+                                    f"<b>Float:</b> {float_display} shares\n"
+                                    f"<b>Halted:</b> {halt_time_str} ET\n"
+                                    f"<b>Resumed:</b> {resume_time_str} ET\n\n"
+                                    f"🚀 <i>Real-time via NASDAQ feed</i>"
+                                )
+                                await send_all_alerts(alert_msg)
+                                log_event("nasdaq_resume", symbol, current_price if current_price else 0, 0, datetime.now(timezone.utc), {
+                                    "halt_time": halt_time_str,
+                                    "resume_time": resume_time_str,
+                                    "halt_code": halt_reason_code,
+                                    "data_source": "nasdaq_scrape",
+                                    "float_shares": float_shares,
+                                    "price_source": price_source
+                                })
+                        except Exception as e:
+                            logger.error(f"[RESUME ERROR] {symbol}: {e}", exc_info=True)
+                        continue  # skip further halt processing for resumed row
 
-<b>Symbol:</b> {symbol}
-<b>Price:</b> {price_display}
-<b>Float:</b> {float_display} shares
-<b>Halt Time:</b> {halt_time_str} ET
-<b>Reason:</b> {halt_reason} ({halt_reason_code})
-<b>Status:</b> HALTED ⏸️
+                    # HALT processing
+                    if halt_key in seen_halts:
+                        continue
+                    seen_halts.add(halt_key)
 
-🚀 <i>Real-time via NASDAQ feed</i>"""
-                                            
-                                            logger.warning(f"[🚨 HALT ALERT] Sending NASDAQ halt for {symbol} @ {price_display} ({price_source})")
-                                            await send_all_alerts(alert_msg)
-                                            
-                                            # Log halt event
-                                            log_event(
-                                                "nasdaq_halt", symbol,
-                                                current_price if current_price else 0, 0, now, {
-                                                    "halt_reason": halt_reason,
-                                                    "halt_code": halt_reason_code,
-                                                    "halt_time": halt_time_str,
-                                                    "float_shares": float_shares,
-                                                    "price_source": price_source,
-                                                    "data_source": "nasdaq_scrape"
-                                                })
-                                            
-                                            logger.warning(f"[✅ NASDAQ SENT] {symbol} @ {price_display} - {halt_reason}")
-                                        else:
-                                            float_str = f"{float_shares/1e6:.1f}M" if float_shares else "None"
-                                            price_str = f"${current_price:.2f}" if current_price else "None"
-                                            logger.warning(f"[❌ HALT FILTERED] {symbol} - {filter_reason} (Price: {price_str}, Float: {float_str})")
-                                        
-                                    except Exception as e:
-                                        logger.error(f"[🚨 NASDAQ ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
-                                        # 🚨 EMERGENCY: Try to send alert even on error
-                                        try:
-                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_str} ET\n<b>Source:</b> NASDAQ\n\n⚠️ Error getting details, sending emergency alert."
-                                            await send_all_alerts(emergency_msg)
-                                            logger.warning(f"[NASDAQ] Sent emergency halt alert for {symbol}")
-                                        except:
-                                            pass
-                                        continue
-                        
+                    if symbol not in ever_halted_symbols:
+                        ever_halted_symbols.add(symbol)
+                        # persist asynchronously
+                        def write_halted():
+                            tmp = halted_file + ".tmp"
+                            try:
+                                with open(tmp, "wb") as f:
+                                    pickle.dump(ever_halted_symbols, f)
+                                os.replace(tmp, halted_file)
+                            except Exception as e:
+                                logger.error(f"[HALT TRACKER] Failed to persist halted symbols: {e}")
+                        try:
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(io_executor, write_halted)
+                            logger.info(f"[HALT TRACKER] Persisted new halted symbol {symbol}")
+                        except RuntimeError:
+                            write_halted()
+
+                    # Detailed halt handling similar to Polygon LULD path
+                    logger.warning(f"[NASDAQ DETECTED] {symbol} halt at {halt_time_str} ET (Reason: {halt_reason_code})")
+                    try:
+                        current_price = last_trade_price.get(symbol)
+                        price_source = "last_trade"
+                        if not current_price and candles.get(symbol) and len(candles[symbol]) > 0:
+                            current_price = candles[symbol][-1]['close']
+                            price_source = "candle"
+                        float_shares = await get_float_shares(symbol)
+                        should_alert = False
+                        filter_reason = None
+                        if not current_price:
+                            filter_reason = "no price data"
+                            logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                        elif current_price > PRICE_THRESHOLD:
+                            filter_reason = f"price {current_price:.2f} > {PRICE_THRESHOLD}"
+                            logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                        else:
+                            if float_shares is None and symbol not in FLOAT_EXCEPTION_SYMBOLS:
+                                filter_reason = "no float data"
+                                logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                            elif (float_shares is not None and not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)
+                                  and symbol not in FLOAT_EXCEPTION_SYMBOLS):
+                                filter_reason = f"float {float_shares/1e6:.1f}M out of range"
+                                logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                            else:
+                                should_alert = True
+                                logger.info(f"[NASDAQ PASS] {symbol} - Price {current_price:.2f}, Float ok")
+
+                        if should_alert:
+                            halt_reason_map = {
+                                'T1': 'News Pending',
+                                'T2': 'News Released',
+                                'T5': 'Single Security Trading Pause',
+                                'T6': 'Regulatory Concern',
+                                'T8': 'ETF Component Security Halt',
+                                'T12': 'Additional Information Requested',
+                                'LUDP': 'Volatility Trading Pause',
+                                'LUDS': 'Straddle Condition',
+                                'MWC': 'Market-Wide Circuit Breaker',
+                                'IPO1': 'IPO Not Ready',
+                                'M': 'Volatility Trading Pause',
+                            }
+                            hr = halt_reason_map.get(halt_reason_code, halt_reason_code)
+                            price_display = f"${current_price:.2f}" if current_price else "N/A"
+                            float_display = f"{float_shares/1e6:.1f}M" if float_shares else "Unknown"
+                            alert_msg = (
+                                f"🛑 <b>TRADING HALT</b> (NASDAQ)\n\n"
+                                f"<b>Symbol:</b> {escape_html(symbol)}\n"
+                                f"<b>Price:</b> {price_display}\n"
+                                f"<b>Float:</b> {float_display} shares\n"
+                                f"<b>Halt Time:</b> {halt_time_str} ET\n"
+                                f"<b>Reason:</b> {hr}\n\n"
+                                f"🚀 <i>Real-time via NASDAQ feed</i>"
+                            )
+                            await send_all_alerts(alert_msg)
+                            log_event("nasdaq_halt", symbol, current_price if current_price else 0, 0, datetime.now(timezone.utc), {
+                                "halt_reason": hr,
+                                "halt_code": halt_reason_code,
+                                "halt_time": halt_time_str,
+                                "float_shares": float_shares,
+                                "price_source": price_source,
+                                "data_source": "nasdaq_scrape"
+                            })
+                            logger.warning(f"[✅ NASDAQ SENT] {symbol} @ {price_display} - {hr}")
+                        else:
+                            logger.warning(f"[❌ HALT FILTERED] {symbol} - {filter_reason}")
+                    except Exception as e:
+                        logger.error(f"[NASDAQ HALT ERROR] {symbol}: {e}", exc_info=True)
+
         except Exception as e:
-            logger.error(f"[NASDAQ HALT MONITOR] Error: {e}")
-        
-        # 🚨 PRIMARY HALT SOURCE: Check every 15 seconds for fast detection (more reliable than WebSocket)
+            logger.error(f"[NASDAQ HALT MONITOR] Error: {e}", exc_info=True)
+
+        # Run every 15 seconds
         await asyncio.sleep(15)
 
 
@@ -3810,109 +3673,100 @@ async def ml_training_loop():
     """Background task for ML training and outcome tracking"""
     while True:
         try:
-            # Check alert outcomes every 5 minutes
             await check_alert_outcomes()
-
-            # Retrain model once per day at market close
-            ny_time = datetime.now(timezone.utc).astimezone(
-                pytz.timezone("America/New_York"))
-            if ny_time.hour == 20 and ny_time.minute < 5:  # 8:00-8:05 PM ET
+            # Retrain model shortly after market close window
+            ny_time = datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
+            if ny_time.hour == 20 and ny_time.minute < 5:
                 await retrain_model_if_needed()
-
         except Exception as e:
-            logger.error(f"[ML TRAINING] Error in ML training loop: {e}")
-
-        await asyncio.sleep(300)  # 5 minutes
+            logger.error(f"[ML TRAINING] Error: {e}", exc_info=True)
+        await asyncio.sleep(300)
 
 
 async def main():
-    global http_session
-    
-    # ✅ STARTUP: Check critical dependencies
-    logger.info("[STARTUP] Checking dependencies...")
+    global http_session, io_executor
+    logger.info("[STARTUP] Checking critical dependencies...")
+
     missing_deps = []
-    
     try:
-        import bs4
+        import bs4  # noqa: F401
         logger.info("  ✅ BeautifulSoup4 (bs4) available")
     except ImportError:
         missing_deps.append("beautifulsoup4")
         logger.error("  ❌ BeautifulSoup4 (bs4) NOT installed")
-    
+
     try:
-        import yfinance
+        import yfinance  # noqa: F401
         logger.info("  ✅ yfinance available")
     except ImportError:
         missing_deps.append("yfinance")
         logger.error("  ❌ yfinance NOT installed")
-    
+
     if missing_deps:
-        error_msg = f"\n❌ CRITICAL ERROR: Missing required dependencies!\n\nPlease install: {', '.join(missing_deps)}\n\nRun: pip install {' '.join(missing_deps)}\n"
+        error_msg = f"\n❌ CRITICAL ERROR: Missing required dependencies!\nPlease install: {', '.join(missing_deps)}\nRun: pip install {' '.join(missing_deps)}\n"
         logger.error(error_msg)
         raise ImportError(f"Missing dependencies: {', '.join(missing_deps)}")
-    
-    logger.info("[STARTUP] ✅ All dependencies available\n")
-    
-    # 🚀 PERFORMANCE: Initialize reusable HTTP session
-    http_session = aiohttp.ClientSession()
-    logger.info("[HTTP SESSION] Created reusable HTTP session for better performance")
-    
-    logger.info("Main event loop running. Press Ctrl+C to exit.")
-    ingest_task = asyncio.create_task(ingest_polygon_events())
-    # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
-    close_alert_task = asyncio.create_task(market_close_alert_loop())
-    premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
-    # Enable NASDAQ halt monitoring (catches T1, T2, T5, T12 halts that Polygon LULD misses)
-    nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
-    ml_task = asyncio.create_task(ml_training_loop())
+
+    # Create global http_session if not present
+    if http_session is None:
+        timeout = aiohttp.ClientTimeout(total=15)
+        http_session_local = aiohttp.ClientSession(timeout=timeout)
+        http_session = http_session_local
+        logger.info("[HTTP SESSION] Created reusable HTTP session for better performance")
+
+    logger.info("Main event loop starting tasks.")
     try:
+        ingest_task = asyncio.create_task(ingest_polygon_events())
+        close_alert_task = asyncio.create_task(market_close_alert_loop())
+        premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
+        nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
+        ml_task = asyncio.create_task(ml_training_loop())
+
+        # Keep main alive
         while True:
             await asyncio.sleep(60)
     except asyncio.CancelledError:
         logger.info("Main loop cancelled.")
+    except Exception as e:
+        logger.error(f"[MAIN] Unexpected error: {e}", exc_info=True)
+        raise
     finally:
-        ingest_task.cancel()
-        close_alert_task.cancel()
-        premarket_alert_task.cancel()
-        nasdaq_halt_task.cancel()
-        ml_task.cancel()
+        # Cancel background tasks gracefully
+        tasks = [ingest_task, close_alert_task, premarket_alert_task, nasdaq_halt_task, ml_task]
+        for t in tasks:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        # Await cancellation
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
-        # 🚨 FIX: Await cancelled tasks with error handling
-        try:
-            await ingest_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await close_alert_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await premarket_alert_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await nasdaq_halt_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await ml_task
-        except asyncio.CancelledError:
-            pass
-        
-        # 🚀 PERFORMANCE: Close reusable HTTP session
+        # Close http session
         if http_session:
-            await http_session.close()
-            logger.info("[HTTP SESSION] Closed reusable HTTP session")
-        
-        # 🚀 PERFORMANCE: Shutdown thread pool executor with wait=True
-        # This ensures in-flight disk writes (pickle, CSV, JSON) complete safely
-        # Blocking is acceptable here as we're already in shutdown path
-        io_executor.shutdown(wait=True)
-        logger.info("[IO EXECUTOR] Shutdown thread pool executor (waited for in-flight tasks)")
+            try:
+                await http_session.close()
+                logger.info("[HTTP SESSION] Closed HTTP session")
+            except Exception as e:
+                logger.warning(f"[HTTP SESSION] Error closing session: {e}")
+
+        # Shutdown executor (wait for I/O tasks to finish)
+        try:
+            io_executor.shutdown(wait=True)
+            logger.info("[IO EXECUTOR] Shutdown thread pool executor (waited for in-flight tasks)")
+        except Exception as e:
+            logger.warning(f"[IO EXECUTOR] Shutdown failed: {e}")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutting down gracefully...")
+        logger.info("Shutting down gracefully (KeyboardInterrupt)...")
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}", exc_info=True)
