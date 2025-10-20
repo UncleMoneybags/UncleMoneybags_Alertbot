@@ -1262,8 +1262,15 @@ def escape_html(s):
 
 
 def fmt_price(p):
-    """Safe price formatter - returns 'N/A' if price is None to prevent crashes"""
-    return f"{p:.2f}" if p is not None else "N/A"
+    """Safe price formatter with proper decimals for penny stocks"""
+    if p is None:
+        return "N/A"
+    elif p < 1.0:
+        return f"{p:.4f}"  # 4 decimals for penny stocks (shows $0.3398 instead of $0.34)
+    elif p < 10.0:
+        return f"{p:.3f}"  # 3 decimals for $1-$10 stocks
+    else:
+        return f"{p:.2f}"  # 2 decimals for $10+ stocks
 
 
 CANDLE_MAXLEN = 30
@@ -1447,8 +1454,18 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005  # 0.5%+ for early detection
     rising_from_prev = curr_candle['close'] > prev_candle['close'] and prev_momentum >= 0.003  # 0.3%+ from previous
     
-    # Price must be moving UP - BOTH conditions required to prevent false alerts on falling stocks
-    bullish_momentum = is_green_candle and rising_from_prev
+    # 🚨 PENNY STOCK FILTER: Require REAL cent movement, not just percentage
+    curr_price = curr_candle['close']
+    if curr_price < 1.0:
+        # For stocks under $1, require at least 2 cents absolute movement
+        absolute_move = curr_candle['close'] - prev_candle['close']
+        if absolute_move < 0.02:  # Must move at least 2 cents
+            bullish_momentum = False
+        else:
+            bullish_momentum = is_green_candle and rising_from_prev
+    else:
+        # For stocks over $1, use percentage-based momentum
+        bullish_momentum = is_green_candle and rising_from_prev
 
     symbol = curr_candle.get('symbol', '?')
 
