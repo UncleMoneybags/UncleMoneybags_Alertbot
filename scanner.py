@@ -246,7 +246,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
         'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
         'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
-        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'AGQ', 'UGLD', 'DGLD',
+        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD',
         'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ'  # Crypto/quantum ETF-like products
     }
@@ -1924,11 +1924,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not isinstance(vwap_candles[symbol], deque):
         vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
     float_shares = await get_float_shares(symbol)
-    # Check exception list first, then float range
-    # 🚨 FIX: FAIL-OPEN for unknown float (consistent with is_eligible)
-    if symbol not in FLOAT_EXCEPTION_SYMBOLS and float_shares is not None and (
-            not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES)):
-        logger.debug(f"Skipping {symbol} due to float {float_shares}")
+    
+    # 🚨 CRITICAL FIX: Check ALL eligibility criteria (price, float, AND ETF filter)
+    # This was the bug allowing DUST, ZSL, GLL alerts - only checking float, not ETFs!
+    if not is_eligible(symbol, close, float_shares, use_entry_price=True):
+        logger.debug(f"[FILTER BLOCKED] {symbol} - Failed is_eligible check (ETF or criteria mismatch)")
         return
 
     # Log exception processing
