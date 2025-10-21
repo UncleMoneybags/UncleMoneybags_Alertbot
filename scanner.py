@@ -239,6 +239,36 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             )
         return False
 
+    # 🚫 ETF FILTER: Block leveraged/inverse ETFs and common index funds
+    # These have artificial price action and don't represent real stock momentum
+    etf_patterns = ['L', 'S', 'X']  # Common leveraged suffixes (SOXL, JDST, ZSL, TQQQ, etc.)
+    common_etfs = {
+        'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
+        'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
+        'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
+        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'AGQ', 'UGLD', 'DGLD',
+        'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
+        'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ'  # Crypto/quantum ETF-like products
+    }
+    
+    # Block if symbol ends with common ETF suffix (4+ chars ending in L/S/X)
+    if len(symbol) >= 4 and symbol[-1] in etf_patterns:
+        filter_counts["etf_suffix"] = filter_counts.get("etf_suffix", 0) + 1
+        if filter_counts["etf_suffix"] % 50 == 1:
+            logger.info(
+                f"[FILTER DEBUG] {symbol} filtered: ETF suffix pattern detected (count: {filter_counts['etf_suffix']})"
+            )
+        return False
+    
+    # Block if symbol is in known ETF list
+    if symbol in common_etfs:
+        filter_counts["common_etf"] = filter_counts.get("common_etf", 0) + 1
+        if filter_counts["common_etf"] % 50 == 1:
+            logger.info(
+                f"[FILTER DEBUG] {symbol} filtered: Known ETF/structured product (count: {filter_counts['common_etf']})"
+            )
+        return False
+
     # Float check - exception symbols bypass ONLY float filter
     if symbol not in FLOAT_EXCEPTION_SYMBOLS:
         # FAIL-OPEN: If float unknown, ALLOW symbol (only reject when we KNOW float is too high)
@@ -1454,18 +1484,36 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005  # 0.5%+ for early detection
     rising_from_prev = curr_candle['close'] > prev_candle['close'] and prev_momentum >= 0.003  # 0.3%+ from previous
     
-    # 🚨 PENNY STOCK FILTER: Require REAL cent movement, not just percentage
+    # 🚨 TIERED PRICE MOVEMENT FILTER: Require meaningful price moves across all price ranges
+    # Prevents false alerts on noise (IBIO +0.09%, TOVX +0.7¢) while catching real early momentum
     curr_price = curr_candle['close']
+    absolute_move = curr_candle['close'] - prev_candle['close']
+    percent_move = abs(price_momentum)
+    
+    # Tiered thresholds: higher absolute $ move required as price increases
     if curr_price < 1.0:
-        # For stocks under $1, require at least 2 cents absolute movement
-        absolute_move = curr_candle['close'] - prev_candle['close']
-        if absolute_move < 0.02:  # Must move at least 2 cents
-            bullish_momentum = False
-        else:
-            bullish_momentum = is_green_candle and rising_from_prev
+        # Under $1: Require at least 2 cents (≈2%-8% depending on price)
+        min_abs_move = 0.02
+        min_pct_move = 0.0  # Absolute move is the gate
+        threshold_met = absolute_move >= min_abs_move
+    elif curr_price < 5.0:
+        # $1-$5: Require max(0.75%, $0.03) to filter IBIO-style noise
+        min_abs_move = 0.03
+        min_pct_move = 0.0075  # 0.75%
+        threshold_met = absolute_move >= min_abs_move or percent_move >= min_pct_move
+    elif curr_price < 10.0:
+        # $5-$10: Require max(0.5%, $0.05) for early detection
+        min_abs_move = 0.05
+        min_pct_move = 0.005  # 0.5%
+        threshold_met = absolute_move >= min_abs_move or percent_move >= min_pct_move
     else:
-        # For stocks over $1, use percentage-based momentum
-        bullish_momentum = is_green_candle and rising_from_prev
+        # >$10: Require max(0.35%, $0.10) to catch established movers
+        min_abs_move = 0.10
+        min_pct_move = 0.0035  # 0.35%
+        threshold_met = absolute_move >= min_abs_move or percent_move >= min_pct_move
+    
+    # Only pass if base momentum checks AND tiered threshold are met
+    bullish_momentum = is_green_candle and rising_from_prev and threshold_met
 
     symbol = curr_candle.get('symbol', '?')
 
@@ -2358,16 +2406,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         alert_price = get_display_price(symbol, close, candle_time_vs)
         price_str = fmt_price(alert_price)
         rvol_str = f"{spike_data['rvol']:.1f}"
-        move_pct = spike_data['price_move'] * 100
-
-        # Show actual percentage with proper sign
-        if move_pct >= 0:
-            move_str = f"+{move_pct:.1f}%"
-        else:
-            move_str = f"{move_pct:.1f}%"  # Negative sign already included
 
         alert_text = (f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
-                      f"Price: ${price_str} ({move_str})")
+                      f"Price: ${price_str}")
 
         # Add to pending alerts instead of sending immediately
         pending_alerts[symbol].append({
