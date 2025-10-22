@@ -2659,6 +2659,16 @@ async def update_profile_for_day(symbol, day_candles):
     await vol_profile.add_day(symbol, day_candles)
 
 
+def is_warrant(symbol):
+    """Check if symbol is a warrant - filter these from gainers list"""
+    warrant_suffixes = ['W', 'WS', 'WT', 'WW']
+    # Check if symbol ends with warrant suffix (e.g., ABCW, XYZWS)
+    for suffix in warrant_suffixes:
+        if symbol.endswith(suffix) and len(symbol) > len(suffix):
+            return True
+    return False
+
+
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
@@ -2672,6 +2682,11 @@ async def premarket_gainers_alert_loop():
                 logger.info("Sending premarket gainers alert at 9:24:55am ET")
                 gainers = []
                 for sym in premarket_open_prices:
+                    # 🚫 Skip warrants (symbols ending in W, WS, WT, WW)
+                    if is_warrant(sym):
+                        logger.debug(f"[GAINERS FILTER] {sym} - Skipping warrant from gainers list")
+                        continue
+                    
                     if sym in premarket_last_prices and premarket_open_prices[
                             sym] > 0:
                         pct_gain = (premarket_last_prices[sym] -
