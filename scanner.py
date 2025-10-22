@@ -248,7 +248,9 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
         'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD',
         'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
-        'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ'  # Crypto/quantum ETF-like products
+        'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',  # Crypto/quantum ETF-like products
+        'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',  # YieldMax income/covered call ETFs
+        'SLE', 'SMD', 'AMD3', 'SKY', 'SND'  # GraniteShares leveraged products
     }
     
     # Block if symbol ends with common ETF suffix (4+ chars ending in L/S/X)
@@ -3181,35 +3183,11 @@ async def ingest_polygon_events():
                                                 logger.warning(f"[LULD BLOCKED] {symbol} - Halt NOT verified on NASDAQ, skipping alert (prevents false positive)")
                                                 continue
                                             
-                                            float_display = f"{float_shares/1e6:.1f}M" if float_shares else "⚠️ Unknown"
-                                            price_display = f"${current_price:.2f}" if current_price else "⚠️ Unknown"
-                                            
-                                            # Determine halt reason from indicators
-                                            halt_reason = "Volatility Halt"
-                                            if 1 in indicators:
-                                                halt_reason = "Limit Up Halt"
-                                            elif 2 in indicators:
-                                                halt_reason = "Limit Down Halt"
+                                            # Format clean halt alert - just emoji, HALT, ticker, price
+                                            price_str = fmt_price(current_price) if current_price else "?"
+                                            alert_msg = f"🛑 <b>HALT {symbol}</b> ${price_str}"
 
-                                            # Format price limits safely (fix f-string ternary bug)
-                                            high_limit_display = f"${high_limit:.2f}" if high_limit else "N/A"
-                                            low_limit_display = f"${low_limit:.2f}" if low_limit else "N/A"
-
-                                            # Format LULD halt alert
-                                            alert_msg = f"""🛑 <b>LULD HALT ALERT</b> (Polygon Official)
-                                            
-<b>Symbol:</b> {symbol}
-<b>Price:</b> {price_display}
-<b>Float:</b> {float_display} shares
-<b>Halt Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}
-<b>Reason:</b> {halt_reason}
-<b>High Limit:</b> {high_limit_display}
-<b>Low Limit:</b> {low_limit_display}
-<b>Status:</b> VOLATILITY HALT ⚠️
-
-🚀 <i>Real-time via Polygon LULD feed</i>"""
-
-                                            logger.warning(f"[🚨 HALT ALERT] Sending VERIFIED LULD halt for {symbol} @ {price_display} ({price_source})")
+                                            logger.warning(f"[🚨 HALT ALERT] Sending VERIFIED LULD halt for {symbol} @ ${price_str} ({price_source})")
                                             await send_all_alerts(alert_msg)
 
                                             # Log halt event
@@ -3233,14 +3211,9 @@ async def ingest_polygon_events():
 
                                     except Exception as e:
                                         logger.error(f"[🚨 LULD ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
-                                        # 🚨 EMERGENCY: Try to send alert even on error
-                                        try:
-                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_et.strftime('%I:%M:%S %p ET')}\n\n⚠️ Error getting details - check logs"
-                                            await send_all_alerts(emergency_msg)
-                                            halt_last_alert_time[symbol] = datetime.now(timezone.utc)
-                                            logger.warning(f"[LULD] Sent emergency halt alert for {symbol}")
-                                        except:
-                                            pass
+                                        # 🚨 CRITICAL FIX: NO emergency alerts - must pass filtering to alert
+                                        # If we can't verify price/float, we can't confirm it meets criteria
+                                        logger.warning(f"[LULD BLOCKED] {symbol} - Error during filtering, cannot verify criteria - NO ALERT SENT")
                                         continue
                     except Exception as e:
                         logger.error(f"Error processing message: {e}\nRaw: {msg[:200]}", exc_info=True)
