@@ -239,9 +239,8 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             )
         return False
 
-    # 🚫 ETF FILTER: Block leveraged/inverse ETFs and common index funds
-    # These have artificial price action and don't represent real stock momentum
-    etf_patterns = ['L', 'S', 'X']  # Common leveraged suffixes (SOXL, JDST, ZSL, TQQQ, etc.)
+    # 🚫 ETF FILTER: Block known ETFs and leveraged products (explicit list only)
+    # Removed suffix pattern (L/S/X) to prevent false positives on real stocks like ASNS
     common_etfs = {
         'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
         'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
@@ -253,16 +252,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         'SLE', 'SMD', 'AMD3', 'SKY', 'SND'  # GraniteShares leveraged products
     }
     
-    # Block if symbol ends with common ETF suffix (4+ chars ending in L/S/X)
-    if len(symbol) >= 4 and symbol[-1] in etf_patterns:
-        filter_counts["etf_suffix"] = filter_counts.get("etf_suffix", 0) + 1
-        if filter_counts["etf_suffix"] % 50 == 1:
-            logger.info(
-                f"[FILTER DEBUG] {symbol} filtered: ETF suffix pattern detected (count: {filter_counts['etf_suffix']})"
-            )
-        return False
-    
-    # Block if symbol is in known ETF list
+    # Block only if symbol is in explicit ETF list
     if symbol in common_etfs:
         filter_counts["common_etf"] = filter_counts.get("common_etf", 0) + 1
         if filter_counts["common_etf"] % 50 == 1:
