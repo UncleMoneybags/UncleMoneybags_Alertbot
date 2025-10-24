@@ -2673,6 +2673,20 @@ def is_warrant(symbol):
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
+    
+    # ETF blocklist (same as main scanner)
+    etf_blocklist = {
+        'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
+        'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
+        'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
+        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD',
+        'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
+        'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',
+        'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',
+        'SLE', 'SMD', 'AMD3', 'SKY', 'SND',
+        'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'
+    }
+    
     while True:
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
@@ -2688,6 +2702,11 @@ async def premarket_gainers_alert_loop():
                         logger.debug(f"[GAINERS FILTER] {sym} - Skipping warrant from gainers list")
                         continue
                     
+                    # 🚫 Skip ETFs - must be real stocks only
+                    if sym in etf_blocklist:
+                        logger.debug(f"[GAINERS FILTER] {sym} - Skipping ETF from gainers list")
+                        continue
+                    
                     if sym in premarket_last_prices and premarket_open_prices[
                             sym] > 0:
                         pct_gain = (premarket_last_prices[sym] -
@@ -2695,7 +2714,8 @@ async def premarket_gainers_alert_loop():
                                     ) / premarket_open_prices[sym] * 100
                         last_price = premarket_last_prices[sym]
                         total_vol = premarket_volumes.get(sym, 0)
-                        if last_price <= 20 and total_vol >= 25000:
+                        # 🎯 STRICT FILTERS: Price ≤$15, Volume ≥50k, Gain ≥5% for quality list
+                        if last_price <= 15 and total_vol >= 50000 and pct_gain >= 5.0:
                             float_val = float_cache.get(sym)
                             float_str = f", Float: {float_val/1e6:.1f}M" if float_val else ""
                             gainers.append((sym, pct_gain, last_price,
