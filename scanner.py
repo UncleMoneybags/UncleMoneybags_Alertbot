@@ -1427,7 +1427,7 @@ def get_session_date(dt):
 
 
 def check_volume_spike(candles_seq, vwap_value, float_shares=None):
-    """Sustained volume spike detection - requires 2-3 consecutive green candles with volume
+    """Sustained volume spike detection - requires 2 consecutive green candles
     
     🚨 NO VWAP REQUIREMENT - Catches volume spikes regardless of VWAP position
     🎯 SUSTAINED MOMENTUM - Prevents alerts on single-candle spikes that fail immediately
@@ -1445,17 +1445,16 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
         except:
             return False, {}
     
-    if len(candles_list) < 6:  # Need 6 candles for sustained detection (3 trailing + 3 momentum)
+    if len(candles_list) < 5:  # Need 5 candles (3 trailing + 2 consecutive green)
         return False, {}
 
     curr_candle = candles_list[-1]
     prev_candle = candles_list[-2]
-    prev_prev_candle = candles_list[-3]
     curr_volume = curr_candle['volume']
     symbol = curr_candle.get('symbol', '?')
 
     # ADAPTIVE: Use 3 trailing candles for RVOL baseline (before the move)
-    trailing_volumes = [c['volume'] for c in candles_list[-6:-3]]
+    trailing_volumes = [c['volume'] for c in candles_list[-5:-2]]
     trailing_avg = sum(trailing_volumes) / 3 if len(
         trailing_volumes) == 3 else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
@@ -1473,15 +1472,13 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     prev_momentum = (curr_candle['close'] - prev_candle['close']
                      ) / prev_candle['close'] if prev_candle['close'] > 0 else 0
     
-    # 🚀 SUSTAINED MOMENTUM: Check last 2-3 candles for consecutive green volume
+    # 🚀 SUSTAINED MOMENTUM: Require 2 consecutive green candles
     # This prevents alerting on single-candle spikes that fail immediately (MAMK issue)
     prev_green = prev_candle['close'] > prev_candle['open']
-    prev_prev_green = prev_prev_candle['close'] > prev_prev_candle['open']
     curr_green = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005
     
-    # Require 2 out of 3 recent candles to be green (allows 1 pullback)
-    consecutive_green_count = sum([curr_green, prev_green, prev_prev_green])
-    sustained_momentum = consecutive_green_count >= 2
+    # Require BOTH current AND previous candle to be green (2 consecutive)
+    sustained_momentum = curr_green and prev_green
     
     # Price must still be rising overall
     is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005  # 0.5%+ for early detection
@@ -1523,7 +1520,7 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     logger.info(
         f"[VOLUME SPIKE CHECK] {symbol} | "
         f"Vol={curr_volume}, RVOL={rvol:.2f}, "
-        f"Sustained={sustained_momentum} ({consecutive_green_count}/3 green), "
+        f"Sustained={sustained_momentum} (2 consec green: prev={prev_green}, curr={curr_green}), "
         f"Green={is_green_candle} ({price_momentum*100:.1f}%), "
         f"Rising={rising_from_prev}, Momentum={bullish_momentum}, "
         f"Above VWAP={above_vwap} (info only)")
@@ -3196,7 +3193,7 @@ async def ingest_polygon_events():
                                             log_event(
                                                 "polygon_luld_halt", symbol,
                                                 current_price if current_price else 0, 0, halt_time, {
-                                                    "halt_reason": halt_reason,
+                                                    "halt_type": "LULD",
                                                     "high_limit": high_limit,
                                                     "low_limit": low_limit,
                                                     "indicators": indicators,
@@ -3207,7 +3204,7 @@ async def ingest_polygon_events():
 
                                             # Track when we sent this halt alert (prevents spam on reconnects)
                                             halt_last_alert_time[symbol] = datetime.now(timezone.utc)
-                                            logger.warning(f"[✅ LULD SENT] {symbol} @ {price_display} - {halt_reason}")
+                                            logger.warning(f"[✅ LULD SENT] {symbol} @ ${price_str} - LULD halt verified")
                                         else:
                                             logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
 
