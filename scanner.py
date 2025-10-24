@@ -214,11 +214,10 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
     """Check if symbol meets filtering criteria: price <= $15 AND float <= 20M
     
     Args:
-        use_entry_price: If True and symbol has entry_price, use that instead of current price
-                        (allows grandfathering - keeps tracking stocks that run past $15)
+        use_entry_price: REMOVED - Always uses current price (no grandfathering)
     """
-    # 🎯 GRANDFATHERING: Use entry price for already-tracked stocks
-    check_price = entry_price.get(symbol) if use_entry_price and entry_price.get(symbol) else last_price
+    # 🚫 GRANDFATHERING REMOVED: Always use current price to prevent alerts on $15+ stocks
+    check_price = last_price
     
     # Price check - ALL symbols must be <= $15 (increased for early momentum detection!)
     if check_price is None:
@@ -232,10 +231,9 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         filter_counts["price_too_high"] += 1
         if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT", "GLTO"
                       ] or filter_counts["price_too_high"] % 50 == 1:
-            using_str = "entry_price" if use_entry_price and entry_price.get(symbol) else "last_price"
             logger.info(
                 f"[FILTER DEBUG] {symbol} filtered: price ${check_price:.2f} > ${PRICE_THRESHOLD} "
-                f"(count: {filter_counts['price_too_high']}) [using {using_str}]"
+                f"(count: {filter_counts['price_too_high']})"
             )
         return False
 
@@ -249,7 +247,8 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',  # Crypto/quantum ETF-like products
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',  # YieldMax income/covered call ETFs
-        'SLE', 'SMD', 'AMD3', 'SKY', 'SND'  # GraniteShares leveraged products
+        'SLE', 'SMD', 'AMD3', 'SKY', 'SND',  # GraniteShares leveraged products
+        'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'  # Volatility products
     }
     
     # Block only if symbol is in explicit ETF list
@@ -1428,9 +1427,10 @@ def get_session_date(dt):
 
 
 def check_volume_spike(candles_seq, vwap_value, float_shares=None):
-    """Improved volume spike detection with better RVOL calculation and price momentum
+    """Sustained volume spike detection - requires 2-3 consecutive green candles with volume
     
     🚨 NO VWAP REQUIREMENT - Catches volume spikes regardless of VWAP position
+    🎯 SUSTAINED MOMENTUM - Prevents alerts on single-candle spikes that fail immediately
     
     Args:
         float_shares: Float size for adaptive thresholds - catches micro-float spikes like ULY
@@ -1445,16 +1445,17 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
         except:
             return False, {}
     
-    if len(candles_list) < 4:  # REDUCED: Only need 4 candles to detect early spikes
+    if len(candles_list) < 6:  # Need 6 candles for sustained detection (3 trailing + 3 momentum)
         return False, {}
 
     curr_candle = candles_list[-1]
     prev_candle = candles_list[-2]
+    prev_prev_candle = candles_list[-3]
     curr_volume = curr_candle['volume']
     symbol = curr_candle.get('symbol', '?')
 
-    # ADAPTIVE: Use 3 trailing candles for early detection (4 total needed)
-    trailing_volumes = [c['volume'] for c in candles_list[-4:-1]]
+    # ADAPTIVE: Use 3 trailing candles for RVOL baseline (before the move)
+    trailing_volumes = [c['volume'] for c in candles_list[-6:-3]]
     trailing_avg = sum(trailing_volumes) / 3 if len(
         trailing_volumes) == 3 else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
@@ -1472,7 +1473,17 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     prev_momentum = (curr_candle['close'] - prev_candle['close']
                      ) / prev_candle['close'] if prev_candle['close'] > 0 else 0
     
-    # Green candle with meaningful move AND rising from previous with meaningful move
+    # 🚀 SUSTAINED MOMENTUM: Check last 2-3 candles for consecutive green volume
+    # This prevents alerting on single-candle spikes that fail immediately (MAMK issue)
+    prev_green = prev_candle['close'] > prev_candle['open']
+    prev_prev_green = prev_prev_candle['close'] > prev_prev_candle['open']
+    curr_green = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005
+    
+    # Require 2 out of 3 recent candles to be green (allows 1 pullback)
+    consecutive_green_count = sum([curr_green, prev_green, prev_prev_green])
+    sustained_momentum = consecutive_green_count >= 2
+    
+    # Price must still be rising overall
     is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005  # 0.5%+ for early detection
     rising_from_prev = curr_candle['close'] > prev_candle['close'] and prev_momentum >= 0.003  # 0.3%+ from previous
     
@@ -1504,14 +1515,15 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
         min_pct_move = 0.0035  # 0.35%
         threshold_met = absolute_move >= min_abs_move or percent_move >= min_pct_move
     
-    # Only pass if base momentum checks AND tiered threshold are met
-    bullish_momentum = is_green_candle and rising_from_prev and threshold_met
+    # Only pass if sustained momentum AND base momentum checks AND tiered threshold are met
+    bullish_momentum = sustained_momentum and is_green_candle and rising_from_prev and threshold_met
 
     symbol = curr_candle.get('symbol', '?')
 
     logger.info(
         f"[VOLUME SPIKE CHECK] {symbol} | "
         f"Vol={curr_volume}, RVOL={rvol:.2f}, "
+        f"Sustained={sustained_momentum} ({consecutive_green_count}/3 green), "
         f"Green={is_green_candle} ({price_momentum*100:.1f}%), "
         f"Rising={rising_from_prev}, Momentum={bullish_momentum}, "
         f"Above VWAP={above_vwap} (info only)")
