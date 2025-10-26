@@ -3326,6 +3326,164 @@ async def verify_halt_on_nasdaq(symbol, halt_time_str):
         return True
 
 
+async def rest_api_backup_scanner():
+    """🚨 REST API BACKUP: Poll Polygon every 90 seconds to catch stocks WebSocket misses
+    Catches micro-caps like TGL that WebSocket may skip during high-volume periods
+    Only alerts if WebSocket hasn't already alerted on the stock"""
+    import aiohttp
+    from datetime import datetime, timezone, timedelta
+    
+    # Track stocks we've already sent REST backup alerts for (deduplication)
+    rest_alerted_stocks = {}
+    
+    while True:
+        # Only run during market scan hours
+        if not is_market_scan_time():
+            await asyncio.sleep(60)
+            continue
+        
+        try:
+            # Get current time for freshness checks
+            now = datetime.now(timezone.utc)
+            eastern = pytz.timezone("America/New_York")
+            now_et = now.astimezone(eastern)
+            
+            # Query Polygon snapshot API for all stocks (catches WebSocket gaps)
+            logger.info("[REST BACKUP] Polling Polygon snapshot API for top gainers (90s interval)...")
+            
+            async with http_session.get(
+                f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}"
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[REST BACKUP] API error: {resp.status}")
+                    await asyncio.sleep(90)  # Retry after 90 seconds
+                    continue
+                
+                data = await resp.json()
+                tickers = data.get("tickers", [])
+                
+                logger.info(f"[REST BACKUP] Received {len(tickers)} tickers from snapshot API")
+                
+                # Process each ticker for potential alerts
+                candidates = []
+                for ticker_data in tickers:
+                    try:
+                        symbol = ticker_data.get("ticker")
+                        if not symbol:
+                            continue
+                        
+                        # Get day data
+                        day = ticker_data.get("day", {})
+                        prev_day = ticker_data.get("prevDay", {})
+                        
+                        current_price = day.get("c")  # Current close
+                        prev_close = prev_day.get("c")  # Previous close
+                        volume = day.get("v", 0)
+                        
+                        if not current_price or not prev_close or prev_close == 0:
+                            continue
+                        
+                        # Calculate % gain
+                        pct_gain = ((current_price - prev_close) / prev_close) * 100
+                        
+                        # FILTER: Must be significant gainer (>10%) to warrant backup alert
+                        if pct_gain < 10.0:
+                            continue
+                        
+                        # Check eligibility (price, float, ETF filter)
+                        float_shares = await get_float_shares(symbol)
+                        if not is_eligible(symbol, current_price, float_shares, use_entry_price=False):
+                            continue
+                        
+                        # DEDUPLICATION: Skip if WebSocket already alerted today
+                        if symbol in alerted_symbols:
+                            logger.debug(f"[REST BACKUP] {symbol} - WebSocket already alerted, skipping")
+                            continue
+                        
+                        # DEDUPLICATION: Skip if REST backup already alerted in last hour
+                        last_rest_alert = rest_alerted_stocks.get(symbol)
+                        if last_rest_alert and (now - last_rest_alert).total_seconds() < 3600:  # 1 hour
+                            logger.debug(f"[REST BACKUP] {symbol} - Already sent REST alert in last hour, skipping")
+                            continue
+                        
+                        candidates.append({
+                            'symbol': symbol,
+                            'price': current_price,
+                            'gain': pct_gain,
+                            'volume': volume,
+                            'float': float_shares
+                        })
+                    
+                    except Exception as e:
+                        logger.debug(f"[REST BACKUP] Error processing ticker: {e}")
+                        continue
+                
+                # Alert on top candidates (stocks WebSocket missed)
+                if candidates:
+                    # Sort by % gain (biggest movers first)
+                    candidates.sort(key=lambda x: x['gain'], reverse=True)
+                    
+                    logger.info(f"[REST BACKUP] Found {len(candidates)} stocks WebSocket may have missed")
+                    
+                    for candidate in candidates[:5]:  # Limit to top 5 to avoid spam
+                        symbol = candidate['symbol']
+                        price = candidate['price']
+                        gain = candidate['gain']
+                        volume = candidate['volume']
+                        float_shares = candidate['float']
+                        
+                        # Format alert - IDENTICAL to volume spike alerts
+                        price_str = fmt_price(price)
+                        
+                        alert_msg = (
+                            f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
+                            f"Price: ${price_str}"
+                        )
+                        
+                        await send_all_alerts(alert_msg)
+                        
+                        # Log the alert
+                        log_event(
+                            "rest_backup_alert",
+                            symbol,
+                            price,
+                            volume,
+                            now,
+                            {
+                                'gain_pct': gain,
+                                'float': float_shares,
+                                'reason': 'WebSocket gap detection'
+                            }
+                        )
+                        
+                        # Mark as alerted
+                        rest_alerted_stocks[symbol] = now
+                        
+                        logger.warning(
+                            f"[REST BACKUP ALERT] {symbol} ${price:.2f} +{gain:.1f}% - "
+                            f"Caught by backup scanner (WebSocket missed)"
+                        )
+                        
+                        # Small delay between alerts
+                        await asyncio.sleep(2)
+                
+                else:
+                    logger.info("[REST BACKUP] No new gainers detected (WebSocket is working properly)")
+            
+            # Clean up old REST alert tracking (older than 24 hours)
+            cutoff = now - timedelta(hours=24)
+            rest_alerted_stocks = {
+                sym: timestamp for sym, timestamp in rest_alerted_stocks.items()
+                if timestamp > cutoff
+            }
+        
+        except Exception as e:
+            logger.error(f"[REST BACKUP] Error in backup scanner: {e}")
+        
+        # Poll every 90 seconds (1.5 minutes) - unlimited API plan allows frequent polling
+        await asyncio.sleep(90)
+
+
 async def nasdaq_halt_monitor():
     """🚨 PRIMARY HALT SOURCE: Monitor NASDAQ every 15 seconds (more reliable than WebSocket)
     Catches ALL halt types (T1, T2, T5, T12, LUDP, etc.) with relaxed $20 price threshold
@@ -3690,6 +3848,8 @@ async def main():
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     # Enable NASDAQ halt monitoring (catches T1, T2, T5, T12 halts that Polygon LULD misses)
     nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
+    # 🔍 Enable REST API backup scanner (catches stocks WebSocket misses - runs every 90 seconds)
+    rest_backup_task = asyncio.create_task(rest_api_backup_scanner())
     try:
         while True:
             await asyncio.sleep(60)
@@ -3700,6 +3860,7 @@ async def main():
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         nasdaq_halt_task.cancel()
+        rest_backup_task.cancel()
 
         # 🚨 FIX: Await cancelled tasks with error handling
         try:
@@ -3716,6 +3877,10 @@ async def main():
             pass
         try:
             await nasdaq_halt_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await rest_backup_task
         except asyncio.CancelledError:
             pass
         
