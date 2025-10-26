@@ -3509,13 +3509,13 @@ async def nasdaq_halt_monitor():
     
     while True:
         try:
-            ny_tz = pytz.timezone("America/New_York")
-            now = datetime.now(timezone.utc).astimezone(ny_tz)
-            
-            # Only run during extended market hours (4am-8pm ET)
-            if not (4 <= now.hour < 20):
+            # Only run during market scan hours (4am-8pm ET, Mon-Fri)
+            if not is_market_scan_time():
                 await asyncio.sleep(300)  # Check every 5 minutes when closed
                 continue
+            
+            ny_tz = pytz.timezone("America/New_York")
+            now = datetime.now(timezone.utc).astimezone(ny_tz)
             
             # Scrape NASDAQ halt page
             url = "https://www.nasdaqtrader.com/trader.aspx?id=tradehalts"
