@@ -3774,13 +3774,8 @@ async def nasdaq_halt_monitor():
                                         
                                     except Exception as e:
                                         logger.error(f"[🚨 NASDAQ ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
-                                        # 🚨 EMERGENCY: Try to send alert even on error
-                                        try:
-                                            emergency_msg = f"🛑 <b>HALT DETECTED</b>\n\n<b>Symbol:</b> {symbol}\n<b>Time:</b> {halt_time_str} ET\n<b>Source:</b> NASDAQ\n\n⚠️ Error getting details - check logs"
-                                            await send_all_alerts(emergency_msg)
-                                            logger.warning(f"[NASDAQ] Sent emergency halt alert for {symbol}")
-                                        except:
-                                            pass
+                                        # DO NOT send emergency alert - if we can't verify criteria, don't alert
+                                        logger.warning(f"[HALT SKIPPED] {symbol} - Could not verify price/float criteria due to error")
                                         continue
                         
         except Exception as e:
