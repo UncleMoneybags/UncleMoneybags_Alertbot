@@ -250,7 +250,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
         'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
         'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
-        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD',
+        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD', 'DZZ',  # Gold/commodity ETFs
         'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',  # Crypto/quantum ETF-like products
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',  # YieldMax income/covered call ETFs
@@ -3856,8 +3856,8 @@ async def main():
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     # Enable NASDAQ halt monitoring (catches T1, T2, T5, T12 halts that Polygon LULD misses)
     nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
-    # 🔍 Enable REST API backup scanner (catches stocks WebSocket misses - runs every 90 seconds)
-    rest_backup_task = asyncio.create_task(rest_api_backup_scanner())
+    # 🔍 DISABLED: REST API backup scanner (was alerting on late/worthless moves)
+    # rest_backup_task = asyncio.create_task(rest_api_backup_scanner())
     try:
         while True:
             await asyncio.sleep(60)
@@ -3868,7 +3868,7 @@ async def main():
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         nasdaq_halt_task.cancel()
-        rest_backup_task.cancel()
+        # rest_backup_task.cancel()  # DISABLED
 
         # 🚨 FIX: Await cancelled tasks with error handling
         try:
@@ -3887,10 +3887,11 @@ async def main():
             await nasdaq_halt_task
         except asyncio.CancelledError:
             pass
-        try:
-            await rest_backup_task
-        except asyncio.CancelledError:
-            pass
+        # REST backup scanner disabled
+        # try:
+        #     await rest_backup_task
+        # except asyncio.CancelledError:
+        #     pass
         
         # 🚀 PERFORMANCE: Close reusable HTTP session
         if http_session:
