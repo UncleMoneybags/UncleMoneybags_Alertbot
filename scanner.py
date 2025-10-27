@@ -3397,7 +3397,13 @@ async def rest_api_backup_scanner():
                         if pct_gain < 10.0:
                             continue
                         
-                        # Check eligibility (price, float, ETF filter)
+                        # FILTER: Volume requirement - must have meaningful volume (100K+ shares)
+                        # Prevents alerts on low-volume garbage pumps and reverse split trash
+                        if volume < 100000:
+                            logger.debug(f"[REST BACKUP] {symbol} - Low volume {volume:,} < 100K, skipping")
+                            continue
+                        
+                        # Check eligibility (price, float, ETF filter, warrants)
                         float_shares = await get_float_shares(symbol)
                         if not is_eligible(symbol, current_price, float_shares, use_entry_price=False):
                             continue
