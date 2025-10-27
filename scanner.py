@@ -862,8 +862,9 @@ MIN_3MIN_VOLUME = 25000
 MIN_PER_CANDLE_VOL = 25000
 MIN_IPO_DAYS = 30
 ALERT_PRICE_DELTA = 0.25
-RVOL_SPIKE_THRESHOLD = 2.0  # REDUCED: Lower RVOL for early detection
+RVOL_SPIKE_THRESHOLD = 2.2  # Balanced threshold for early detection without noise
 RVOL_SPIKE_MIN_VOLUME = 25000  # REDUCED: Lower volume for early spikes
+AFTERHOURS_MIN_VOLUME = 100000  # STRICT: Require 100k+ volume for after-hours alerts to filter illiquid garbage
 
 # 🚀 MEMORY MANAGEMENT: LRU tracking for symbol eviction
 symbol_last_access = {}  # symbol -> last access timestamp
@@ -1534,8 +1535,17 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
 
     # Check each condition - VWAP REMOVED
     vol_ok = curr_volume >= min_volume
-    rvol_ok = rvol >= RVOL_SPIKE_THRESHOLD  # 1.5x threshold for early detection
+    rvol_ok = rvol >= RVOL_SPIKE_THRESHOLD  # 2.2x threshold for early detection
     momentum_ok = bullish_momentum
+    
+    # 🚨 AFTER-HOURS LIQUIDITY FILTER: Require 100k+ volume to prevent illiquid garbage alerts
+    session_type = get_session_type(datetime.now(timezone.utc))
+    if session_type in ["premarket", "afterhours"]:
+        afterhours_vol_ok = curr_volume >= AFTERHOURS_MIN_VOLUME
+        if not afterhours_vol_ok:
+            logger.info(f"[AFTERHOURS FILTER] {symbol} - Volume {curr_volume} < {AFTERHOURS_MIN_VOLUME} (session: {session_type}) - BLOCKING alert")
+            return False, {}
+        logger.info(f"[AFTERHOURS PASS] {symbol} - Volume {curr_volume} >= {AFTERHOURS_MIN_VOLUME} (session: {session_type})")
 
     # 🚨 VOLUME SPIKE = Volume + RVOL + Momentum ONLY (no VWAP requirement)
     spike_detected = vol_ok and rvol_ok and momentum_ok
@@ -1544,7 +1554,7 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     logger.info(
         f"[SPIKE DEBUG] {symbol} | "
         f"vol_ok={vol_ok} ({curr_volume}>={min_volume}), "
-        f"rvol_ok={rvol_ok} ({rvol:.2f}>={RVOL_SPIKE_THRESHOLD}), "
+        f"rvol_ok={rvol_ok} ({rvol:.2f}>={RVOL_SPIKE_THRESHOLD:.1f}), "
         f"momentum_ok={momentum_ok}, "
         f"FINAL: spike_detected={spike_detected} (VWAP not required)")
 
