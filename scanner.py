@@ -216,6 +216,13 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
     Args:
         use_entry_price: REMOVED - Always uses current price (no grandfathering)
     """
+    # 🚫 WARRANT FILTER: Block all warrants immediately
+    if is_warrant(symbol):
+        filter_counts["warrant"] = filter_counts.get("warrant", 0) + 1
+        if filter_counts["warrant"] % 50 == 1:
+            logger.info(f"[FILTER DEBUG] {symbol} filtered: Warrant (count: {filter_counts['warrant']})")
+        return False
+    
     # 🚫 GRANDFATHERING REMOVED: Always use current price to prevent alerts on $15+ stocks
     check_price = last_price
     
