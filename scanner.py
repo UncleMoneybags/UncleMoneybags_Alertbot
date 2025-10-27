@@ -3595,10 +3595,16 @@ async def nasdaq_halt_monitor():
                                                     filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
                                                     logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
                                                 else:
-                                                    # Price is valid, check float
+                                                    # Price is valid, check float + movement tracking
                                                     if float_shares is None:
-                                                        filter_reason = "no float data available"
-                                                        logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
+                                                        # Only alert if stock is ALREADY being tracked (has movement data)
+                                                        # Require ≥1 candle to catch fast movers that halt quickly
+                                                        if symbol in candles and len(candles[symbol]) >= 1:
+                                                            should_alert = True
+                                                            logger.warning(f"[RESUME PASS] {symbol} - Price ${current_price:.2f}, Float UNKNOWN but STOCK IS MOVING (has {len(candles[symbol])} candles) - ALLOWING")
+                                                        else:
+                                                            filter_reason = "no float data available and stock not being tracked"
+                                                            logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
                                                     elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
                                                         filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
                                                         logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
@@ -3716,10 +3722,17 @@ async def nasdaq_halt_monitor():
                                             filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
                                             logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
                                         else:
-                                            # Price is valid, check float
+                                            # Price is valid, check float + movement tracking
                                             if float_shares is None:
-                                                filter_reason = "no float data available"
-                                                logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
+                                                # Only alert if stock is ALREADY being tracked (has movement data)
+                                                # Don't alert on random halts with unknown float
+                                                # Require ≥1 candle to catch fast movers that halt quickly
+                                                if symbol in candles and len(candles[symbol]) >= 1:
+                                                    should_alert = True
+                                                    logger.warning(f"[NASDAQ PASS] {symbol} - Price ${current_price:.2f}, Float UNKNOWN but STOCK IS MOVING (has {len(candles[symbol])} candles) - ALLOWING")
+                                                else:
+                                                    filter_reason = "no float data available and stock not being tracked"
+                                                    logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
                                             elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
                                                 filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
                                                 logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
