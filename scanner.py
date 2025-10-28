@@ -2083,11 +2083,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
         if warming_up_criteria and not warming_up_was_true[symbol]:
-            if last_trade_volume[symbol] < 500:
-                logger.info(
-                    f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
-                )
-                return
             if (now - last_alert_time[symbol]['warming_up']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
@@ -2220,11 +2215,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         )
 
         if runner_criteria and not runner_was_true[symbol]:
-            if last_trade_volume[symbol] < 500:
-                logger.info(
-                    f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
-                )
-                return
             if (now - last_alert_time[symbol]['runner']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
@@ -2336,11 +2326,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
             if (now - last_alert_time[symbol]['vwap_reclaim']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
-                return
-            if last_trade_volume[symbol] < 500:
-                logger.info(
-                    f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
-                )
                 return
             
             # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
@@ -2595,11 +2580,6 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 if ema5 / ema13 < 1.011:
                     logger.error(
                         f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.011)"
-                    )
-                    return
-                if last_trade_volume[symbol] < 500:
-                    logger.info(
-                        f"Not alerting {symbol}: last trade volume too low ({last_trade_volume[symbol]})"
                     )
                     return
                 if (now - last_alert_time[symbol]['ema_stack']) < timedelta(
