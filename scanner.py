@@ -4,7 +4,7 @@ import websockets
 import aiohttp
 import json
 import html
-import re
+import remake 
 from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta, date, time as dt_time
 from email.utils import parsedate_to_datetime
@@ -1385,11 +1385,21 @@ def get_alert_score(alert_type, symbol, data):
 
 
 pending_alerts = defaultdict(list)  # Store multiple alerts per symbol
+last_alert_sent_time = defaultdict(lambda: None)  # Track last alert time to prevent duplicates
 
 
 async def send_best_alert(symbol):
     """Send only the highest scoring alert for a symbol"""
     if symbol not in pending_alerts or not pending_alerts[symbol]:
+        return
+
+    # 🚨 DUPLICATE PREVENTION: Check if we already sent an alert for this symbol recently
+    now = datetime.now(timezone.utc)
+    last_sent = last_alert_sent_time.get(symbol)
+    if last_sent and (now - last_sent).total_seconds() < 60:  # 60 second cooldown
+        time_since = int((now - last_sent).total_seconds())
+        logger.info(f"[ALERT COOLDOWN] {symbol} - Already alerted {time_since}s ago, skipping duplicate")
+        pending_alerts[symbol].clear()
         return
 
     # Find highest scoring alert
@@ -1398,6 +1408,7 @@ async def send_best_alert(symbol):
     # Only send if score is high enough (LOWERED for faster alerts)
     if best_alert['score'] >= 20:  # 🚨 LOWERED from 30 to 20 - catch more valid setups
         await send_all_alerts(best_alert['message'])
+        last_alert_sent_time[symbol] = now  # 🚨 Record alert time
         logger.info(
             f"[ALERT SENT] {symbol} | {best_alert['type']} | Score: {best_alert['score']}"
         )
