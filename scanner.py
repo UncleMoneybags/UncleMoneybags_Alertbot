@@ -2332,23 +2332,37 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             candle_time_vr = curr_candle['start_time'] + timedelta(minutes=1)
             alert_price = get_display_price(symbol, curr_candle['close'], candle_time_vr)
             
-            # 🚨 REMOVED 0.3% margin requirement - was blocking valid reclaims
-            # Price just needs to be above VWAP, period - no artificial margin required
+            # Calculate alert score and add to pending alerts
+            vwap_reclaim_data = {
+                "rvol": rvol,
+                "volume": curr_candle['volume'],
+                "price_move": candle_price_move,
+                "candle_price": curr_candle['close'],
+                "real_time_price": last_trade_price.get(symbol)
+            }
+            score = get_alert_score("vwap_reclaim", symbol, vwap_reclaim_data)
+            
+            price_str = fmt_price(alert_price)
+            vwap_str = fmt_price(curr_vwap) if curr_vwap is not None else "?"
+            alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
+                          f"Price: ${price_str} | VWAP: ${vwap_str}")
+            
+            # Add to pending alerts instead of sending immediately
+            pending_alerts[symbol].append({
+                'type': 'vwap_reclaim',
+                'score': score,
+                'message': alert_text
+            })
+            
+            # Send the best alert for this symbol
+            await send_best_alert(symbol)
+            
+            # Log event for tracking
             log_event(
                 "vwap_reclaim", symbol,
                 alert_price,
-                curr_candle['volume'], event_time, {
-                    "rvol": rvol,
-                    "candle_price": curr_candle['close'],
-                    "real_time_price": last_trade_price.get(symbol)
-                })
-            price_str = fmt_price(alert_price)
-            vwap_str = fmt_price(curr_vwap) if curr_vwap is not None else "?"
-            vol_str = f"{curr_candle['volume']:,}"
-            rvol_str = f"{rvol:.2f}"
-            alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
-                          f"Price: ${price_str} | VWAP: ${vwap_str}")
-            await send_all_alerts(alert_text)
+                curr_candle['volume'], event_time, vwap_reclaim_data)
+            
             vwap_reclaim_was_true[symbol] = True
             alerted_symbols[symbol] = today
             last_alert_time[symbol]['vwap_reclaim'] = now
