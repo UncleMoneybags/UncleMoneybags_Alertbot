@@ -3166,6 +3166,14 @@ async def ingest_polygon_events():
 
                                     halted_symbols.add(halt_key)
 
+                                    # 🚨 ACTIVE HALT VERIFICATION: Check if stock has traded since halt
+                                    # If we have recent trades AFTER the halt time, stock has resumed → skip alert
+                                    symbol_last_trade_time = last_trade_time.get(symbol)
+                                    if symbol_last_trade_time and symbol_last_trade_time > halt_time:
+                                        time_since_halt = (symbol_last_trade_time - halt_time).total_seconds() / 60
+                                        logger.info(f"[LULD SKIP] {symbol} - Stock has traded {time_since_halt:.1f} min after halt (resumed, not currently halted)")
+                                        continue
+
                                     # 🚨🚨 SPECIAL HALT HANDLING - BULLETPROOF 🚨🚨
                                     logger.warning(f"[LULD DETECTED] {symbol} halt at {halt_time_et.strftime('%I:%M:%S %p ET')}")
                                     
