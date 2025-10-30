@@ -2092,7 +2092,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
-        if warming_up_criteria and not warming_up_was_true[symbol]:
+        # 🚨 FIX: Don't fire Warming Up if Runner already alerted (progression hierarchy)
+        if warming_up_criteria and not warming_up_was_true[symbol] and not runner_was_true[symbol]:
             if (now - last_alert_time[symbol]['warming_up']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
                 return
