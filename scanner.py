@@ -664,8 +664,8 @@ def vwap_numpy(prices, volumes):
 def vwap_candles_numpy(candles):
     """🚨 ENHANCED CANDLE VWAP: Bulletproof calculation with error handling"""
     if not candles:
-        logger.info("[VWAP DEBUG] No candles, returning 0")
-        return 0.0
+        logger.debug("[VWAP DEBUG] No candles, returning None")
+        return None
 
     try:
         # 🚨 FIX: Filter out zero-volume candles BEFORE calculation
@@ -692,21 +692,22 @@ def vwap_candles_numpy(candles):
 
         # 🚨 FIX: Check if we have any valid candles after filtering
         if not prices or not volumes:
-            logger.warning("[VWAP ERROR] No non-zero volume candles available")
-            return 0.0
+            logger.debug("[VWAP DEBUG] No non-zero volume candles available, returning None")
+            return None
 
-        logger.info(f"[VWAP DEBUG] Prices used: {prices}")
-        logger.info(f"[VWAP DEBUG] Volumes used: {volumes}")
+        # 🚨 PERFORMANCE: Reduced logging - these fire thousands of times per second
+        logger.debug(f"[VWAP DEBUG] Prices used: {prices}")
+        logger.debug(f"[VWAP DEBUG] Volumes used: {volumes}")
 
         # Use enhanced VWAP calculation
         vwap_val = vwap_numpy(prices, volumes)
-        logger.info(f"[VWAP DEBUG] VWAP result: {vwap_val}")
+        logger.debug(f"[VWAP DEBUG] VWAP result: {vwap_val}")
         return vwap_val
 
     except Exception as e:
         logger.error(
             f"[VWAP ERROR] Failed to calculate VWAP from candles: {e}")
-        return 0.0  # Return 0 on error (will be caught by validation later)
+        return None  # Return None on error so alerts are blocked until valid VWAP
 
 
 def get_valid_vwap(symbol):
