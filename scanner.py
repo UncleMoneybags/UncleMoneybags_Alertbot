@@ -2693,6 +2693,22 @@ def is_warrant(symbol):
     return False
 
 
+def is_etf(symbol):
+    """Check if symbol is a known ETF or leveraged product"""
+    common_etfs = {
+        'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
+        'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
+        'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
+        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD', 'DZZ',
+        'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
+        'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',
+        'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',
+        'SLE', 'SMD', 'AMD3', 'SKY', 'SND',
+        'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'
+    }
+    return symbol in common_etfs
+
+
 async def premarket_gainers_alert_loop():
     eastern = pytz.timezone("America/New_York")
     sent_today = False
