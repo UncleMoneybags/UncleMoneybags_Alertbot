@@ -3143,9 +3143,16 @@ async def ingest_polygon_events():
                                     halt_time_et = halt_time.astimezone(eastern)
                                     halt_key = f"{symbol}_{halt_time_et.strftime('%H:%M:%S')}_LULD"
 
+                                    # 🚨 STALE EVENT FILTER: Reject LULD events older than 5 minutes
+                                    # Only alert on ACTIVELY HALTED stocks, not old/resumed halts
+                                    now = datetime.now(timezone.utc)
+                                    halt_age_minutes = (now - halt_time).total_seconds() / 60
+                                    if halt_age_minutes > 5:  # 5 minute staleness threshold - only current halts
+                                        logger.info(f"[LULD SKIP] {symbol} - Halt is {halt_age_minutes:.1f} minutes old (stale event, stock likely resumed)")
+                                        continue
+                                    
                                     # 🚨 TIME-BASED DEDUPLICATION: Skip if we alerted on this symbol in last 5 minutes
                                     # This prevents spam when scanner reconnects and Polygon resends old LULD events
-                                    now = datetime.now(timezone.utc)
                                     last_halt_time = halt_last_alert_time.get(symbol)
                                     if last_halt_time and (now - last_halt_time).total_seconds() < 300:  # 5 minutes
                                         time_since = int((now - last_halt_time).total_seconds())
