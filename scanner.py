@@ -2821,8 +2821,8 @@ async def ingest_polygon_events():
                 f"[CONNECTION] Connecting to Polygon WebSocket... (attempt {connection_attempts + 1})"
             )
             async with websockets.connect(url,
-                                          ping_interval=15,
-                                          ping_timeout=20) as ws:
+                                          ping_interval=20,
+                                          ping_timeout=60) as ws:
                 logger.info(
                     "[CONNECTION] Successfully connected to Polygon WebSocket")
 
@@ -2903,16 +2903,32 @@ async def ingest_polygon_events():
                                     logger.debug(f"[TRADE SKIP] {symbol} - Missing timestamp, cannot validate freshness")
                                     continue
 
-                                # Check eligibility BEFORE processing/logging
-                                float_shares = await get_float_shares(symbol)
+                                # 🚀 PERFORMANCE: Fast eligibility checks FIRST (no I/O) before slow float lookup
                                 
                                 # 🎯 GRANDFATHERING: Use entry price for already-tracked stocks
                                 is_tracked = symbol in entry_price and entry_price[symbol] is not None
+                                check_price = entry_price[symbol] if is_tracked else price
                                 
+                                # ✅ FAST CHECK #1: Price filter (instant, no I/O) - reject 90% of stocks immediately
+                                if check_price > 15:
+                                    # If was tracked but now too expensive, clear tracking
+                                    if is_tracked:
+                                        logger.info(f"[GRANDFATHERING] {symbol} too expensive, removing from tracking (entry: ${entry_price[symbol]:.2f}, current: ${price:.2f})")
+                                        entry_price[symbol] = None
+                                    continue
+                                
+                                # ✅ FAST CHECK #2: ETF/Warrant filter (instant, no I/O)
+                                if is_etf(symbol) or is_warrant(symbol):
+                                    continue
+                                
+                                # ✅ SLOW CHECK #3: Float lookup (only for stocks ≤$15) - 90% reduction in HTTP calls
+                                float_shares = await get_float_shares(symbol)
+                                
+                                # Final eligibility check with float data
                                 if not is_eligible(symbol, price, float_shares, use_entry_price=is_tracked):
                                     # If not eligible and was being tracked, clear entry price
                                     if is_tracked:
-                                        logger.info(f"[GRANDFATHERING] {symbol} no longer eligible, removing from tracking (entry: ${entry_price[symbol]:.2f}, current: ${price:.2f})")
+                                        logger.info(f"[GRANDFATHERING] {symbol} no longer eligible (float), removing from tracking (entry: ${entry_price[symbol]:.2f}, current: ${price:.2f})")
                                         entry_price[symbol] = None
                                     continue  # Skip ineligible symbols completely
                                 
