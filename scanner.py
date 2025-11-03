@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta, date, time as dt_time
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
 import pytz
-import signal
+import signala
 import pickle
 import csv
 import os
@@ -3392,8 +3392,8 @@ async def verify_halt_on_nasdaq(symbol, halt_time_str):
         
     except Exception as e:
         logger.error(f"[HALT VERIFY] Error verifying {symbol}: {e}")
-        # If verification fails, assume halt is real (fail-safe)
-        return True
+        # If verification fails with error, BLOCK the alert (prevent false positives)
+        return False
 
 
 async def rest_api_backup_scanner():
