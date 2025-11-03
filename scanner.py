@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta, date, time as dt_time
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
 import pytz
-import signala
+import signal
 import pickle
 import csv
 import os
@@ -3154,6 +3154,11 @@ async def ingest_polygon_events():
                                 # Process all pending alerts and send only the best one
                                 await send_best_alert(symbol)
                             elif event.get("ev") == "LULD":
+                                # 🚨 HALT ALERTS DISABLED: Too many false positives from NASDAQ verification failures
+                                # NASDAQ page doesn't reliably list all halts, causing false alerts
+                                # TODO: Implement more reliable halt detection (Polygon API status endpoint?)
+                                continue
+                                
                                 # Handle LULD (Limit Up/Limit Down) events - Polygon's official halt detection!
                                 # Robust symbol extraction - Polygon uses different keys across feeds
                                 symbol = event.get("sym") or event.get("T") or event.get("ticker") or event.get("symbol")
