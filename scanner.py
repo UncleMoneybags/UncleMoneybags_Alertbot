@@ -1795,11 +1795,17 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
 
     # 🚨 CRITICAL FIX: Use real-time price for VWAP comparison
     current_price_perfect = last_trade_price.get(symbol)
+    # 🚨 PERFECT SETUP: Increased thresholds to match Volume Spike quality standards
+    # - RVOL 2.2x (up from 2.0x) to align with volume spike minimum
+    # - Volume 250K (up from 100K) to ensure meaningful liquidity
+    # - Dollar volume $50K minimum to filter out low-liquidity garbage
+    dollar_volume = last_volume * current_price_perfect if current_price_perfect else 0
     perfect = ((ema5 > ema8 > ema13) and (ema5 >= 1.011 * ema13) and
                (current_price_perfect is not None
                 and current_price_perfect > vwap_value)  # 🚨 REAL-TIME PRICE!
-               and (last_volume >= 100000) and (rvol > 2.0) and (last_rsi < 70)
-               and (last_macd_hist > 0) and bullish_engulf)
+               and (last_volume >= 250000) and (rvol > 2.2) and (last_rsi < 70)
+               and (last_macd_hist > 0) and bullish_engulf
+               and (dollar_volume >= 50000))  # Minimum $50K traded for quality
 
     # ---- PATCH: enforce ratio at alert time! ----
     if perfect:
@@ -3154,11 +3160,6 @@ async def ingest_polygon_events():
                                 # Process all pending alerts and send only the best one
                                 await send_best_alert(symbol)
                             elif event.get("ev") == "LULD":
-                                # 🚨 HALT ALERTS DISABLED: Too many false positives from NASDAQ verification failures
-                                # NASDAQ page doesn't reliably list all halts, causing false alerts
-                                # TODO: Implement more reliable halt detection (Polygon API status endpoint?)
-                                continue
-                                
                                 # Handle LULD (Limit Up/Limit Down) events - Polygon's official halt detection!
                                 # Robust symbol extraction - Polygon uses different keys across feeds
                                 symbol = event.get("sym") or event.get("T") or event.get("ticker") or event.get("symbol")
@@ -3171,6 +3172,13 @@ async def ingest_polygon_events():
 
                                 # 🔍 DEBUG: Log raw LULD event for diagnosis
                                 logger.info(f"[LULD RAW EVENT] keys={list(event.keys())} symbol={symbol} event={event}")
+                                
+                                # 🚨 HALT ALERTS DISABLED: Need to identify correct indicator codes
+                                # TGE false alert had indicator [0] - unclear if that's an actual halt
+                                # Log all LULD events to identify which indicators = real halts
+                                # TODO: Monitor logs to map indicators to halt types, then re-enable
+                                logger.info(f"[LULD LOGGED] {symbol} - Indicator {indicators} (monitoring only, no alert)")
+                                continue
                                 
                                 if symbol and timestamp:
                                     # Format halt key for deduplication
@@ -3269,13 +3277,9 @@ async def ingest_polygon_events():
                                                 logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
                                         
                                         if should_alert:
-                                            # 🔍 HALT VERIFICATION: Re-check NASDAQ before alerting
-                                            halt_time_str = halt_time_et.strftime('%H:%M:%S')
-                                            is_verified = await verify_halt_on_nasdaq(symbol, halt_time_str)
-                                            
-                                            if not is_verified:
-                                                logger.warning(f"[LULD BLOCKED] {symbol} - Halt NOT verified on NASDAQ, skipping alert (prevents false positive)")
-                                                continue
+                                            # 🚀 TRUST POLYGON LULD: Skip NASDAQ verification (unreliable)
+                                            # Polygon's LULD events + staleness filter + trade verification is enough
+                                            # NASDAQ page doesn't reliably show all halts (brief halts disappear)
                                             
                                             # Format clean halt alert - just emoji, HALT, ticker, price
                                             price_str = fmt_price(current_price) if current_price else "?"
