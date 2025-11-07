@@ -2386,6 +2386,16 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if len(candles_seq) >= 2 and len(vwap_candles[symbol]) >= 3:
         prev_candle = list(candles_seq)[-2]
         curr_candle = list(candles_seq)[-1]
+        
+        # 🚨 FIX: Require both candles to be finalized (≥1 minute apart)
+        # Prevents false alerts from comparing partial in-progress candles
+        time_gap = curr_candle['start_time'] - prev_candle['start_time']
+        if time_gap < timedelta(minutes=1):
+            logger.debug(
+                f"[VWAP SKIP] {symbol} - Waiting for previous candle to finalize (gap: {time_gap.total_seconds()}s)"
+            )
+            return  # Skip - prev candle not finalized yet
+        
         # Require sufficient VWAP data for both calculations
         if len(vwap_candles[symbol]) < 3:
             logger.info(
