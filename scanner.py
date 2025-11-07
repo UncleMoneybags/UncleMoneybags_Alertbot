@@ -83,6 +83,12 @@ FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS = 300  # Only save every 5 minutes to reduce d
 _last_float_cache_save = datetime.min.replace(tzinfo=timezone.utc)
 _float_cache_lock = asyncio.Lock()  # 🔒 Prevent concurrent write corruption
 
+# 🎯 TICKER TYPE CACHE: Real-time ETF detection via Polygon API
+# Cache ticker types to avoid repeated API calls (ETF, CS, WARRANT, etc.)
+ticker_type_cache = {}  # {symbol: type_code} e.g., {"SPY": "ETF", "AAPL": "CS"}
+_last_ticker_type_save = datetime.min.replace(tzinfo=timezone.utc)
+_ticker_type_lock = asyncio.Lock()
+
 
 async def save_float_cache(force=False):
     """Save float cache to disk with debouncing to reduce I/O overhead.
@@ -202,7 +208,77 @@ async def get_float_shares(ticker):
         return float_cache.get(ticker, None)
 
 
+async def save_ticker_type_cache(force=False):
+    """Save ticker type cache to disk with debouncing."""
+    global _last_ticker_type_save
+    now = datetime.now(timezone.utc)
+    
+    if not force and (now - _last_ticker_type_save).total_seconds() < FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS:
+        return
+    
+    async with _ticker_type_lock:
+        tmp = "ticker_type_cache.pkl.tmp"
+        loop = asyncio.get_event_loop()
+        
+        def write_pickle():
+            with open(tmp, "wb") as f:
+                pickle.dump(ticker_type_cache, f)
+        
+        await loop.run_in_executor(io_executor, write_pickle)
+        os.replace(tmp, "ticker_type_cache.pkl")
+        _last_ticker_type_save = now
+        logger.debug(f"Saved ticker type cache, entries: {len(ticker_type_cache)}")
+
+
+def load_ticker_type_cache():
+    global ticker_type_cache
+    if os.path.exists("ticker_type_cache.pkl"):
+        with open("ticker_type_cache.pkl", "rb") as f:
+            ticker_type_cache = pickle.load(f)
+        logger.debug(f"Loaded ticker type cache, entries: {len(ticker_type_cache)}")
+    else:
+        ticker_type_cache = {}
+        logger.debug("No ticker type cache found, starting new")
+
+
+async def get_ticker_type(symbol):
+    """Get ticker type from Polygon API with caching.
+    
+    Returns:
+        str: Ticker type code (CS, ETF, WARRANT, etc.) or None if unknown
+    """
+    # Check cache first
+    if symbol in ticker_type_cache:
+        return ticker_type_cache[symbol]
+    
+    # Call Polygon API v3 reference endpoint
+    try:
+        url = f"https://api.polygon.io/v3/reference/tickers/{symbol}"
+        params = {"apiKey": POLYGON_API_KEY}
+        
+        async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get("status") == "OK" and data.get("results"):
+                    ticker_type = data["results"].get("type")
+                    # Cache the result
+                    ticker_type_cache[symbol] = ticker_type
+                    await save_ticker_type_cache()
+                    logger.debug(f"[TICKER TYPE] {symbol} = {ticker_type}")
+                    return ticker_type
+            elif response.status == 429:  # Rate limit
+                logger.warning(f"[TICKER TYPE] Rate limited on {symbol}")
+                return None
+            else:
+                logger.debug(f"[TICKER TYPE] {symbol} - API error: {response.status}")
+                return None
+    except Exception as e:
+        logger.debug(f"[TICKER TYPE] {symbol} - Error: {e}")
+        return None
+
+
 load_float_cache()
+load_ticker_type_cache()
 # --- END FLOAT PATCH ---
 
 # Filtering counters for debugging
@@ -243,26 +319,40 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
             )
         return False
 
-    # 🚫 ETF FILTER: Block known ETFs and leveraged products (explicit list only)
-    # Removed suffix pattern (L/S/X) to prevent false positives on real stocks like ASNS
+    # 🚫 ETF/WARRANT FILTER: Two-tier filtering system
+    # TIER 1: Hardcoded list for instant filtering of common ETFs (no API call)
     common_etfs = {
         'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
         'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
         'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
+        'UPRO', 'SPXU', 'QLD', 'QID', 'SSO', 'SDS',  # 2x/3x S&P 500 & Nasdaq
+        'FNGU', 'FNGO', 'BERZ',  # FANG leveraged/inverse
         'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD', 'DZZ',  # Gold/commodity ETFs
         'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',  # Crypto/quantum ETF-like products
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',  # YieldMax income/covered call ETFs
+        'TSLL', 'TSLS', 'TSL', 'TSLG', 'TSDD',  # Tesla leveraged/inverse ETFs
         'SLE', 'SMD', 'AMD3', 'SKY', 'SND',  # GraniteShares leveraged products
         'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'  # Volatility products
     }
     
-    # Block only if symbol is in explicit ETF list
+    # TIER 1: Fast path - check hardcoded ETF list
     if symbol in common_etfs:
         filter_counts["common_etf"] = filter_counts.get("common_etf", 0) + 1
         if filter_counts["common_etf"] % 50 == 1:
             logger.info(
                 f"[FILTER DEBUG] {symbol} filtered: Known ETF/structured product (count: {filter_counts['common_etf']})"
+            )
+        return False
+    
+    # TIER 2: Check Polygon API ticker type cache (instant dict lookup, populated by background task)
+    # Block: ETF, ETN (Exchange-Traded Note), WARRANT, FUND, UNIT, SP (Structured Product)
+    ticker_type = ticker_type_cache.get(symbol)
+    if ticker_type in ['ETF', 'ETN', 'WARRANT', 'FUND', 'UNIT', 'SP']:
+        filter_counts["polygon_etf"] = filter_counts.get("polygon_etf", 0) + 1
+        if filter_counts["polygon_etf"] % 50 == 1:
+            logger.info(
+                f"[FILTER DEBUG] {symbol} filtered: Polygon type={ticker_type} (count: {filter_counts['polygon_etf']})"
             )
         return False
 
@@ -1330,6 +1420,9 @@ volume_spike_alerted = set()
 rvol_spike_alerted = set()
 halted_symbols = set()
 halt_last_alert_time = {}  # Track last halt alert time per symbol to prevent spam on reconnects
+halt_resume_alert_time = {}  # Track last resume alert time per symbol to prevent duplicates
+halted_stocks = {}  # Track actively halted stocks {symbol: {'time': halt_time, 'price': price, 'halt_key': key}}
+halt_lock = asyncio.Lock()  # Concurrency lock to avoid race conditions on halt detection
 
 ALERT_COOLDOWN_MINUTES = 1  # 🚨 REDUCED to 1 minute - catch rapid momentum shifts
 # 🚨 NEW: Track last alert time PER ALERT TYPE (not just per symbol)
@@ -1923,6 +2016,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     
     # 🚀 MEMORY MANAGEMENT: Enforce symbol limit with LRU eviction
     enforce_symbol_limit(symbol)
+    
+    # 🎯 BACKGROUND TASK: Populate ticker type cache for new symbols (non-blocking)
+    # If ticker type not in cache, fetch it in background - future checks will be instant
+    if symbol not in ticker_type_cache:
+        asyncio.create_task(get_ticker_type(symbol))
 
     # Only reset state once per day at 04:00 ET (not on every calendar day change)
     if current_session_date != today_ny:
@@ -2705,10 +2803,13 @@ def is_etf(symbol):
         'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
         'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
         'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
+        'UPRO', 'SPXU', 'QLD', 'QID', 'SSO', 'SDS',  # 2x/3x S&P 500 & Nasdaq
+        'FNGU', 'FNGO', 'BERZ',  # FANG leveraged/inverse
         'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD', 'DZZ',
         'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',
+        'TSLL', 'TSLS', 'TSL', 'TSLG', 'TSDD',  # Tesla leveraged/inverse ETFs
         'SLE', 'SMD', 'AMD3', 'SKY', 'SND',
         'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'
     }
@@ -2724,10 +2825,13 @@ async def premarket_gainers_alert_loop():
         'SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'VOO', 'VEA', 'VWO', 'AGG', 'BND',
         'GLD', 'SLV', 'USO', 'UNG', 'TLT', 'HYG', 'LQD', 'EEM', 'FXI', 'EWJ',
         'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'SPXL', 'SPXS', 'TECL', 'TECS',
-        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD',
+        'UPRO', 'SPXU', 'QLD', 'QID', 'SSO', 'SDS',  # 2x/3x S&P 500 & Nasdaq
+        'FNGU', 'FNGO', 'BERZ',  # FANG leveraged/inverse
+        'JDST', 'JNUG', 'NUGT', 'DUST', 'ZSL', 'GLL', 'AGQ', 'UGLD', 'DGLD', 'DZZ',
         'LABU', 'LABD', 'YINN', 'YANG', 'FAS', 'FAZ', 'TNA', 'TZA',
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',
+        'TSLL', 'TSLS', 'TSL', 'TSLG', 'TSDD',  # Tesla leveraged/inverse ETFs
         'SLE', 'SMD', 'AMD3', 'SKY', 'SND',
         'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'
     }
@@ -2864,11 +2968,16 @@ async def ingest_polygon_events():
                         "action": "auth",
                         "params": POLYGON_API_KEY
                     }))
-                # Subscribe to ALL active stocks - full market scanning for dynamic discovery + halt monitoring
+                # Subscribe to ALL active stocks - full market scanning + 3-step halt verification
+                # AM.* = aggregated minute bars
+                # T.* = trades (for halt resume confirmation)
+                # LULD.* = LULD events (indicator 17 = halt candidate)
+                # Q.* = quotes (condition 43 = confirmed halt)
+                # NOI.* = auction imbalances (auction='H' = halt auction)
                 await ws.send(
                     json.dumps({
                         "action": "subscribe",
-                        "params": "AM.*,T.*,LULD.*"
+                        "params": "AM.*,T.*,LULD.*,Q.*,NOI.*"
                     }))
                 logger.info(
                     "Subscribed to: AM.* (minute bars), T.* (trades), LULD.* (halt/volatility alerts) - FULL monitoring"
@@ -2976,6 +3085,71 @@ async def ingest_polygon_events():
                                 logger.debug(
                                     f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={trade_time} | Age={trade_age_seconds:.1f}s"
                                 )
+                                
+                                # 🚨 RESUME DETECTION: First trade after halt = stock resumed
+                                if symbol in halted_stocks:
+                                    async with halt_lock:  # Prevent race conditions & atomic pop
+                                        halt_info = halted_stocks.get(symbol)
+                                        if not halt_info:  # Double-check after acquiring lock
+                                            continue
+                                        
+                                        halt_time = halt_info['time']
+                                        halt_price = halt_info['price']
+                                        halt_price_str = halt_info['price_str']
+                                        halt_key = halt_info.get('halt_key')  # Get halt_key for cleanup
+                                        
+                                        # Dedup: skip if already sent resume alert recently
+                                        now_utc = datetime.now(timezone.utc)
+                                        last_resume_time = halt_resume_alert_time.get(symbol)
+                                        if last_resume_time and (now_utc - last_resume_time).total_seconds() < 300:  # 5 min
+                                            continue
+                                        
+                                        # Trade occurred after halt = RESUMED (with upper bound to avoid stale resumes)
+                                        time_since_halt = (trade_time - halt_time).total_seconds() / 60
+                                        if trade_time > halt_time and time_since_halt < 20:  # Within 20 min of halt
+                                            try:
+                                                # 🚨 VALIDATE TRADE DATA: Ensure valid price AND volume before confirming resume
+                                                if not price or not isinstance(price, (int, float)) or price <= 0:
+                                                    logger.warning(f"[RESUME SKIP] {symbol} - Invalid resume price: {price}")
+                                                    continue
+                                                if not size or not isinstance(size, (int, float)) or size <= 0:
+                                                    logger.warning(f"[RESUME SKIP] {symbol} - Invalid resume volume: {size}")
+                                                    continue
+                                                
+                                                eastern = pytz.timezone("America/New_York")
+                                                halt_time_et = halt_time.astimezone(eastern)
+                                                resume_time_et = trade_time.astimezone(eastern)
+                                                resume_price_str = fmt_price(price)
+                                                
+                                                alert_msg = f"▶️ <b>RESUMED {symbol}</b> ${resume_price_str}"
+                                                
+                                                logger.warning(
+                                                    f"[✅ RESUME] {symbol} - Halted @ {halt_time_et.strftime('%I:%M:%S %p')} ${halt_price_str}, "
+                                                    f"resumed @ {resume_time_et.strftime('%I:%M:%S %p')} ${resume_price_str}"
+                                                )
+                                                await send_all_alerts(alert_msg)
+                                                
+                                                # Log resume event
+                                                try:
+                                                    log_event("trading_resume", symbol, price, 0, trade_time, {
+                                                        "halt_time": halt_time.isoformat(),
+                                                        "halt_price": halt_price,
+                                                        "resume_price": price,
+                                                        "halt_duration_minutes": time_since_halt
+                                                    })
+                                                except Exception as log_err:
+                                                    logger.error(f"[RESUME] {symbol} - Failed to log event: {log_err}")
+                                                
+                                                # Track resume alert time
+                                                halt_resume_alert_time[symbol] = now_utc
+                                                
+                                                # Cleanup: remove from halted tracking AND halted_symbols set
+                                                del halted_stocks[symbol]
+                                                if halt_key and halt_key in halted_symbols:
+                                                    halted_symbols.discard(halt_key)
+                                                
+                                            except Exception as resume_err:
+                                                logger.error(f"[RESUME ERROR] {symbol} - Failed to send resume alert: {resume_err}", exc_info=True)
                                 
                                 # 🚨 LOCAL CANDLE AGGREGATION: Build 1-min candles from trades when Polygon doesn't provide AM events
                                 # Track trades per minute for symbols missing Polygon candles
@@ -3161,158 +3335,169 @@ async def ingest_polygon_events():
                                 await send_best_alert(symbol)
                             elif event.get("ev") == "LULD":
                                 # Handle LULD (Limit Up/Limit Down) events - Polygon's official halt detection!
-                                # Robust symbol extraction - Polygon uses different keys across feeds
-                                symbol = event.get("sym") or event.get("T") or event.get("ticker") or event.get("symbol")
-                                high_limit = event.get("h")  # High price limit
-                                low_limit = event.get("l")  # Low price limit
-                                timestamp = event.get(
-                                    "t", 0)  # Unix timestamp in milliseconds
-                                indicators = event.get("i",
-                                                       [])  # Indicators array
+                                async with halt_lock:  # Prevent race conditions
+                                    symbol = event.get("sym") or event.get("T") or event.get("ticker") or event.get("symbol")
+                                    raw_indicators = event.get("i", [])
+                                    timestamp = event.get("t", 0)  # Unix timestamp (Polygon uses nanoseconds)
 
-                                # 🔍 DEBUG: Log raw LULD event for diagnosis
-                                logger.info(f"[LULD RAW EVENT] keys={list(event.keys())} symbol={symbol} event={event}")
-                                
-                                # 🚨 HALT ALERTS DISABLED: Need to identify correct indicator codes
-                                # TGE false alert had indicator [0] - unclear if that's an actual halt
-                                # Log all LULD events to identify which indicators = real halts
-                                # TODO: Monitor logs to map indicators to halt types, then re-enable
-                                logger.info(f"[LULD LOGGED] {symbol} - Indicator {indicators} (monitoring only, no alert)")
-                                continue
-                                
-                                if symbol and timestamp:
-                                    # Format halt key for deduplication
-                                    # 🚨 CRITICAL FIX: Polygon LULD timestamps are in NANOSECONDS, divide by 1,000,000,000 to get seconds
+                                    # 🚨 NORMALIZE INDICATORS: Polygon can send int, string, or list
+                                    # Coerce to list for consistent membership checking
+                                    if isinstance(raw_indicators, (int, str)):
+                                        indicators = [int(raw_indicators)]
+                                    elif isinstance(raw_indicators, list):
+                                        indicators = [int(i) if isinstance(i, str) else i for i in raw_indicators]
+                                    else:
+                                        indicators = []
+
+                                    # 🚨 INDICATOR 17 ONLY = ACTUAL HALT (Suspended/Halt/Pause)
+                                    # Indicator 16 = just "Restated Value" (price band update, NOT a halt)
+                                    if 17 not in indicators:
+                                        logger.debug(f"[LULD SKIP] {symbol} - Indicator {indicators} (not a halt)")
+                                        continue
+                                    
+                                    # Robust timestamp parsing (Polygon uses nanoseconds for LULD)
+                                    try:
+                                        if timestamp > 1e15:  # Nanoseconds
+                                            halt_time = datetime.fromtimestamp(timestamp / 1_000_000_000, tz=timezone.utc)
+                                        elif timestamp > 1e12:  # Microseconds
+                                            halt_time = datetime.fromtimestamp(timestamp / 1_000_000, tz=timezone.utc)
+                                        elif timestamp > 1e9:  # Milliseconds
+                                            halt_time = datetime.fromtimestamp(timestamp / 1_000, tz=timezone.utc)
+                                        else:  # Seconds
+                                            halt_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                                    except Exception as e:
+                                        logger.error(f"[LULD ERROR] {symbol} - Invalid timestamp {timestamp}: {e}")
+                                        continue
+                                    
                                     eastern = pytz.timezone("America/New_York")
-                                    halt_time = datetime.fromtimestamp(
-                                        timestamp / 1_000_000_000, tz=timezone.utc)
                                     halt_time_et = halt_time.astimezone(eastern)
-                                    halt_key = f"{symbol}_{halt_time_et.strftime('%H:%M:%S')}_LULD"
+                                    
+                                    # Key dedupe with DATE to avoid collisions across days
+                                    halt_key = f"{symbol}_{halt_time_et.strftime('%Y-%m-%d_%H:%M:%S')}_LULD"
 
-                                    # 🚨 STALE EVENT FILTER: Reject LULD events older than 5 minutes
-                                    # Only alert on ACTIVELY HALTED stocks, not old/resumed halts
+                                    # Staleness filter: reject halts older than 5 minutes
                                     now = datetime.now(timezone.utc)
                                     halt_age_minutes = (now - halt_time).total_seconds() / 60
-                                    if halt_age_minutes > 5:  # 5 minute staleness threshold - only current halts
-                                        logger.info(f"[LULD SKIP] {symbol} - Halt is {halt_age_minutes:.1f} minutes old (stale event, stock likely resumed)")
+                                    if halt_age_minutes > 5:
+                                        logger.info(f"[LULD SKIP] {symbol} - Halt is {halt_age_minutes:.1f} min old (stale)")
                                         continue
                                     
-                                    # 🚨 TIME-BASED DEDUPLICATION: Skip if we alerted on this symbol in last 5 minutes
-                                    # This prevents spam when scanner reconnects and Polygon resends old LULD events
+                                    # Deduplication: skip if already alerted within 5 minutes
                                     last_halt_time = halt_last_alert_time.get(symbol)
-                                    if last_halt_time and (now - last_halt_time).total_seconds() < 300:  # 5 minutes
-                                        time_since = int((now - last_halt_time).total_seconds())
-                                        logger.info(f"[LULD SKIP] {symbol} - Already alerted {time_since}s ago (within 5min window)")
+                                    if last_halt_time and (now - last_halt_time).total_seconds() < 300:
+                                        logger.info(f"[LULD SKIP] {symbol} - Already alerted {int((now - last_halt_time).total_seconds())}s ago")
                                         continue
                                     
-                                    # Skip if already processed this exact halt
                                     if halt_key in halted_symbols:
-                                        logger.info(f"[LULD SKIP] {symbol} - Duplicate halt key: {halt_key}")
+                                        logger.info(f"[LULD SKIP] {symbol} - Duplicate halt key")
                                         continue
 
-                                    halted_symbols.add(halt_key)
-
-                                    # 🚨 ACTIVE HALT VERIFICATION: Check if stock has traded since halt
-                                    # If we have recent trades AFTER the halt time, stock has resumed → skip alert
+                                    # Active halt verification: check if stock traded after halt
                                     symbol_last_trade_time = last_trade_time.get(symbol)
-                                    if symbol_last_trade_time and symbol_last_trade_time > halt_time:
-                                        time_since_halt = (symbol_last_trade_time - halt_time).total_seconds() / 60
-                                        logger.info(f"[LULD SKIP] {symbol} - Stock has traded {time_since_halt:.1f} min after halt (resumed, not currently halted)")
-                                        continue
-
-                                    # 🚨🚨 SPECIAL HALT HANDLING - BULLETPROOF 🚨🚨
-                                    logger.warning(f"[LULD DETECTED] {symbol} halt at {halt_time_et.strftime('%I:%M:%S %p ET')}")
-                                    
-                                    try:
-                                        # Try to get price from multiple sources
-                                        current_price = last_trade_price.get(symbol)
-                                        price_source = "last_trade"
-                                        
-                                        if not current_price:
-                                            logger.info(f"[LULD] {symbol} - No last_trade_price, trying yfinance (non-blocking)...")
+                                    if symbol_last_trade_time:
+                                        # Normalize comparison: handle datetime vs int timestamps
+                                        if isinstance(symbol_last_trade_time, datetime):
+                                            # Ensure timezone-aware
+                                            if symbol_last_trade_time.tzinfo is None:
+                                                symbol_last_trade_time = symbol_last_trade_time.replace(tzinfo=timezone.utc)
+                                            if symbol_last_trade_time > halt_time:
+                                                logger.info(f"[LULD SKIP] {symbol} - Stock traded after halt (resumed)")
+                                                continue
+                                        elif isinstance(symbol_last_trade_time, (int, float)):
+                                            # Convert to datetime for comparison
                                             try:
-                                                def _fetch_price():
+                                                trade_dt = datetime.fromtimestamp(symbol_last_trade_time, tz=timezone.utc)
+                                                if trade_dt > halt_time:
+                                                    logger.info(f"[LULD SKIP] {symbol} - Stock traded after halt (resumed)")
+                                                    continue
+                                            except:
+                                                pass
+
+                                    logger.warning(f"[LULD HALT] {symbol} - Indicator 17 at {halt_time_et.strftime('%I:%M:%S %p ET')}")
+                                    
+                                    # Get price and float for filtering
+                                    current_price = last_trade_price.get(symbol)
+                                    if not current_price:
+                                        # Fallback to yfinance (safer with exception handling)
+                                        try:
+                                            def _fetch_price():
+                                                try:
                                                     import yfinance as yf
                                                     ticker_info = yf.Ticker(symbol).info
                                                     return ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
-                                                
-                                                loop = asyncio.get_running_loop()
-                                                current_price = await loop.run_in_executor(None, _fetch_price)
-                                                price_source = "yfinance"
-                                            except Exception as yf_error:
-                                                logger.warning(f"[LULD] {symbol} - yfinance failed: {yf_error}")
-                                        
-                                        if not current_price and symbol in candles and len(candles[symbol]) > 0:
-                                            current_price = candles[symbol][-1]['close']
-                                            price_source = "candle"
-                                            logger.info(f"[LULD] {symbol} - Using candle price ${current_price:.2f}")
-
-                                        float_shares = await get_float_shares(symbol)
-                                        
-                                        # 🚨 STRICT HALT FILTERING: Only alert if stock meets bot criteria
-                                        # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
-                                        should_alert = False
-                                        filter_reason = None
-                                        
-                                        # Price must be known and ≤$15 to alert
-                                        if not current_price:
-                                            filter_reason = "no price data available"
-                                            logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-                                        elif current_price > PRICE_THRESHOLD:
-                                            should_alert = False
-                                            filter_reason = f"price ${current_price:.2f} > ${PRICE_THRESHOLD}"
-                                            logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-                                        else:
-                                            # Price is valid, check float
-                                            if float_shares is None:
-                                                # FAIL-OPEN: Alert on unknown floats for halts (important events)
-                                                should_alert = True
-                                                logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float UNKNOWN - MEETS CRITERIA (fail-open)")
-                                            elif not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES or symbol in FLOAT_EXCEPTION_SYMBOLS):
-                                                filter_reason = f"float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M"
-                                                logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-                                            else:
-                                                # Stock meets all criteria!
-                                                should_alert = True
-                                                logger.info(f"[LULD PASS] {symbol} - Price ${current_price:.2f}, Float {float_shares/1e6:.1f}M - MEETS CRITERIA")
-                                        
-                                        if should_alert:
-                                            # 🚀 TRUST POLYGON LULD: Skip NASDAQ verification (unreliable)
-                                            # Polygon's LULD events + staleness filter + trade verification is enough
-                                            # NASDAQ page doesn't reliably show all halts (brief halts disappear)
+                                                except Exception as e:
+                                                    logger.debug(f"[LULD] {symbol} - yfinance fetch error: {e}")
+                                                    return None
                                             
-                                            # Format clean halt alert - just emoji, HALT, ticker, price
-                                            price_str = fmt_price(current_price) if current_price else "?"
-                                            alert_msg = f"🛑 <b>HALT {symbol}</b> ${price_str}"
+                                            loop = asyncio.get_running_loop()
+                                            current_price = await loop.run_in_executor(None, _fetch_price)
+                                        except Exception as e:
+                                            logger.warning(f"[LULD] {symbol} - yfinance failed: {e}")
+                                    
+                                    if not current_price and symbol in candles and len(candles[symbol]) > 0:
+                                        current_price = candles[symbol][-1]['close']
 
-                                            logger.warning(f"[🚨 HALT ALERT] Sending VERIFIED LULD halt for {symbol} @ ${price_str} ({price_source})")
-                                            await send_all_alerts(alert_msg)
-
-                                            # Log halt event
-                                            log_event(
-                                                "polygon_luld_halt", symbol,
-                                                current_price if current_price else 0, 0, halt_time, {
-                                                    "halt_type": "LULD",
-                                                    "high_limit": high_limit,
-                                                    "low_limit": low_limit,
-                                                    "indicators": indicators,
-                                                    "float_shares": float_shares,
-                                                    "price_source": price_source,
-                                                    "data_source": "polygon_luld"
-                                                })
-
-                                            # Track when we sent this halt alert (prevents spam on reconnects)
-                                            halt_last_alert_time[symbol] = datetime.now(timezone.utc)
-                                            logger.warning(f"[✅ LULD SENT] {symbol} @ ${price_str} - LULD halt verified")
-                                        else:
-                                            logger.info(f"[LULD FILTERED] {symbol} - {filter_reason}")
-
-                                    except Exception as e:
-                                        logger.error(f"[🚨 LULD ERROR] Error processing halt for {symbol}: {e}", exc_info=True)
-                                        # 🚨 CRITICAL FIX: NO emergency alerts - must pass filtering to alert
-                                        # If we can't verify price/float, we can't confirm it meets criteria
-                                        logger.warning(f"[LULD BLOCKED] {symbol} - Error during filtering, cannot verify criteria - NO ALERT SENT")
+                                    float_shares = await get_float_shares(symbol)
+                                    
+                                    # 🚫 WARRANT FILTER: Block warrants from halt alerts
+                                    if is_warrant(symbol):
+                                        logger.info(f"[LULD SKIP] {symbol} - Warrant filtered")
                                         continue
+                                    
+                                    # 🚫 ETF FILTER: Block ETFs from halt alerts
+                                    if is_etf(symbol):
+                                        logger.info(f"[LULD SKIP] {symbol} - ETF filtered")
+                                        continue
+                                    
+                                    # Filter: price must be ≤$15 and float 500K-20M
+                                    if not current_price:
+                                        logger.info(f"[LULD SKIP] {symbol} - No price data available")
+                                        continue
+                                        
+                                    if current_price > PRICE_THRESHOLD:
+                                        logger.info(f"[LULD SKIP] {symbol} - Price ${current_price:.2f} > ${PRICE_THRESHOLD}")
+                                        continue
+                                    
+                                    # Float check (explicit None check, fail-open for None)
+                                    if float_shares is not None and not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
+                                        logger.info(f"[LULD SKIP] {symbol} - Float {float_shares/1e6:.1f}M not in range {MIN_FLOAT_SHARES/1e6:.1f}M-{MAX_FLOAT_SHARES/1e6:.1f}M")
+                                        continue
+                                    
+                                    # All filters passed - send halt alert (defensive exception handling)
+                                    try:
+                                        price_str = fmt_price(current_price)
+                                        alert_msg = f"🛑 <b>HALT {symbol}</b> ${price_str}"
+                                        
+                                        logger.warning(f"[🚨 HALT ALERT] {symbol} @ ${price_str} - LULD indicator 17")
+                                        await send_all_alerts(alert_msg)
+                                        
+                                        # Log halt event
+                                        try:
+                                            log_event("trading_halt", symbol, current_price, 0, halt_time, {
+                                                "halt_type": "LULD",
+                                                "indicator": 17,
+                                                "float_shares": float_shares
+                                            })
+                                        except Exception as log_err:
+                                            logger.error(f"[LULD] {symbol} - Failed to log event: {log_err}")
+                                        
+                                        # Track alert time to prevent duplicates
+                                        halt_last_alert_time[symbol] = now
+                                        
+                                        # Track halted stock for resume detection (store halt_key for cleanup)
+                                        halted_stocks[symbol] = {
+                                            'time': halt_time,
+                                            'price': current_price,
+                                            'price_str': price_str,
+                                            'halt_key': halt_key  # Store for cleanup on resume
+                                        }
+                                        
+                                        # Add to halted_symbols AFTER verification
+                                        halted_symbols.add(halt_key)
+                                        
+                                        logger.warning(f"[✅ HALT SENT] {symbol} @ ${price_str} - Tracking for resume")
+                                    except Exception as alert_err:
+                                        logger.error(f"[LULD ERROR] {symbol} - Failed to send alert: {alert_err}", exc_info=True)
                     except Exception as e:
                         logger.error(f"Error processing message: {e}\nRaw: {msg[:200]}", exc_info=True)
 
@@ -3902,6 +4087,48 @@ async def ml_training_loop():
         await asyncio.sleep(300)  # 5 minutes
 
 
+async def prune_stale_halts():
+    """🧹 BACKGROUND TASK: Prune halt entries older than 20 minutes
+    
+    Prevents memory leak when halted stocks never resume (no trade arrives).
+    Runs every 60 seconds to cleanup stale entries.
+    """
+    MAX_HALT_AGE_MINUTES = 20
+    
+    while True:
+        try:
+            await asyncio.sleep(60)  # Check every minute
+            
+            if not is_market_scan_time():
+                continue
+            
+            now = datetime.now(timezone.utc)
+            stale_symbols = []
+            
+            # Find stale halt entries (>20 min old)
+            async with halt_lock:
+                for symbol, halt_info in list(halted_stocks.items()):
+                    halt_time = halt_info.get('time')
+                    if not halt_time:
+                        # Corrupt entry - remove immediately
+                        stale_symbols.append(symbol)
+                        continue
+                    
+                    age_minutes = (now - halt_time).total_seconds() / 60
+                    if age_minutes > MAX_HALT_AGE_MINUTES:
+                        stale_symbols.append(symbol)
+                
+                # Remove stale entries
+                for symbol in stale_symbols:
+                    halt_info = halted_stocks.pop(symbol, None)
+                    if halt_info and halt_info.get('halt_key'):
+                        halted_symbols.discard(halt_info['halt_key'])
+                    logger.info(f"[PRUNE] {symbol} - Removed stale halt entry (>20 min old)")
+            
+        except Exception as e:
+            logger.error(f"[PRUNE ERROR] Failed to prune stale halts: {e}")
+
+
 async def main():
     global http_session
     
@@ -3941,6 +4168,8 @@ async def main():
     premarket_alert_task = asyncio.create_task(premarket_gainers_alert_loop())
     # Enable NASDAQ halt monitoring (catches T1, T2, T5, T12 halts that Polygon LULD misses)
     nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
+    # Enable halt pruning (removes stale entries >20 min old)
+    prune_halt_task = asyncio.create_task(prune_stale_halts())
     # 🔍 DISABLED: REST API backup scanner (was alerting on late/worthless moves)
     # rest_backup_task = asyncio.create_task(rest_api_backup_scanner())
     try:
@@ -3953,6 +4182,7 @@ async def main():
         close_alert_task.cancel()
         premarket_alert_task.cancel()
         nasdaq_halt_task.cancel()
+        prune_halt_task.cancel()
         # rest_backup_task.cancel()  # DISABLED
 
         # 🚨 FIX: Await cancelled tasks with error handling
@@ -3970,6 +4200,10 @@ async def main():
             pass
         try:
             await nasdaq_halt_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await prune_halt_task
         except asyncio.CancelledError:
             pass
         # REST backup scanner disabled
