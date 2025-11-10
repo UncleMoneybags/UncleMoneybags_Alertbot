@@ -2402,8 +2402,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data for reclaim, blocking alert"
             )
             return  # Block VWAP reclaim if insufficient data
-        prev_vwap = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
+        
+        # 🚨 FIX: Use SAME VWAP for both comparisons (current session VWAP)
+        # Previous logic was BROKEN - compared against different VWAPs creating false crossovers
         curr_vwap = vwap_candles_numpy(list(vwap_candles[symbol]))
+        
         trailing_vols = [c['volume'] for c in candles_list[:-1]]
         rvol = 0
         if trailing_vols:
@@ -2411,16 +2414,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 len(trailing_vols), 20)
             rvol = curr_candle[
                 'volume'] / avg_trailing if avg_trailing > 0 else 0
+        
         # 🚨 CRITICAL FIX: VWAP reclaim uses ONLY candle closes for crossover detection
-        # Previous logic was BROKEN - mixed real-time ticks with candle data
+        # Compare BOTH candles against the SAME VWAP (current session VWAP)
         prev_close = prev_candle['close']
         curr_close = curr_candle['close']
         
-        # Simple, clean crossover detection: previous candle below, current candle above
-        prev_below_vwap = (prev_vwap is not None and prev_close < prev_vwap)
+        # True crossover: previous candle closed below current VWAP, current candle closes above it
+        prev_below_vwap = (curr_vwap is not None and prev_close < curr_vwap)
         curr_above_vwap = (curr_vwap is not None and curr_close > curr_vwap * 1.005)  # 0.5% buffer
         
-        # TRUE CROSSOVER = previous closed below AND current closed above (that's it!)
+        # TRUE CROSSOVER = previous closed below AND current closed above (same VWAP baseline!)
         is_true_crossover = prev_below_vwap and curr_above_vwap
         
         # Require UPWARD price movement for VWAP reclaim
@@ -2436,13 +2440,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and rvol >= 1.5  # RVOL threshold
         )
 
-        # DEBUG: Show VWAP reclaim detection logic
+        # DEBUG: Show VWAP reclaim detection logic (now using same VWAP for both)
         if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
             logger.info(
-                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < prev_vwap={prev_vwap:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > curr_vwap={curr_vwap:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
+                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < curr_vwap={curr_vwap:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > curr_vwap={curr_vwap:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
             )
         logger.info(
-            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={prev_vwap:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
+            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={curr_vwap:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -3425,6 +3429,14 @@ async def ingest_polygon_events():
 
                                     logger.warning(f"[LULD HALT] {symbol} - Indicator 17 at {halt_time_et.strftime('%I:%M:%S %p ET')}")
                                     
+                                    # 🚨 CRITICAL: Verify halt on NASDAQ before alerting (prevents false positives)
+                                    halt_time_str = halt_time_et.strftime('%H:%M:%S')
+                                    is_verified = await verify_halt_on_nasdaq(symbol, halt_time_str)
+                                    
+                                    if not is_verified:
+                                        logger.warning(f"[LULD SKIP] {symbol} - NOT verified on NASDAQ (false positive)")
+                                        continue
+                                    
                                     # Get price and float for filtering
                                     current_price = last_trade_price.get(symbol)
                                     if not current_price:
@@ -3556,6 +3568,36 @@ async def ingest_polygon_events():
                 await asyncio.sleep(30)
 
 
+async def check_nasdaq_halt_status(symbol):
+    """Check if stock is currently listed on NASDAQ halt page.
+    Returns True if stock is STILL HALTED, False if resumed/not found.
+    """
+    from bs4 import BeautifulSoup
+    
+    try:
+        async with http_session.get("https://www.nasdaqtrader.com/trader.aspx?id=tradehalts", 
+                                     timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status == 200:
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                table = soup.find('table', {'id': 'Trading_Halts'})
+                
+                if table:
+                    rows = table.find_all('tr')[1:]  # Skip header
+                    for row in rows:
+                        cols = row.find_all('td')
+                        if len(cols) >= 1:
+                            nasdaq_symbol = cols[0].text.strip()
+                            if nasdaq_symbol == symbol:
+                                return True  # Still halted
+        
+        return False  # Not found = resumed or never halted
+        
+    except Exception as e:
+        logger.error(f"[RESUME CHECK] Error checking {symbol}: {e}")
+        return True  # On error, assume still halted (don't send false resume)
+
+
 async def verify_halt_on_nasdaq(symbol, halt_time_str):
     """🔍 HALT VERIFICATION: Re-check NASDAQ to confirm halt is still active
     
@@ -3598,6 +3640,91 @@ async def verify_halt_on_nasdaq(symbol, halt_time_str):
         logger.error(f"[HALT VERIFY] Error verifying {symbol}: {e}")
         # If verification fails with error, BLOCK the alert (prevent false positives)
         return False
+
+
+async def active_resume_monitor():
+    """🚀 ACTIVE RESUME DETECTION: Poll NASDAQ every 10 seconds to catch resumes INSTANTLY
+    
+    Detects resumes even with ZERO volume by checking if stock disappears from NASDAQ halt page.
+    Sends resume alert immediately when halt status clears, not waiting for trades.
+    """
+    while True:
+        try:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            
+            if not is_market_scan_time():
+                continue
+            
+            # Get list of currently halted stocks
+            async with halt_lock:
+                halted_list = list(halted_stocks.items())
+            
+            if not halted_list:
+                continue  # No halted stocks to monitor
+            
+            # Check each halted stock on NASDAQ
+            for symbol, halt_info in halted_list:
+                try:
+                    # Check if still listed on NASDAQ halt page
+                    still_halted = await check_nasdaq_halt_status(symbol)
+                    
+                    if not still_halted:
+                        # Stock RESUMED! (disappeared from halt page)
+                        async with halt_lock:
+                            if symbol not in halted_stocks:
+                                continue  # Already processed
+                            
+                            halt_info = halted_stocks.get(symbol)
+                            if not halt_info:
+                                continue
+                            
+                            halt_time = halt_info.get('time')
+                            halt_price = halt_info.get('price', 0)
+                            
+                            # Check resume alert cooldown
+                            now_utc = datetime.now(timezone.utc)
+                            last_resume_time = halt_resume_alert_time.get(symbol)
+                            if last_resume_time and (now_utc - last_resume_time).total_seconds() < 300:
+                                continue
+                            
+                            # Get current price (best available)
+                            current_price = last_trade_price.get(symbol) or halt_price
+                            
+                            eastern = pytz.timezone("America/New_York")
+                            halt_time_et = halt_time.astimezone(eastern) if halt_time else None
+                            resume_time_et = now_utc.astimezone(eastern)
+                            
+                            halt_duration_mins = (now_utc - halt_time).total_seconds() / 60 if halt_time else 0
+                            
+                            price_str = fmt_price(current_price)
+                            halt_time_str = halt_time_et.strftime("%I:%M %p") if halt_time_et else "Unknown"
+                            resume_time_str = resume_time_et.strftime("%I:%M %p")
+                            
+                            alert_msg = (
+                                f"✅ <b>{escape_html(symbol)} RESUMED</b>\n\n"
+                                f"Halted: {halt_time_str} ET\n"
+                                f"Resumed: {resume_time_str} ET\n"
+                                f"Duration: {halt_duration_mins:.0f} min\n"
+                                f"Price: ${price_str}"
+                            )
+                            
+                            await send_all_alerts(alert_msg)
+                            logger.warning(f"[✅ RESUME DETECTED] {symbol} @ ${price_str} - Disappeared from NASDAQ halt page")
+                            
+                            # Track and cleanup
+                            halt_resume_alert_time[symbol] = now_utc
+                            halt_key = halt_info.get('halt_key')
+                            if halt_key:
+                                halted_symbols.discard(halt_key)
+                            halted_stocks.pop(symbol, None)
+                            
+                except Exception as e:
+                    logger.error(f"[RESUME MONITOR] Error checking {symbol}: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"[RESUME MONITOR] Loop error: {e}")
+            await asyncio.sleep(10)
 
 
 async def rest_api_backup_scanner():
@@ -4180,6 +4307,8 @@ async def main():
     nasdaq_halt_task = asyncio.create_task(nasdaq_halt_monitor())
     # Enable halt pruning (removes stale entries >20 min old)
     prune_halt_task = asyncio.create_task(prune_stale_halts())
+    # Enable active resume monitor (checks NASDAQ every 10s for instant resume detection)
+    resume_monitor_task = asyncio.create_task(active_resume_monitor())
     # 🔍 DISABLED: REST API backup scanner (was alerting on late/worthless moves)
     # rest_backup_task = asyncio.create_task(rest_api_backup_scanner())
     try:
@@ -4193,6 +4322,7 @@ async def main():
         premarket_alert_task.cancel()
         nasdaq_halt_task.cancel()
         prune_halt_task.cancel()
+        resume_monitor_task.cancel()
         # rest_backup_task.cancel()  # DISABLED
 
         # 🚨 FIX: Await cancelled tasks with error handling
@@ -4214,6 +4344,10 @@ async def main():
             pass
         try:
             await prune_halt_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await resume_monitor_task
         except asyncio.CancelledError:
             pass
         # REST backup scanner disabled
