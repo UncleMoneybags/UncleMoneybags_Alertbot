@@ -21,6 +21,15 @@ import requests
 import pandas as pd
 import time
 
+# 🚀 PERFORMANCE: Use uvloop for faster event loop (Linux/macOS)
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    logger = logging.getLogger(__name__)
+    logger.info("[PERFORMANCE] uvloop enabled - faster event loop")
+except ImportError:
+    pass  # Fall back to default event loop on Windows or if uvloop not installed
+
 # 🚀 SAFETY NET: Register cleanup handler for unexpected exits
 def cleanup_resources():
     """Emergency cleanup handler for unexpected shutdowns
@@ -67,6 +76,9 @@ http_session = None
 # 🚀 PERFORMANCE: Thread pool executor for blocking I/O operations (pickle, CSV, JSON)
 # Prevents blocking the event loop during disk writes
 io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="io_worker")
+
+# 🚀 PERFORMANCE: Semaphore to limit concurrent API calls (prevents 429 rate limiting)
+api_semaphore = asyncio.Semaphore(20)  # Max 20 concurrent API requests
 
 last_trade_price = defaultdict(lambda: None)
 last_trade_volume = defaultdict(lambda: 0)
@@ -180,13 +192,13 @@ async def get_float_shares(ticker):
     
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _fetch_float)
+        result = await loop.run_in_executor(io_executor, _fetch_float)
         
         # Handle result
         if isinstance(result, tuple):  # Error case
             float_shares, error = result
             float_cache_none_retry[ticker] = now
-            await save_float_cache()  # Debounced, thread-safe
+            asyncio.create_task(save_float_cache())  # Non-blocking save
             if error and "Rate limited" in str(error):
                 await asyncio.sleep(5)  # Backoff for rate limits
             return float_cache.get(ticker, None)
@@ -194,17 +206,17 @@ async def get_float_shares(ticker):
             float_shares = result
             if float_shares is not None:
                 float_cache[ticker] = float_shares
-                await save_float_cache()  # Debounced, thread-safe
+                asyncio.create_task(save_float_cache())  # Non-blocking save
                 if ticker in float_cache_none_retry:
                     del float_cache_none_retry[ticker]
             else:
                 float_cache_none_retry[ticker] = now
-                await save_float_cache()  # Debounced, thread-safe
+                asyncio.create_task(save_float_cache())  # Non-blocking save
             # Removed unnecessary 0.5s sleep - slows down float lookups
             return float_shares
     except Exception as e:
         float_cache_none_retry[ticker] = now
-        await save_float_cache()  # Debounced, thread-safe
+        asyncio.create_task(save_float_cache())  # Non-blocking save
         return float_cache.get(ticker, None)
 
 
@@ -256,22 +268,24 @@ async def get_ticker_type(symbol):
         url = f"https://api.polygon.io/v3/reference/tickers/{symbol}"
         params = {"apiKey": POLYGON_API_KEY}
         
-        async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get("status") == "OK" and data.get("results"):
-                    ticker_type = data["results"].get("type")
-                    # Cache the result
-                    ticker_type_cache[symbol] = ticker_type
-                    await save_ticker_type_cache()
-                    logger.debug(f"[TICKER TYPE] {symbol} = {ticker_type}")
-                    return ticker_type
-            elif response.status == 429:  # Rate limit
-                logger.warning(f"[TICKER TYPE] Rate limited on {symbol}")
-                return None
-            else:
-                logger.debug(f"[TICKER TYPE] {symbol} - API error: {response.status}")
-                return None
+        # 🚀 PERFORMANCE: Use semaphore to limit concurrent API calls
+        async with api_semaphore:
+            async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("status") == "OK" and data.get("results"):
+                        ticker_type = data["results"].get("type")
+                        # Cache the result
+                        ticker_type_cache[symbol] = ticker_type
+                        asyncio.create_task(save_ticker_type_cache())  # Non-blocking save
+                        logger.debug(f"[TICKER TYPE] {symbol} = {ticker_type}")
+                        return ticker_type
+                elif response.status == 429:  # Rate limit
+                    logger.warning(f"[TICKER TYPE] Rate limited on {symbol}")
+                    return None
+                else:
+                    logger.debug(f"[TICKER TYPE] {symbol} - API error: {response.status}")
+                    return None
     except Exception as e:
         logger.debug(f"[TICKER TYPE] {symbol} - Error: {e}")
         return None
@@ -833,7 +847,14 @@ def get_valid_vwap(symbol):
             )
             return None
 
-    vwap_val = vwap_candles_numpy(vwap_candles[symbol])
+    # 🚀 PERFORMANCE: Use incremental VWAP (O(1) vs O(n))
+    # We maintain vwap_cum_vol and vwap_cum_pv, so just divide them
+    if symbol in vwap_cum_vol and symbol in vwap_cum_pv and vwap_cum_vol[symbol] > 0:
+        vwap_val = vwap_cum_pv[symbol] / vwap_cum_vol[symbol]
+    else:
+        # Fallback to full calculation if incremental data not available
+        logger.debug(f"[VWAP] {symbol} - Using fallback calculation (incremental data missing)")
+        vwap_val = vwap_candles_numpy(vwap_candles[symbol])
 
     # 🚨 FINAL VALIDATION: Ensure VWAP result is reasonable
     # Treat zero, negative, infinite or unreasonably large VWAP as "no VWAP"
@@ -1911,6 +1932,8 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
         # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
         candle_time_ps = candles_seq[-1]['start_time'] + timedelta(minutes=1)
         alert_price = get_display_price(symbol, last_close, candle_time_ps)
+        if alert_price is None:
+            alert_price = last_close  # Fallback to candle close
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
             f"<b>{escape_html(symbol)}</b> | ${fmt_price(alert_price)} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
@@ -2229,6 +2252,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
             candle_time_wu = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
             alert_price = get_display_price(symbol, close_wu, candle_time_wu)
+            if alert_price is None:
+                alert_price = close_wu  # Fallback to candle close
             log_event(
                 "warming_up",
                 symbol,
@@ -2352,6 +2377,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
             candle_time_rn = last_6[-1]['start_time'] + timedelta(minutes=1)
             alert_price = get_display_price(symbol, close_rn, candle_time_rn)
+            if alert_price is None:
+                alert_price = close_rn  # Fallback to candle close
             log_event(
                 "runner", symbol, alert_price,
                 volume_rn, event_time, {
@@ -2396,16 +2423,38 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             return  # Skip - prev candle not finalized yet
         
-        # Require sufficient VWAP data for both calculations
-        if len(vwap_candles[symbol]) < 3:
+        # Require sufficient VWAP data (need at least 3 candles BEFORE current)
+        if len(vwap_candles[symbol]) < 4:
             logger.info(
-                f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data for reclaim, blocking alert"
+                f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data for reclaim, blocking alert (need 4+, have {len(vwap_candles[symbol])})"
             )
             return  # Block VWAP reclaim if insufficient data
         
-        # 🚨 FIX: Use SAME VWAP for both comparisons (current session VWAP)
-        # Previous logic was BROKEN - compared against different VWAPs creating false crossovers
-        curr_vwap = vwap_candles_numpy(list(vwap_candles[symbol]))
+        # 🚨 CRITICAL FIX: Calculate VWAP EXCLUDING current candle to prevent false reclaims
+        # Problem: If we use VWAP that includes current candle, a strong current candle can
+        # move VWAP above prev_close, creating a false "reclaim" signal
+        # Solution: Compare both candles against VWAP calculated BEFORE current candle
+        
+        # Calculate VWAP baseline excluding current candle
+        if symbol in vwap_cum_vol and symbol in vwap_cum_pv and vwap_cum_vol[symbol] > 0:
+            # Subtract current candle's contribution to get VWAP before it
+            curr_typical = (curr_candle['high'] + curr_candle['low'] + curr_candle['close']) / 3
+            curr_pv = curr_typical * curr_candle['volume']
+            
+            vwap_vol_before = vwap_cum_vol[symbol] - curr_candle['volume']
+            vwap_pv_before = vwap_cum_pv[symbol] - curr_pv
+            
+            if vwap_vol_before > 0:
+                vwap_before = vwap_pv_before / vwap_vol_before
+            else:
+                logger.info(f"[VWAP PROTECTION] {symbol} - Invalid VWAP baseline (zero volume), blocking alert")
+                return
+        else:
+            # Fallback: calculate from candles excluding current
+            vwap_before = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
+            if vwap_before is None:
+                logger.info(f"[VWAP PROTECTION] {symbol} - Could not calculate VWAP baseline, blocking alert")
+                return
         
         trailing_vols = [c['volume'] for c in candles_list[:-1]]
         rvol = 0
@@ -2416,15 +2465,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 'volume'] / avg_trailing if avg_trailing > 0 else 0
         
         # 🚨 CRITICAL FIX: VWAP reclaim uses ONLY candle closes for crossover detection
-        # Compare BOTH candles against the SAME VWAP (current session VWAP)
+        # Compare BOTH candles against the SAME VWAP BASELINE (calculated BEFORE current candle)
         prev_close = prev_candle['close']
         curr_close = curr_candle['close']
         
-        # True crossover: previous candle closed below current VWAP, current candle closes above it
-        prev_below_vwap = (curr_vwap is not None and prev_close < curr_vwap)
-        curr_above_vwap = (curr_vwap is not None and curr_close > curr_vwap * 1.005)  # 0.5% buffer
+        # True crossover: previous candle closed below VWAP baseline, current candle closes above it
+        prev_below_vwap = (vwap_before is not None and prev_close < vwap_before)
+        curr_above_vwap = (vwap_before is not None and curr_close > vwap_before * 1.005)  # 0.5% buffer
         
-        # TRUE CROSSOVER = previous closed below AND current closed above (same VWAP baseline!)
+        # TRUE CROSSOVER = previous closed below AND current closed above (same baseline, EXCLUDING current!)
         is_true_crossover = prev_below_vwap and curr_above_vwap
         
         # Require UPWARD price movement for VWAP reclaim
@@ -2440,13 +2489,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and rvol >= 1.5  # RVOL threshold
         )
 
-        # DEBUG: Show VWAP reclaim detection logic (now using same VWAP for both)
+        # DEBUG: Show VWAP reclaim detection logic (using VWAP baseline BEFORE current candle)
         if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
             logger.info(
-                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < curr_vwap={curr_vwap:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > curr_vwap={curr_vwap:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
+                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < vwap_before={vwap_before:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > vwap_before={vwap_before:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
             )
         logger.info(
-            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap={curr_vwap:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap={curr_vwap:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
+            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap_before={vwap_before:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap_before={vwap_before:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
         )
         # Use stored EMAs
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2462,6 +2511,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             candle_time_vr = curr_candle['start_time'] + timedelta(minutes=1)
             alert_price = get_display_price(symbol, curr_candle['close'], candle_time_vr)
             
+            # 🚨 FIX: Ensure we have a valid price for the alert
+            if alert_price is None:
+                alert_price = curr_candle['close']  # Fallback to candle close
+            
             # Calculate alert score and add to pending alerts
             vwap_reclaim_data = {
                 "rvol": rvol,
@@ -2473,7 +2526,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             score = get_alert_score("vwap_reclaim", symbol, vwap_reclaim_data)
             
             price_str = fmt_price(alert_price)
-            vwap_str = fmt_price(curr_vwap) if curr_vwap is not None else "?"
+            vwap_str = fmt_price(vwap_before)  # 🚨 FIX: Use baseline VWAP (before current candle)
             alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
                           f"Price: ${price_str} | VWAP: ${vwap_str}")
             
@@ -2551,6 +2604,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
         candle_time_vs = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
         alert_price = get_display_price(symbol, close, candle_time_vs)
+        if alert_price is None:
+            alert_price = close  # Fallback to candle close
         price_str = fmt_price(alert_price)
         rvol_str = f"{spike_data['rvol']:.1f}"
 
@@ -2755,6 +2810,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 # 🚨 FIX: Use real-time price if fresh, otherwise candle close with timestamp
                 candle_time_ema = last_candle['start_time'] + timedelta(minutes=1)
                 alert_price = get_display_price(symbol, candle_close, candle_time_ema)
+                if alert_price is None:
+                    alert_price = candle_close  # Fallback to candle close
                 log_event(
                     "ema_stack", symbol,
                     alert_price, last_volume,
@@ -3452,7 +3509,7 @@ async def ingest_polygon_events():
                                                     return None
                                             
                                             loop = asyncio.get_running_loop()
-                                            current_price = await loop.run_in_executor(None, _fetch_price)
+                                            current_price = await loop.run_in_executor(io_executor, _fetch_price)
                                         except Exception as e:
                                             logger.warning(f"[LULD] {symbol} - yfinance failed: {e}")
                                     
@@ -4083,7 +4140,7 @@ async def nasdaq_halt_monitor():
                                                     return ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
                                                 
                                                 loop = asyncio.get_running_loop()
-                                                current_price = await loop.run_in_executor(None, _fetch_price)
+                                                current_price = await loop.run_in_executor(io_executor, _fetch_price)
                                                 price_source = "yfinance"
                                                 if current_price:
                                                     logger.info(f"[HALT PRICE] {symbol} - Got ${current_price:.2f} from yfinance")
@@ -4295,7 +4352,15 @@ async def main():
     logger.info("[STARTUP] ✅ All dependencies available\n")
     
     # 🚀 PERFORMANCE: Initialize reusable HTTP session
-    http_session = aiohttp.ClientSession()
+    # 🚀 PERFORMANCE: Configure TCPConnector with limits to prevent socket exhaustion
+    connector = aiohttp.TCPConnector(
+        limit=100,              # Max 100 total connections
+        limit_per_host=20,      # Max 20 connections per host
+        enable_cleanup_closed=True,  # Clean up closed connections
+        ttl_dns_cache=300       # Cache DNS for 5 minutes
+    )
+    timeout = aiohttp.ClientTimeout(total=10)  # 10-second timeout
+    http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     logger.info("[HTTP SESSION] Created reusable HTTP session for better performance")
     
     logger.info("Main event loop running. Press Ctrl+C to exit.")
