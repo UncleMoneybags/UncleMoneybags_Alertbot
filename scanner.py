@@ -2432,6 +2432,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             return  # Skip - prev candle not finalized yet
         
+        # 🚨 FIX: Require previous candle to be RECENT (within last 3 minutes)
+        # Prevents false alerts from comparing current candle against stale/old candles
+        prev_candle_age = now - prev_candle['start_time']
+        if prev_candle_age > timedelta(minutes=3):
+            logger.info(
+                f"[VWAP SKIP] {symbol} - Previous candle too old ({prev_candle_age.total_seconds()/60:.1f} min ago), blocking stale crossover"
+            )
+            return  # Skip - comparing against stale candle would create false alert
+        
         # Require sufficient VWAP data (need at least 3 candles BEFORE current)
         if len(vwap_candles[symbol]) < 4:
             logger.info(
