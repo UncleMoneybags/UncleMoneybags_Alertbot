@@ -300,7 +300,7 @@ filter_counts = defaultdict(int)
 
 
 def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
-    """Check if symbol meets filtering criteria: price <= $15 AND float <= 20M
+    """Check if symbol meets filtering criteria: $0.10 <= price <= $15 AND float <= 20M
     
     Args:
         use_entry_price: REMOVED - Always uses current price (no grandfathering)
@@ -321,6 +321,14 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         if filter_counts["price_none"] % 100 == 1:  # Log every 100th occurrence
             logger.info(
                 f"[FILTER DEBUG] {symbol} filtered: price is None (count: {filter_counts['price_none']})"
+            )
+        return False
+    elif check_price < MIN_PRICE_THRESHOLD:
+        filter_counts["price_too_low"] += 1
+        if filter_counts["price_too_low"] % 50 == 1:
+            logger.info(
+                f"[FILTER DEBUG] {symbol} filtered: price ${check_price:.4f} < ${MIN_PRICE_THRESHOLD} (sub-penny garbage) "
+                f"(count: {filter_counts['price_too_low']})"
             )
         return False
     elif check_price > PRICE_THRESHOLD:
@@ -966,6 +974,7 @@ if not TELEGRAM_CHAT_ID:
     sys.exit(1)
 
 PRICE_THRESHOLD = 15.00  # INCREASED: Allow more headroom for momentum moves
+MIN_PRICE_THRESHOLD = 0.10  # Minimum price threshold
 MAX_SYMBOLS = 4000
 SCREENER_REFRESH_SEC = 30
 MIN_ALERT_MOVE = 0.12
