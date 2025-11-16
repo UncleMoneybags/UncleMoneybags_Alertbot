@@ -106,28 +106,38 @@ async def gumroad_webhook(request: Request, background_tasks: BackgroundTasks):
         else:
             logger.warning("⚠️  GUMROAD_WEBHOOK_SECRET not set - webhook running WITHOUT verification (INSECURE)")
         
-        data = await request.json()
-        event_type = data.get('event')
-        sale_data = data.get('sale', {})
+        # Gumroad sends form-encoded data, parse it
+        form_data = await request.form()
         
-        logger.info(f"Received Gumroad webhook: {event_type}")
-        logger.debug(f"Webhook data: {json.dumps(data, indent=2)}")
+        # Log raw data for debugging
+        logger.info(f"Received Gumroad webhook - Raw form data: {dict(form_data)}")
         
-        if event_type in ['sale.subscription_cancelled', 'sale.refunded', 'subscriber.deleted']:
-            email = sale_data.get('email') or sale_data.get('purchaser', {}).get('email')
-            gumroad_id = sale_data.get('id') or sale_data.get('purchaser', {}).get('id')
-            
+        # Extract data from form
+        email = form_data.get('email') or form_data.get('purchaser_email')
+        seller_id = form_data.get('seller_id')
+        product_id = form_data.get('product_id')
+        
+        # Determine event type from the ping or available fields
+        if form_data.get('refunded') == 'true':
+            event_type = 'refund'
+        elif form_data.get('cancelled') == 'true':
+            event_type = 'cancellation'
+        else:
+            event_type = 'ping'
+        
+        logger.info(f"Gumroad webhook event: {event_type}, email: {email}")
+        
+        # Process cancellations and refunds
+        if event_type in ['cancellation', 'refund']:
             if email:
+                gumroad_id = form_data.get('sale_id') or form_data.get('id') or product_id
                 background_tasks.add_task(process_cancellation, email, gumroad_id)
-                logger.info(f"Queued cancellation processing for {email}")
+                logger.info(f"Queued removal for {email}")
             else:
                 logger.warning(f"No email found in {event_type} event")
         
         return JSONResponse(content={"status": "success"}, status_code=200)
         
-    except json.JSONDecodeError:
-        logger.error("Invalid JSON payload")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
         logger.error(f"Webhook processing error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
