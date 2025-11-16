@@ -27,6 +27,32 @@ async def send_message(chat_id: int, text: str, parse_mode: str = "HTML"):
             return await response.json()
 
 
+async def create_single_use_invite_link(user_id: int, email: str) -> Optional[str]:
+    """Create a single-use invite link for a specific user"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/createChatInviteLink"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "member_limit": 1,
+                "name": f"{email[:20]}"
+            }) as response:
+                result = await response.json()
+                
+                if result.get('ok'):
+                    invite_link = result['result']['invite_link']
+                    logger.info(f"Created single-use invite link for {email}")
+                    return invite_link
+                else:
+                    logger.error(f"Failed to create invite link: {result}")
+                    return None
+                    
+    except Exception as e:
+        logger.error(f"Error creating invite link: {str(e)}")
+        return None
+
+
 async def handle_telegram_update(update: dict):
     """
     Handle incoming Telegram messages for auto-onboarding
@@ -76,14 +102,26 @@ async def handle_telegram_update(update: dict):
             user_db.link_user(email, user_id)
             user_states[user_id] = 'completed'
             
-            await send_message(
-                chat_id,
-                f"Perfect! ✅\n\n"
-                f"Here's your invite link to the premium channel:\n{CHANNEL_INVITE_LINK}\n\n"
-                f"Welcome aboard! 🎉"
-            )
+            # Create single-use invite link
+            invite_link = await create_single_use_invite_link(user_id, email)
             
-            logger.info(f"Successfully linked {email} -> Telegram ID {user_id}")
+            if invite_link:
+                await send_message(
+                    chat_id,
+                    f"Perfect! ✅\n\n"
+                    f"Here's your EXCLUSIVE single-use invite link:\n{invite_link}\n\n"
+                    f"⚠️ This link works ONLY ONCE and cannot be shared.\n\n"
+                    f"Welcome aboard! 🎉"
+                )
+                logger.info(f"Successfully linked {email} -> Telegram ID {user_id}")
+            else:
+                await send_message(
+                    chat_id,
+                    f"✅ Email verified!\n\n"
+                    f"However, I couldn't generate your invite link. Please contact support."
+                )
+                logger.error(f"Failed to create invite link for {email}")
+            
             return
         
         # Unknown state - show help
