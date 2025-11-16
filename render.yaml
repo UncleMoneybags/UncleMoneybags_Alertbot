@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: stock-scanner
+    env: python
+    buildCommand: pip install --no-cache-dir -r vps_requirements.txt
+    startCommand: python scanner.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+  
+  - type: web
+    name: gumroad-telegram-bot
+    env: python
+    rootDir: gumroad_telegram
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
