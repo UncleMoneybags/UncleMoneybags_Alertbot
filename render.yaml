@@ -11,7 +11,7 @@ services:
   - type: web
     name: gumroad-telegram-bot
     env: python
-    rootDir: gumroad_telegram
+    rootDir: gumroad_telegram/gumroad_telegram
     buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
