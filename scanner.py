@@ -2432,6 +2432,23 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             return  # Skip - prev candle not finalized yet
         
+        # 🚨 FIX: Require CONSECUTIVE candles (gap ≤ 1 minute, allowing small tolerance)
+        # Prevents false alerts from non-contiguous candles after data gaps
+        if time_gap > timedelta(seconds=90):
+            logger.info(
+                f"[VWAP SKIP] {symbol} - Candles not consecutive ({time_gap.total_seconds()}s gap), blocking non-contiguous crossover"
+            )
+            return  # Skip - candles too far apart, not a real-time crossover
+        
+        # 🚨 FIX: Require CURRENT candle to be FRESH (within last 90 seconds)
+        # Prevents delayed batch processing from triggering stale alerts
+        curr_candle_age = now - curr_candle['start_time']
+        if curr_candle_age > timedelta(seconds=90):
+            logger.info(
+                f"[VWAP SKIP] {symbol} - Current candle too old ({curr_candle_age.total_seconds()}s ago), blocking delayed alert"
+            )
+            return  # Skip - current candle is stale/delayed
+        
         # 🚨 FIX: Require previous candle to be RECENT (within last 3 minutes)
         # Prevents false alerts from comparing current candle against stale/old candles
         prev_candle_age = now - prev_candle['start_time']
@@ -2492,6 +2509,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         curr_above_vwap = (vwap_before is not None and curr_close > vwap_before * 1.005)  # 0.5% buffer
         
         # TRUE CROSSOVER = previous closed below AND current closed above (same baseline, EXCLUDING current!)
+        # Fresh/consecutive candle checks above ensure this is a REAL-TIME crossover, not stale data
         is_true_crossover = prev_below_vwap and curr_above_vwap
         
         # Require UPWARD price movement for VWAP reclaim
