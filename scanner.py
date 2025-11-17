@@ -2036,6 +2036,17 @@ def enforce_symbol_limit(symbol):
         ema_stack_was_true.pop(lru_symbol, None)
         runner_alerted_today.pop(lru_symbol, None)
         
+        # 🔧 MEMORY LEAK FIX: Evict alert tracking and caches
+        pending_alerts.pop(lru_symbol, None)
+        last_alert_time.pop(lru_symbol, None)
+        halt_last_alert_time.pop(lru_symbol, None)
+        float_cache.pop(lru_symbol, None)
+        float_cache_none_retry.pop(lru_symbol, None)
+        ticker_type_cache.pop(lru_symbol, None)
+        premarket_open_prices.pop(lru_symbol, None)
+        premarket_last_prices.pop(lru_symbol, None)
+        premarket_volumes.pop(lru_symbol, None)
+        
         logger.debug(f"[LRU EVICT] Removed {lru_symbol} to maintain MAX_SYMBOLS={MAX_SYMBOLS} limit (now tracking {len(symbol_last_access)} symbols)")
 
 
