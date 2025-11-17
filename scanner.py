@@ -1012,8 +1012,8 @@ vwap_cum_pv = defaultdict(float)
 rvol_history = defaultdict(lambda: deque(maxlen=20))
 RVOL_MIN = 2.0
 
-EVENT_LOG_FILE = "event_log.csv"
-OUTCOME_LOG_FILE = "outcome_log.csv"
+EVENT_LOG_FILE = "/data/event_log.csv"
+OUTCOME_LOG_FILE = "/data/outcome_log.csv"
 
 # --- AUTO ML TRAINING SYSTEM ---
 recent_alerts = {}  # symbol -> alert_time
@@ -4309,21 +4309,25 @@ async def nasdaq_halt_monitor():
         await asyncio.sleep(15)
 
 
-async def ml_training_loop():
-    """Background task for ML training and outcome tracking"""
+async def outcome_tracking_loop():
+    """Background task for tracking alert outcomes (ML training disabled)"""
+    # Ensure /data directory exists for persistent storage
+    os.makedirs("/data", exist_ok=True)
+    
     while True:
         try:
             # Check alert outcomes every 5 minutes
             await check_alert_outcomes()
 
-            # Retrain model once per day at market close
-            ny_time = datetime.now(timezone.utc).astimezone(
-                pytz.timezone("America/New_York"))
-            if ny_time.hour == 20 and ny_time.minute < 5:  # 8:00-8:05 PM ET
-                await retrain_model_if_needed()
+            # 🔧 ML TRAINING DISABLED: Only collecting data for future use
+            # To enable: uncomment the retrain_model_if_needed() call below
+            # ny_time = datetime.now(timezone.utc).astimezone(
+            #     pytz.timezone("America/New_York"))
+            # if ny_time.hour == 20 and ny_time.minute < 5:  # 8:00-8:05 PM ET
+            #     await retrain_model_if_needed()
 
         except Exception as e:
-            logger.error(f"[ML TRAINING] Error in ML training loop: {e}")
+            logger.error(f"[OUTCOME TRACKING] Error in outcome tracking loop: {e}")
 
         await asyncio.sleep(300)  # 5 minutes
 
@@ -4421,6 +4425,8 @@ async def main():
     prune_halt_task = asyncio.create_task(prune_stale_halts())
     # Enable active resume monitor (checks NASDAQ every 10s for instant resume detection)
     resume_monitor_task = asyncio.create_task(active_resume_monitor())
+    # 📊 Enable outcome tracking (saves alert performance data to /data/outcome_log.csv)
+    outcome_task = asyncio.create_task(outcome_tracking_loop())
     # 🔍 DISABLED: REST API backup scanner (was alerting on late/worthless moves)
     # rest_backup_task = asyncio.create_task(rest_api_backup_scanner())
     try:
@@ -4435,6 +4441,7 @@ async def main():
         nasdaq_halt_task.cancel()
         prune_halt_task.cancel()
         resume_monitor_task.cancel()
+        outcome_task.cancel()
         # rest_backup_task.cancel()  # DISABLED
 
         # 🚨 FIX: Await cancelled tasks with error handling
@@ -4460,6 +4467,10 @@ async def main():
             pass
         try:
             await resume_monitor_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await outcome_task
         except asyncio.CancelledError:
             pass
         # REST backup scanner disabled
