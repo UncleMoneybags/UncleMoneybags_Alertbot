@@ -1,55 +1,40 @@
-# Stock Market Scanner
+Stock Market Scanner
+Overview
+This Python application is a real-time stock market scanner designed to identify potential trading opportunities by monitoring live market data and performing technical analysis. Its primary purpose is to deliver timely trading alerts via Telegram and Discord when specific market criteria are met, aiming to capitalize on market movements and inform users of significant events. The project's ambition is to provide a robust and accurate alerting system for significant stock market events.
 
-A real-time stock market scanner that monitors market data and provides trading alerts via Telegram and Discord.
+User Preferences
+I want iterative development. Ask before making major changes. I prefer detailed explanations. Do not make changes to the folder Z. Do not make changes to the file Y. Scanner runs on Render only - never start workflows on Replit. FULL market scanning required - scan ALL stocks meeting criteria, not just specific tickers.
 
-## Overview
+System Architecture
+The application is built in Python 3.11 with scanner.py as its main entry point. It utilizes a pre-trained machine learning model (runner_model.joblib) for scoring trading events and operates within market hours (4 am-8 pm EST, Monday-Friday) as a background task.
 
-This Python application connects to live market data feeds and performs technical analysis to identify trading opportunities. It automatically detects various market events and sends alerts when specific criteria are met.
+UI/UX Decisions: The system focuses on backend processing and real-time alerts delivered through external messaging platforms (Telegram, Discord) rather than a direct UI.
 
-## Key Features
+Technical Implementations and Feature Specifications:
 
-- **Real-time Data**: Connects to Polygon.io WebSocket for live market data
-- **Technical Analysis**: Calculates EMA, RSI, VWAP, Bollinger Bands, MACD
-- **Alert System**: Sends notifications via Telegram and Discord
-- **News Monitoring**: Scrapes Yahoo Finance and monitors NASDAQ halts
-- **Machine Learning**: Uses trained models to score trading events
-- **Volume Analysis**: Tracks volume spikes and relative volume (RVOL)
-
-## Current Setup
-
-- **Language**: Python 3.11
-- **Main Application**: scanner.py 
-- **Dependencies**: All installed from requirements.txt
-- **Workflow**: Runs automatically as "Stock Scanner" background task
-- **Market Hours**: Active 4am-8pm EST, Monday-Friday
-
-## Project Structure
-
-- `scanner.py` - Main application with all trading logic
-- `runner_model.joblib` - Pre-trained ML model for event scoring
-- `requirements.txt` - Python dependencies
-- `*.csv` files - Historical trading data and event logs
-- Training scripts for ML model development
-
-## Current Status
-
-✅ Application running successfully  
-✅ All dependencies installed  
-✅ ML model loaded  
-✅ Monitoring market schedule (currently paused - market closed)
-
-## Configuration
-
-The application uses environment variables for API keys:
-- `POLYGON_API_KEY` - Market data API key
-- `TELEGRAM_BOT_TOKEN` - Telegram bot token
-- `TELEGRAM_CHAT_ID` - Telegram chat ID
-
-Default values are provided in the code for immediate functionality.
-
-## Recent Changes
-
-- Set up Python 3.11 environment in Replit
-- Installed all required packages
-- Configured workflow to run continuously
-- Verified successful startup and market schedule detection
+Real-time Data Processing: Connects to Polygon.io WebSocket for live market data.
+Technical Analysis: Computes key indicators like EMA, RSI, VWAP, Bollinger Bands, and MACD.
+Alerting System: Integrates with Telegram and Discord for instant notifications, with mechanisms for preventing duplicate and stale alerts, ensuring a proper alert progression hierarchy, and including a global cooldown.
+News and Event Monitoring: Scrapes Yahoo Finance for news and NASDAQ for trading halts, with robust halt detection that includes LULD indicator 17 filtering, active halt verification, and proactive resume detection by polling NASDAQ.
+Machine Learning Integration: Uses a trained ML model to score and prioritize trading events.
+Volume Analysis: Tracks and alerts on volume spikes and relative volume (RVOL) with dynamic and tuned thresholds, requiring sustained momentum and minimum dollar volume.
+Intelligent Price Selection: Prioritizes the freshest available price (real-time trade or candle close) with a smart fallback to candle data when trade ticks are missing.
+False Alert Prevention: Incorporates safeguards like fresh real-time price confirmation, explicit VWAP reset for pre-market data, strict momentum and VWAP validation, and fixes for VWAP false positives.
+Float Handling: Implemented "fail-open" logic for float data, processing all stocks ≤$15 with an increased float threshold to 20M shares.
+ETF and Warrant Filtering: A two-tier system using a hardcoded list and real-time Polygon API detection to block all ETFs, ETNs, funds, warrants, and structured products. Ticker types are cached for instant lookups.
+Error Handling and Stability: Includes fixes for websocket data type inconsistencies, None values, memory leaks, robust handling of zero-volume candles, missing trade timestamps, asynchronous yfinance calls, critical Polygon timestamp parsing, and VWAP None guard fixes. Features asyncio.Lock for float cache persistence, atomic writes, consistent http_session reuse, dependency checks, structured logging, non-blocking I/O, memory management with LRU eviction, and proper resource cleanup.
+Alert Quality Filters: Implemented tiered price movement filters and increased thresholds for "Perfect Setup" alerts to ensure meaningful liquidity and trading activity.
+Recent Changes
+Outcome Tracking with Persistent Storage (November 17, 2025): Enabled automatic alert outcome tracking that saves performance data to /data/outcome_log.csv on Render's persistent disk (1GB). Tracks every alert's success/failure over 2 hours with entry price, exit price, return %, and market context. Data survives restarts and redeploys for future ML training. ML model training is currently DISABLED - only data collection is active. Logs accessible via Render Shell: cat /data/outcome_log.csv. Cost: ~$0.01/month for CSV storage.
+Memory Leak Fix (November 17, 2025): Fixed critical memory leaks causing periodic "memory limit exceeded" restarts on Render. Added 9 missing dictionaries to LRU eviction logic: pending_alerts, last_alert_time, halt_last_alert_time, float_cache, float_cache_none_retry, ticker_type_cache, premarket_open_prices, premarket_last_prices, premarket_volumes. These dictionaries were growing unbounded throughout the trading day. Now properly cleaned when symbols become inactive, maintaining stable memory usage while preserving full functionality for active stocks.
+Active Resume Detection (November 10, 2025): Implemented proactive resume monitoring that polls NASDAQ halt page every 10 seconds to detect resumes INSTANTLY, even with zero volume. Previous system only detected resumes when trade ticks arrived, causing delays or complete misses on low-volume stocks. Example: KXIN halted at 2:37 PM but never got resume alert because zero trades occurred after resumption. New system actively checks if stock disappears from NASDAQ halt page and sends immediate resume alert, regardless of trading activity.
+VWAP Reclaim Logic Fix (November 13, 2025): Fixed critical bug where VWAP reclaim compared candles against a VWAP value that INCLUDED the current candle. When current candle moves strongly, it can shift VWAP above prev_close, creating false "reclaim" detection even though previous candle was already above VWAP before the move. Fix: Calculate VWAP baseline EXCLUDING current candle (using cumulative sums minus current contribution), then compare both prev_close and curr_close against that stable baseline. Combined with finalized-candle requirement (≥1 minute gap) and 4+ candle minimum for complete false positive elimination. Uses incremental O(1) calculation for performance.
+LULD Halt Verification (November 10, 2025): Added mandatory NASDAQ verification for ALL LULD indicator 17 events before sending halt alerts. Previous system sent alerts immediately upon Polygon LULD events without verification, causing false positives. Example: BODI received false halt alert when actively trading at $5.09 - Polygon sent LULD event but stock wasn't actually halted. Fix: Scanner waits 10 seconds after LULD event, then verifies stock appears on NASDAQ official halt page before sending alert. Blocks all false positive halt alerts.
+ETF Detection & Halt Robustness (November 7, 2025): Comprehensive ETF filtering via Polygon API with persistent caching. Three halt robustness fixes: indicator normalization (int/string/list handling), resume trade validation (price>0, volume>0), and automatic pruning task (prevents memory leak).
+Performance Optimizations (November 11, 2025): Major performance improvements: (1) TCPConnector for http_session with connection pooling limits (100 total, 20 per host) prevents socket exhaustion, (2) All blocking I/O now uses bounded io_executor instead of unbounded default thread pool, (3) Cache saves are non-blocking via asyncio.create_task to eliminate latency spikes, (4) Incremental VWAP calculation (O(1) vs O(n)) using existing vwap_cum_vol/vwap_cum_pv instead of recalculating through all candles, (5) API rate limiting via semaphore (max 20 concurrent requests) prevents 429 errors, (6) uvloop integration for faster event loop on Linux/macOS (20-30% throughput boost).
+External Dependencies
+Polygon.io: Real-time market data via WebSocket API.
+Telegram Bot API: For sending trading alerts.
+Discord Webhooks: For sending trading alerts.
+Yahoo Finance: Scraped for news and market information.
+NASDAQ Exchange: Monitored for trading halt information.
