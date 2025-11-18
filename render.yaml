@@ -2,7 +2,7 @@ services:
   - type: worker
     name: stock-scanner
     env: python
-    buildCommand: pip install --no-cache-dir -r vps_requirements.txt
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install --no-cache-dir -r vps_requirements.txt
     startCommand: python scanner.py
     envVars:
       - key: PYTHON_VERSION
