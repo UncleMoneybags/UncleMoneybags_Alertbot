@@ -300,7 +300,7 @@ filter_counts = defaultdict(int)
 
 
 def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
-    """Check if symbol meets filtering criteria: $0.50 <= price <= $15 AND float <= 20M
+    """Check if symbol meets filtering criteria: $0.25 <= price <= $15 AND float <= 20M
     
     Args:
         use_entry_price: REMOVED - Always uses current price (no grandfathering)
@@ -974,7 +974,7 @@ if not TELEGRAM_CHAT_ID:
     sys.exit(1)
 
 PRICE_THRESHOLD = 15.00  # INCREASED: Allow more headroom for momentum moves
-MIN_PRICE_THRESHOLD = 0.50  # Minimum price threshold (blocks OTC/Pink Sheet garbage)
+MIN_PRICE_THRESHOLD = 0.25  # Minimum price threshold (blocks most OTC/Pink Sheet garbage)
 MAX_SYMBOLS = 4000
 SCREENER_REFRESH_SEC = 30
 MIN_ALERT_MOVE = 0.12
