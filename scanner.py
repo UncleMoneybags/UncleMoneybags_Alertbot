@@ -3408,8 +3408,8 @@ async def ingest_polygon_events():
                                 candle_time = start_time.astimezone(eastern).time()
                                 market_open_time = dt_time(9, 30)
                                 
-                                # If this is the first candle at or after 9:30 AM, reset VWAP
-                                if len(vwap_candles[symbol]) > 0:
+                                # If this is the first candle at or after 9:30 AM, reset VWAP (only once per day)
+                                if not vwap_reset_done.get(symbol, False) and len(vwap_candles[symbol]) > 0:
                                     last_candle_time = vwap_candles[symbol][-1]['start_time'].astimezone(eastern).time()
                                     # Reset if crossing from pre-market into regular session
                                     if last_candle_time < market_open_time <= candle_time:
@@ -3417,6 +3417,7 @@ async def ingest_polygon_events():
                                         vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
                                         vwap_cum_vol[symbol] = 0
                                         vwap_cum_pv[symbol] = 0
+                                        vwap_reset_done[symbol] = True  # Prevent multiple resets per day
                                 
                                 # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
                                 if len(vwap_candles[symbol]) > 0:
