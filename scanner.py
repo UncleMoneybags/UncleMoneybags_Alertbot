@@ -165,59 +165,113 @@ def load_float_cache():
         logger.debug("No float_cache_none_retry found, starting new")
 
 
-async def get_float_shares(ticker):
-    """Non-blocking float share lookup using thread executor for yfinance.
+async def get_float_shares(ticker, current_price=None):
+    """Get float shares with validation and multi-source fallback.
     
-    Runs blocking yfinance call in thread pool to prevent event loop stalling.
-    Uses debounced cache saving to reduce disk I/O overhead.
+    Strategy:
+    1. Check cache first
+    2. Try Polygon API for shares outstanding
+    3. Validate data (reject obviously wrong values like 795M for penny stocks)
+    4. Fall back to yfinance if needed
+    5. On bad/missing data, return None (fail-open logic allows stock through)
+    
+    Args:
+        ticker: Stock symbol
+        current_price: Current stock price for validation (optional)
     """
     now = datetime.now(timezone.utc)
+    
     # Check positive/real float first
     if ticker in float_cache and float_cache[ticker] is not None:
         return float_cache[ticker]
+    
     # Check negative/None cache, only retry every N minutes
     if ticker in float_cache_none_retry:
         last_none = float_cache_none_retry[ticker]
         if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
             return None
     
-    # Run blocking yfinance call in thread executor to avoid blocking event loop
-    def _fetch_float():
+    # Try Polygon API first (more reliable for ADRs and penny stocks)
+    try:
+        url = f"https://api.polygon.io/v3/reference/tickers/{ticker}"
+        params = {"apiKey": POLYGON_API_KEY}
+        
+        async with api_semaphore:
+            async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("status") == "OK" and data.get("results"):
+                        results = data["results"]
+                        shares = results.get("share_class_shares_outstanding")
+                        
+                        # Validate: Reject obviously wrong data
+                        if shares and shares > 100_000_000:  # 100M+ shares
+                            # For penny stocks ($0.25-$15), 100M+ float is almost always wrong
+                            # (ADR underlying shares, not ADR float)
+                            if current_price and current_price < 15:
+                                logger.warning(
+                                    f"[FLOAT VALIDATION] {ticker} - Rejected Polygon float {shares/1_000_000:.1f}M "
+                                    f"(price ${current_price:.2f} suggests data error). Using fail-open."
+                                )
+                                # Don't cache bad data, return None to allow through
+                                return None
+                        
+                        if shares and shares >= MIN_FLOAT_SHARES:
+                            float_cache[ticker] = shares
+                            asyncio.create_task(save_float_cache())
+                            logger.debug(f"[FLOAT] {ticker} - Polygon API: {shares/1_000_000:.1f}M shares")
+                            return shares
+    except Exception as e:
+        logger.debug(f"[FLOAT] {ticker} - Polygon API error: {e}")
+    
+    # Fallback to yfinance
+    def _fetch_float_yf():
         try:
             import yfinance as yf
             info = yf.Ticker(ticker).info
-            return info.get('floatShares', None)
+            shares = info.get('floatShares', None)
+            
+            # Same validation for yfinance data
+            if shares and shares > 100_000_000 and current_price and current_price < 15:
+                logger.warning(
+                    f"[FLOAT VALIDATION] {ticker} - Rejected yfinance float {shares/1_000_000:.1f}M "
+                    f"(price ${current_price:.2f} suggests data error). Using fail-open."
+                )
+                return None
+            
+            return shares
         except Exception as e:
             return None, e
     
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(io_executor, _fetch_float)
+        result = await loop.run_in_executor(io_executor, _fetch_float_yf)
         
         # Handle result
         if isinstance(result, tuple):  # Error case
             float_shares, error = result
             float_cache_none_retry[ticker] = now
-            asyncio.create_task(save_float_cache())  # Non-blocking save
+            asyncio.create_task(save_float_cache())
             if error and "Rate limited" in str(error):
-                await asyncio.sleep(5)  # Backoff for rate limits
-            return float_cache.get(ticker, None)
+                await asyncio.sleep(5)
+            return None
         else:
             float_shares = result
-            if float_shares is not None:
+            if float_shares is not None and float_shares >= MIN_FLOAT_SHARES:
                 float_cache[ticker] = float_shares
-                asyncio.create_task(save_float_cache())  # Non-blocking save
+                asyncio.create_task(save_float_cache())
                 if ticker in float_cache_none_retry:
                     del float_cache_none_retry[ticker]
+                logger.debug(f"[FLOAT] {ticker} - yfinance: {float_shares/1_000_000:.1f}M shares")
             else:
                 float_cache_none_retry[ticker] = now
-                asyncio.create_task(save_float_cache())  # Non-blocking save
-            # Removed unnecessary 0.5s sleep - slows down float lookups
+                asyncio.create_task(save_float_cache())
             return float_shares
     except Exception as e:
         float_cache_none_retry[ticker] = now
-        asyncio.create_task(save_float_cache())  # Non-blocking save
-        return float_cache.get(ticker, None)
+        asyncio.create_task(save_float_cache())
+        logger.debug(f"[FLOAT] {ticker} - yfinance error: {e}")
+        return None
 
 
 async def save_ticker_type_cache(force=False):
@@ -2099,7 +2153,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
     if not isinstance(vwap_candles[symbol], deque):
         vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
-    float_shares = await get_float_shares(symbol)
+    float_shares = await get_float_shares(symbol, current_price=close)
     
     # 🚨 CRITICAL FIX: Check ALL eligibility criteria (price, float, AND ETF filter)
     # This was the bug allowing DUST, ZSL, GLL alerts - only checking float, not ETFs!
@@ -3177,7 +3231,7 @@ async def ingest_polygon_events():
                                     continue
                                 
                                 # ✅ SLOW CHECK #3: Float lookup (only for stocks ≤$15) - 90% reduction in HTTP calls
-                                float_shares = await get_float_shares(symbol)
+                                float_shares = await get_float_shares(symbol, current_price=price)
                                 
                                 # Final eligibility check with float data
                                 if not is_eligible(symbol, price, float_shares, use_entry_price=is_tracked):
@@ -3570,7 +3624,7 @@ async def ingest_polygon_events():
                                     if not current_price and symbol in candles and len(candles[symbol]) > 0:
                                         current_price = candles[symbol][-1]['close']
 
-                                    float_shares = await get_float_shares(symbol)
+                                    float_shares = await get_float_shares(symbol, current_price=current_price)
                                     
                                     # 🚫 WARRANT FILTER: Block warrants from halt alerts
                                     if is_warrant(symbol):
@@ -3909,7 +3963,7 @@ async def rest_api_backup_scanner():
                             continue
                         
                         # Check eligibility (price, float, ETF filter, warrants)
-                        float_shares = await get_float_shares(symbol)
+                        float_shares = await get_float_shares(symbol, current_price=current_price)
                         if not is_eligible(symbol, current_price, float_shares, use_entry_price=False):
                             continue
                         
@@ -4085,7 +4139,7 @@ async def nasdaq_halt_monitor():
                                                     price_source = "candle"
                                                 
                                                 # Get float data
-                                                float_shares = await get_float_shares(symbol)
+                                                float_shares = await get_float_shares(symbol, current_price=current_price)
                                                 
                                                 # 🚨 STRICT RESUME FILTERING: Only alert if stock meets bot criteria
                                                 # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
@@ -4207,7 +4261,7 @@ async def nasdaq_halt_monitor():
                                             logger.info(f"[HALT PRICE] {symbol} - Using candle price ${current_price:.2f}")
                                         
                                         # Get float with detailed logging
-                                        float_shares = await get_float_shares(symbol)
+                                        float_shares = await get_float_shares(symbol, current_price=current_price)
                                         if float_shares:
                                             logger.info(f"[HALT FLOAT] {symbol} - Float: {float_shares/1e6:.2f}M shares")
                                         else:
