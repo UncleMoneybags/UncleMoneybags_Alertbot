@@ -37,7 +37,10 @@ def cleanup_resources():
     Ensures both HTTP session and ThreadPoolExecutor are properly closed
     even if normal shutdown path is bypassed.
     """
-    global http_session, io_executor
+    # Use globals().get() to safely handle cleanup even if vars not yet defined
+    http_session = globals().get("http_session")
+    io_executor = globals().get("io_executor")
+    
     try:
         # Close HTTP session to prevent connection leaks
         if http_session and not http_session.closed:
@@ -63,7 +66,7 @@ def cleanup_resources():
     except Exception as e:
         logger.error(f"[ATEXIT] Cleanup error: {e}")
 
-atexit.register(cleanup_resources)
+# Register atexit after cleanup_resources is defined (actual registration happens in main())
 
 MARKET_OPEN = dt_time(4, 0)
 MARKET_CLOSE = dt_time(20, 0)
@@ -93,13 +96,13 @@ float_cache_none_retry = {}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
 FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS = 300  # Only save every 5 minutes to reduce disk I/O
 _last_float_cache_save = datetime.min.replace(tzinfo=timezone.utc)
-_float_cache_lock = asyncio.Lock()  # 🔒 Prevent concurrent write corruption
+_float_cache_lock = None  # 🔒 Created in main() to avoid event loop binding issues
 
 # 🎯 TICKER TYPE CACHE: Real-time ETF detection via Polygon API
 # Cache ticker types to avoid repeated API calls (ETF, CS, WARRANT, etc.)
 ticker_type_cache = {}  # {symbol: type_code} e.g., {"SPY": "ETF", "AAPL": "CS"}
 _last_ticker_type_save = datetime.min.replace(tzinfo=timezone.utc)
-_ticker_type_lock = asyncio.Lock()
+_ticker_type_lock = None  # Created in main() to avoid event loop binding issues
 
 
 async def save_float_cache(force=False):
@@ -950,28 +953,13 @@ logger.info(
 )
 logger.info("Imports completed successfully.")
 
+# Environment variables loaded at module level but validated in main()
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # --- DISCORD WEBHOOK ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-
-if not POLYGON_API_KEY:
-    logger.critical(
-        "POLYGON_API_KEY environment variable is required! Set it and restart."
-    )
-    sys.exit(1)
-if not TELEGRAM_BOT_TOKEN:
-    logger.critical(
-        "TELEGRAM_BOT_TOKEN environment variable is required! Set it and restart."
-    )
-    sys.exit(1)
-if not TELEGRAM_CHAT_ID:
-    logger.critical(
-        "TELEGRAM_CHAT_ID environment variable is required! Set it and restart."
-    )
-    sys.exit(1)
 
 PRICE_THRESHOLD = 15.00  # INCREASED: Allow more headroom for momentum moves
 MIN_PRICE_THRESHOLD = 0.10  # Minimum price threshold
@@ -3153,8 +3141,8 @@ async def ingest_polygon_events():
                                     continue
 
                                 # 🚨 FIX: Calculate trade_time FIRST (needed for local candle builder)
-                                # Polygon timestamps are in nanoseconds, divide by 1,000,000 to get seconds
-                                trade_time = datetime.fromtimestamp(trade_timestamp / 1_000_000, tz=timezone.utc)
+                                # Polygon timestamps are in nanoseconds, divide by 1,000,000,000 to get seconds
+                                trade_time = datetime.fromtimestamp(trade_timestamp / 1_000_000_000, tz=timezone.utc)
                                 now_utc = datetime.now(timezone.utc)
                                 trade_age_seconds = (now_utc - trade_time).total_seconds()
                                 
@@ -4377,7 +4365,33 @@ async def prune_stale_halts():
 
 
 async def main():
-    global http_session
+    global http_session, _float_cache_lock, _ticker_type_lock
+    
+    # 🚨 CRITICAL: Validate environment variables before startup
+    if not POLYGON_API_KEY:
+        logger.critical("POLYGON_API_KEY environment variable is required! Set it and restart.")
+        raise RuntimeError("Missing POLYGON_API_KEY")
+    if not TELEGRAM_BOT_TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN environment variable is required! Set it and restart.")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        logger.critical("TELEGRAM_CHAT_ID environment variable is required! Set it and restart.")
+        raise RuntimeError("Missing TELEGRAM_CHAT_ID")
+    
+    logger.info("[STARTUP] ✅ Environment variables validated\n")
+    
+    # 🚨 CRITICAL: Ensure /data directory exists for log files
+    os.makedirs("/data", exist_ok=True)
+    logger.info("[STARTUP] ✅ /data directory ready\n")
+    
+    # 🔒 Create asyncio locks in main() to bind to correct event loop
+    _float_cache_lock = asyncio.Lock()
+    _ticker_type_lock = asyncio.Lock()
+    logger.info("[STARTUP] ✅ Async locks initialized\n")
+    
+    # 🚨 Register atexit cleanup AFTER executor/session are defined
+    atexit.register(cleanup_resources)
+    logger.info("[STARTUP] ✅ Cleanup handlers registered\n")
     
     # ✅ STARTUP: Check critical dependencies
     logger.info("[STARTUP] Checking dependencies...")
