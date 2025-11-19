@@ -436,7 +436,18 @@ MINUTES_PER_SESSION = 390  # 9:30-16:00
 
 
 def get_minute_of_day(dt):
-    return (dt.hour - 9) * 60 + (dt.minute - 30)
+    """Convert datetime to minute of trading day (0 = 9:30 AM ET).
+    
+    Args:
+        dt: datetime object (any timezone)
+    
+    Returns:
+        int: Minutes since 9:30 AM ET (0-based)
+    """
+    # 🚨 FIX: Convert to Eastern time before calculating minute offset
+    eastern = pytz.timezone("America/New_York")
+    dt_et = dt.astimezone(eastern)
+    return (dt_et.hour - 9) * 60 + (dt_et.minute - 30)
 
 
 class VolumeProfile:
@@ -1455,7 +1466,7 @@ halted_symbols = set()
 halt_last_alert_time = {}  # Track last halt alert time per symbol to prevent spam on reconnects
 halt_resume_alert_time = {}  # Track last resume alert time per symbol to prevent duplicates
 halted_stocks = {}  # Track actively halted stocks {symbol: {'time': halt_time, 'price': price, 'halt_key': key}}
-halt_lock = asyncio.Lock()  # Concurrency lock to avoid race conditions on halt detection
+halt_lock = None  # Concurrency lock - created in main() to avoid event loop binding issues
 
 ALERT_COOLDOWN_MINUTES = 1  # 🚨 REDUCED to 1 minute - catch rapid momentum shifts
 # 🚨 NEW: Track last alert time PER ALERT TYPE (not just per symbol)
@@ -4400,8 +4411,10 @@ async def main():
     logger.info(f"[STARTUP] ✅ Data directory ready: {DATA_DIR}\n")
     
     # 🔒 Create asyncio locks in main() to bind to correct event loop
+    global _float_cache_lock, _ticker_type_lock, halt_lock
     _float_cache_lock = asyncio.Lock()
     _ticker_type_lock = asyncio.Lock()
+    halt_lock = asyncio.Lock()
     logger.info("[STARTUP] ✅ Async locks initialized\n")
     
     # 🚨 Register atexit cleanup AFTER executor/session are defined
