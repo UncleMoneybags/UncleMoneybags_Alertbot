@@ -369,6 +369,7 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',  # Crypto/quantum ETF-like products
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',  # YieldMax income/covered call ETFs
         'TSLL', 'TSLS', 'TSL', 'TSLG', 'TSDD',  # Tesla leveraged/inverse ETFs
+        'IRE',  # Defiance 2X Long IREN ETF - leveraged Bitcoin miner ETF
         'SLE', 'SMD', 'AMD3', 'SKY', 'SND',  # GraniteShares leveraged products
         'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'  # Volatility products
     }
@@ -385,6 +386,19 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
     # TIER 2: Check Polygon API ticker type cache (instant dict lookup, populated by background task)
     # Block: ETF, ETN (Exchange-Traded Note), WARRANT, FUND, UNIT, SP (Structured Product)
     ticker_type = ticker_type_cache.get(symbol)
+    
+    # 🚨 CRITICAL FIX: FAIL-CLOSED for unknown ticker types (prevents ETF race condition)
+    # If ticker type is unknown (None), BLOCK symbol until verified by Polygon API
+    # This prevents new ETFs from alerting on first candle before cache populates
+    if ticker_type is None:
+        filter_counts["ticker_type_unknown"] = filter_counts.get("ticker_type_unknown", 0) + 1
+        if filter_counts["ticker_type_unknown"] % 100 == 1:
+            logger.info(
+                f"[FILTER DEBUG] {symbol} filtered: Ticker type unknown, blocking until verified by Polygon API (count: {filter_counts['ticker_type_unknown']})"
+            )
+        return False  # Block unknown symbols (will be verified on next candle after API completes)
+    
+    # Ticker type is known - check if it's a blocked type
     if ticker_type in ['ETF', 'ETN', 'WARRANT', 'FUND', 'UNIT', 'SP']:
         filter_counts["polygon_etf"] = filter_counts.get("polygon_etf", 0) + 1
         if filter_counts["polygon_etf"] % 50 == 1:
@@ -2611,15 +2625,15 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             alerted_symbols[symbol] = today
             last_alert_time[symbol]['vwap_reclaim'] = now
 
-    # Volume Spike Logic PATCH - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
-    if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
-        logger.info(
-            f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking volume spike alert"
-        )
-        return  # Block all alerts if no VWAP data
-    vwap_value = vwap_candles_numpy(vwap_candles[symbol])
+    # Volume Spike Logic - VWAP is optional (momentum/volume filters prevent false alerts)
+    # Get VWAP if available (for scoring), but don't block if missing
+    vwap_value = None
+    if vwap_candles[symbol] and len(vwap_candles[symbol]) >= 3:
+        vwap_value = vwap_candles_numpy(vwap_candles[symbol])
+    
+    vwap_str = f"{vwap_value:.4f}" if vwap_value is not None else "N/A (calculating)"
     logger.info(
-        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_value:.4f} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
+        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_str} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
     )
     # Use stored EMAs for Volume Spike
     emas = get_stored_emas(symbol, [5, 8, 13])
@@ -2647,11 +2661,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
             return
         
-        # 🚨 STRICT VWAP VALIDATION - Final check with real-time price freshness
-        vwap_valid, real_time_price_vs, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "VOLUME SPIKE")
-        if not vwap_valid:
-            logger.info(vwap_reason)
-            return
+        # 🚨 VWAP VALIDATION - Optional (only if VWAP available)
+        # Volume spike momentum/price filters already prevent false alerts
+        if vwap_value is not None:
+            vwap_valid, real_time_price_vs, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "VOLUME SPIKE")
+            if not vwap_valid:
+                logger.info(vwap_reason)
+                return
 
         # Calculate alert score and add to pending alerts
         score = get_alert_score("volume_spike", symbol, spike_data)
@@ -2942,6 +2958,7 @@ def is_etf(symbol):
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',
         'TSLL', 'TSLS', 'TSL', 'TSLG', 'TSDD',  # Tesla leveraged/inverse ETFs
+        'IRE',  # Defiance 2X Long IREN ETF - leveraged Bitcoin miner ETF
         'SLE', 'SMD', 'AMD3', 'SKY', 'SND',
         'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'
     }
@@ -2964,6 +2981,7 @@ async def premarket_gainers_alert_loop():
         'MSTR', 'MSTU', 'MSTZ', 'IONZ', 'IONQ',
         'TSLY', 'CONY', 'NVDY', 'MSTY', 'AIYY', 'YMAX', 'GOOY', 'TSMY',
         'TSLL', 'TSLS', 'TSL', 'TSLG', 'TSDD',  # Tesla leveraged/inverse ETFs
+        'IRE',  # Defiance 2X Long IREN ETF - leveraged Bitcoin miner ETF
         'SLE', 'SMD', 'AMD3', 'SKY', 'SND',
         'VXX', 'UVXY', 'UVIX', 'VIXY', 'SVXY', 'TVIX'
     }
