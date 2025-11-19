@@ -165,113 +165,59 @@ def load_float_cache():
         logger.debug("No float_cache_none_retry found, starting new")
 
 
-async def get_float_shares(ticker, current_price=None):
-    """Get float shares with validation and multi-source fallback.
+async def get_float_shares(ticker):
+    """Non-blocking float share lookup using thread executor for yfinance.
     
-    Strategy:
-    1. Check cache first
-    2. Try Polygon API for shares outstanding
-    3. Validate data (reject obviously wrong values like 795M for penny stocks)
-    4. Fall back to yfinance if needed
-    5. On bad/missing data, return None (fail-open logic allows stock through)
-    
-    Args:
-        ticker: Stock symbol
-        current_price: Current stock price for validation (optional)
+    Runs blocking yfinance call in thread pool to prevent event loop stalling.
+    Uses debounced cache saving to reduce disk I/O overhead.
     """
     now = datetime.now(timezone.utc)
-    
     # Check positive/real float first
     if ticker in float_cache and float_cache[ticker] is not None:
         return float_cache[ticker]
-    
     # Check negative/None cache, only retry every N minutes
     if ticker in float_cache_none_retry:
         last_none = float_cache_none_retry[ticker]
         if (now - last_none).total_seconds() < FLOAT_CACHE_NONE_RETRY_MIN * 60:
             return None
     
-    # Try Polygon API first (more reliable for ADRs and penny stocks)
-    try:
-        url = f"https://api.polygon.io/v3/reference/tickers/{ticker}"
-        params = {"apiKey": POLYGON_API_KEY}
-        
-        async with api_semaphore:
-            async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get("status") == "OK" and data.get("results"):
-                        results = data["results"]
-                        shares = results.get("share_class_shares_outstanding")
-                        
-                        # Validate: Reject obviously wrong data
-                        if shares and shares > 100_000_000:  # 100M+ shares
-                            # For penny stocks ($0.25-$15), 100M+ float is almost always wrong
-                            # (ADR underlying shares, not ADR float)
-                            if current_price and current_price < 15:
-                                logger.warning(
-                                    f"[FLOAT VALIDATION] {ticker} - Rejected Polygon float {shares/1_000_000:.1f}M "
-                                    f"(price ${current_price:.2f} suggests data error). Using fail-open."
-                                )
-                                # Don't cache bad data, return None to allow through
-                                return None
-                        
-                        if shares and shares >= MIN_FLOAT_SHARES:
-                            float_cache[ticker] = shares
-                            asyncio.create_task(save_float_cache())
-                            logger.debug(f"[FLOAT] {ticker} - Polygon API: {shares/1_000_000:.1f}M shares")
-                            return shares
-    except Exception as e:
-        logger.debug(f"[FLOAT] {ticker} - Polygon API error: {e}")
-    
-    # Fallback to yfinance
-    def _fetch_float_yf():
+    # Run blocking yfinance call in thread executor to avoid blocking event loop
+    def _fetch_float():
         try:
             import yfinance as yf
             info = yf.Ticker(ticker).info
-            shares = info.get('floatShares', None)
-            
-            # Same validation for yfinance data
-            if shares and shares > 100_000_000 and current_price and current_price < 15:
-                logger.warning(
-                    f"[FLOAT VALIDATION] {ticker} - Rejected yfinance float {shares/1_000_000:.1f}M "
-                    f"(price ${current_price:.2f} suggests data error). Using fail-open."
-                )
-                return None
-            
-            return shares
+            return info.get('floatShares', None)
         except Exception as e:
             return None, e
     
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(io_executor, _fetch_float_yf)
+        result = await loop.run_in_executor(io_executor, _fetch_float)
         
         # Handle result
         if isinstance(result, tuple):  # Error case
             float_shares, error = result
             float_cache_none_retry[ticker] = now
-            asyncio.create_task(save_float_cache())
+            asyncio.create_task(save_float_cache())  # Non-blocking save
             if error and "Rate limited" in str(error):
-                await asyncio.sleep(5)
-            return None
+                await asyncio.sleep(5)  # Backoff for rate limits
+            return float_cache.get(ticker, None)
         else:
             float_shares = result
-            if float_shares is not None and float_shares >= MIN_FLOAT_SHARES:
+            if float_shares is not None:
                 float_cache[ticker] = float_shares
-                asyncio.create_task(save_float_cache())
+                asyncio.create_task(save_float_cache())  # Non-blocking save
                 if ticker in float_cache_none_retry:
                     del float_cache_none_retry[ticker]
-                logger.debug(f"[FLOAT] {ticker} - yfinance: {float_shares/1_000_000:.1f}M shares")
             else:
                 float_cache_none_retry[ticker] = now
-                asyncio.create_task(save_float_cache())
+                asyncio.create_task(save_float_cache())  # Non-blocking save
+            # Removed unnecessary 0.5s sleep - slows down float lookups
             return float_shares
     except Exception as e:
         float_cache_none_retry[ticker] = now
-        asyncio.create_task(save_float_cache())
-        logger.debug(f"[FLOAT] {ticker} - yfinance error: {e}")
-        return None
+        asyncio.create_task(save_float_cache())  # Non-blocking save
+        return float_cache.get(ticker, None)
 
 
 async def save_ticker_type_cache(force=False):
@@ -354,7 +300,7 @@ filter_counts = defaultdict(int)
 
 
 def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
-    """Check if symbol meets filtering criteria: $0.25 <= price <= $15 AND float <= 20M
+    """Check if symbol meets filtering criteria: $0.10 <= price <= $15 AND float <= 20M
     
     Args:
         use_entry_price: REMOVED - Always uses current price (no grandfathering)
@@ -1028,7 +974,7 @@ if not TELEGRAM_CHAT_ID:
     sys.exit(1)
 
 PRICE_THRESHOLD = 15.00  # INCREASED: Allow more headroom for momentum moves
-MIN_PRICE_THRESHOLD = 0.25  # Minimum price threshold (blocks most OTC/Pink Sheet garbage)
+MIN_PRICE_THRESHOLD = 0.10  # Minimum price threshold
 MAX_SYMBOLS = 4000
 SCREENER_REFRESH_SEC = 30
 MIN_ALERT_MOVE = 0.12
@@ -2153,7 +2099,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
     if not isinstance(vwap_candles[symbol], deque):
         vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
-    float_shares = await get_float_shares(symbol, current_price=close)
+    float_shares = await get_float_shares(symbol)
     
     # 🚨 CRITICAL FIX: Check ALL eligibility criteria (price, float, AND ETF filter)
     # This was the bug allowing DUST, ZSL, GLL alerts - only checking float, not ETFs!
@@ -2491,171 +2437,165 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # 🚨 FIX: Require both candles to be finalized (≥1 minute apart)
         # Prevents false alerts from comparing partial in-progress candles
         time_gap = curr_candle['start_time'] - prev_candle['start_time']
-        vwap_reclaim_allowed = True  # Track if VWAP reclaim should be processed
-        
         if time_gap < timedelta(minutes=1):
             logger.debug(
                 f"[VWAP SKIP] {symbol} - Waiting for previous candle to finalize (gap: {time_gap.total_seconds()}s)"
             )
-            vwap_reclaim_allowed = False
+            return  # Skip - prev candle not finalized yet
         
         # 🚨 FIX: Require CONSECUTIVE candles (gap ≤ 1 minute, allowing small tolerance)
         # Prevents false alerts from non-contiguous candles after data gaps
-        elif time_gap > timedelta(seconds=90):
+        if time_gap > timedelta(seconds=90):
             logger.info(
                 f"[VWAP SKIP] {symbol} - Candles not consecutive ({time_gap.total_seconds()}s gap), blocking non-contiguous crossover"
             )
-            vwap_reclaim_allowed = False
+            return  # Skip - candles too far apart, not a real-time crossover
         
         # 🚨 FIX: Require CURRENT candle to be FRESH (within last 90 seconds)
         # Prevents delayed batch processing from triggering stale alerts
-        else:
-            curr_candle_age = now - curr_candle['start_time']
-            if curr_candle_age > timedelta(seconds=90):
-                logger.info(
-                    f"[VWAP SKIP] {symbol} - Current candle too old ({curr_candle_age.total_seconds()}s ago), blocking delayed alert"
-                )
-                vwap_reclaim_allowed = False
-            
-            # 🚨 FIX: Require previous candle to be RECENT (within last 3 minutes)
-            # Prevents false alerts from comparing current candle against stale/old candles
-            elif prev_candle_age := now - prev_candle['start_time']:
-                if prev_candle_age > timedelta(minutes=3):
-                    logger.info(
-                        f"[VWAP SKIP] {symbol} - Previous candle too old ({prev_candle_age.total_seconds()/60:.1f} min ago), blocking stale crossover"
-                    )
-                    vwap_reclaim_allowed = False
+        curr_candle_age = now - curr_candle['start_time']
+        if curr_candle_age > timedelta(seconds=90):
+            logger.info(
+                f"[VWAP SKIP] {symbol} - Current candle too old ({curr_candle_age.total_seconds()}s ago), blocking delayed alert"
+            )
+            return  # Skip - current candle is stale/delayed
+        
+        # 🚨 FIX: Require previous candle to be RECENT (within last 3 minutes)
+        # Prevents false alerts from comparing current candle against stale/old candles
+        prev_candle_age = now - prev_candle['start_time']
+        if prev_candle_age > timedelta(minutes=3):
+            logger.info(
+                f"[VWAP SKIP] {symbol} - Previous candle too old ({prev_candle_age.total_seconds()/60:.1f} min ago), blocking stale crossover"
+            )
+            return  # Skip - comparing against stale candle would create false alert
         
         # Require sufficient VWAP data (need at least 3 candles BEFORE current)
-        if vwap_reclaim_allowed and len(vwap_candles[symbol]) < 4:
+        if len(vwap_candles[symbol]) < 4:
             logger.info(
                 f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data for reclaim, blocking alert (need 4+, have {len(vwap_candles[symbol])})"
             )
-            vwap_reclaim_allowed = False
+            return  # Block VWAP reclaim if insufficient data
         
-        # Only process VWAP reclaim if all checks passed
-        if vwap_reclaim_allowed:
-            # 🚨 CRITICAL FIX: Calculate VWAP EXCLUDING current candle to prevent false reclaims
-            # Problem: If we use VWAP that includes current candle, a strong current candle can
-            # move VWAP above prev_close, creating a false "reclaim" signal
-            # Solution: Compare both candles against VWAP calculated BEFORE current candle
+        # 🚨 CRITICAL FIX: Calculate VWAP EXCLUDING current candle to prevent false reclaims
+        # Problem: If we use VWAP that includes current candle, a strong current candle can
+        # move VWAP above prev_close, creating a false "reclaim" signal
+        # Solution: Compare both candles against VWAP calculated BEFORE current candle
+        
+        # Calculate VWAP baseline excluding current candle
+        if symbol in vwap_cum_vol and symbol in vwap_cum_pv and vwap_cum_vol[symbol] > 0:
+            # Subtract current candle's contribution to get VWAP before it
+            curr_typical = (curr_candle['high'] + curr_candle['low'] + curr_candle['close']) / 3
+            curr_pv = curr_typical * curr_candle['volume']
             
-            # Calculate VWAP baseline excluding current candle
-            if symbol in vwap_cum_vol and symbol in vwap_cum_pv and vwap_cum_vol[symbol] > 0:
-                # Subtract current candle's contribution to get VWAP before it
-                curr_typical = (curr_candle['high'] + curr_candle['low'] + curr_candle['close']) / 3
-                curr_pv = curr_typical * curr_candle['volume']
-                
-                vwap_vol_before = vwap_cum_vol[symbol] - curr_candle['volume']
-                vwap_pv_before = vwap_cum_pv[symbol] - curr_pv
-                
-                if vwap_vol_before > 0:
-                    vwap_before = vwap_pv_before / vwap_vol_before
-                else:
-                    logger.info(f"[VWAP PROTECTION] {symbol} - Invalid VWAP baseline (zero volume), blocking alert")
-                    vwap_reclaim_allowed = False
+            vwap_vol_before = vwap_cum_vol[symbol] - curr_candle['volume']
+            vwap_pv_before = vwap_cum_pv[symbol] - curr_pv
+            
+            if vwap_vol_before > 0:
+                vwap_before = vwap_pv_before / vwap_vol_before
             else:
-                # Fallback: calculate from candles excluding current
-                vwap_before = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
-                if vwap_before is None:
-                    logger.info(f"[VWAP PROTECTION] {symbol} - Could not calculate VWAP baseline, blocking alert")
-                    vwap_reclaim_allowed = False
-            
-            # Only continue if VWAP reclaim is still allowed after calculation
-            if vwap_reclaim_allowed:
-                trailing_vols = [c['volume'] for c in candles_list[:-1]]
-                rvol = 0
-                if trailing_vols:
-                    avg_trailing = sum(trailing_vols[-20:]) / min(
-                        len(trailing_vols), 20)
-                    rvol = curr_candle[
-                        'volume'] / avg_trailing if avg_trailing > 0 else 0
-                
-                # 🚨 CRITICAL FIX: VWAP reclaim uses ONLY candle closes for crossover detection
-                # Compare BOTH candles against the SAME VWAP BASELINE (calculated BEFORE current candle)
-                prev_close = prev_candle['close']
-                curr_close = curr_candle['close']
-                
-                # True crossover: previous candle closed below VWAP baseline, current candle closes above it
-                prev_below_vwap = (vwap_before is not None and prev_close < vwap_before)
-                curr_above_vwap = (vwap_before is not None and curr_close > vwap_before * 1.005)  # 0.5% buffer
-                
-                # TRUE CROSSOVER = previous closed below AND current closed above (same baseline, EXCLUDING current!)
-                # Fresh/consecutive candle checks above ensure this is a REAL-TIME crossover, not stale data
-                is_true_crossover = prev_below_vwap and curr_above_vwap
-                
-                # Require UPWARD price movement for VWAP reclaim
-                candle_price_move = (
-                    curr_candle['close'] - curr_candle['open']
-                ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
-                
-                # 🚨 VWAP reclaim criteria: TRUE crossover + volume confirmation
-                vwap_reclaim_criteria = (
-                    is_true_crossover  # Previous candle closed below, current closed above!
-                    and candle_price_move >= 0.03  # Require 3% UPWARD move in the reclaim candle
-                    and curr_candle['volume'] >= 50_000  # Volume threshold
-                    and rvol >= 1.5  # RVOL threshold
-                )
+                logger.info(f"[VWAP PROTECTION] {symbol} - Invalid VWAP baseline (zero volume), blocking alert")
+                return
+        else:
+            # Fallback: calculate from candles excluding current
+            vwap_before = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
+            if vwap_before is None:
+                logger.info(f"[VWAP PROTECTION] {symbol} - Could not calculate VWAP baseline, blocking alert")
+                return
+        
+        trailing_vols = [c['volume'] for c in candles_list[:-1]]
+        rvol = 0
+        if trailing_vols:
+            avg_trailing = sum(trailing_vols[-20:]) / min(
+                len(trailing_vols), 20)
+            rvol = curr_candle[
+                'volume'] / avg_trailing if avg_trailing > 0 else 0
+        
+        # 🚨 CRITICAL FIX: VWAP reclaim uses ONLY candle closes for crossover detection
+        # Compare BOTH candles against the SAME VWAP BASELINE (calculated BEFORE current candle)
+        prev_close = prev_candle['close']
+        curr_close = curr_candle['close']
+        
+        # True crossover: previous candle closed below VWAP baseline, current candle closes above it
+        prev_below_vwap = (vwap_before is not None and prev_close < vwap_before)
+        curr_above_vwap = (vwap_before is not None and curr_close > vwap_before * 1.005)  # 0.5% buffer
+        
+        # TRUE CROSSOVER = previous closed below AND current closed above (same baseline, EXCLUDING current!)
+        # Fresh/consecutive candle checks above ensure this is a REAL-TIME crossover, not stale data
+        is_true_crossover = prev_below_vwap and curr_above_vwap
+        
+        # Require UPWARD price movement for VWAP reclaim
+        candle_price_move = (
+            curr_candle['close'] - curr_candle['open']
+        ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
+        
+        # 🚨 VWAP reclaim criteria: TRUE crossover + volume confirmation
+        vwap_reclaim_criteria = (
+            is_true_crossover  # Previous candle closed below, current closed above!
+            and candle_price_move >= 0.03  # Require 3% UPWARD move in the reclaim candle
+            and curr_candle['volume'] >= 50_000  # Volume threshold
+            and rvol >= 1.5  # RVOL threshold
+        )
 
-                # DEBUG: Show VWAP reclaim detection logic (using VWAP baseline BEFORE current candle)
-                if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
-                    logger.info(
-                        f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < vwap_before={vwap_before:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > vwap_before={vwap_before:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
-                    )
-                logger.info(
-                    f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap_before={vwap_before:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap_before={vwap_before:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
-                )
-                # Use stored EMAs
-                emas = get_stored_emas(symbol, [5, 8, 13])
-                logger.info(
-                    f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
-                )
-                if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
-                    if (now - last_alert_time[symbol]['vwap_reclaim']) >= timedelta(
-                            minutes=ALERT_COOLDOWN_MINUTES):
-                        
-                        # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
-                        candle_time_vr = curr_candle['start_time'] + timedelta(minutes=1)
-                        alert_price = get_display_price(symbol, curr_candle['close'], candle_time_vr)
-                        
-                        # 🚨 FIX: Ensure we have a valid price for the alert
-                        if alert_price is None:
-                            alert_price = curr_candle['close']  # Fallback to candle close
-                        
-                        # Calculate alert score and add to pending alerts
-                        vwap_reclaim_data = {
-                            "rvol": rvol,
-                            "volume": curr_candle['volume'],
-                            "price_move": candle_price_move,
-                            "candle_price": curr_candle['close'],
-                            "real_time_price": last_trade_price.get(symbol)
-                        }
-                        score = get_alert_score("vwap_reclaim", symbol, vwap_reclaim_data)
-                        
-                        price_str = fmt_price(alert_price)
-                        vwap_str = fmt_price(vwap_before)  # 🚨 FIX: Use baseline VWAP (before current candle)
-                        alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
-                                      f"Price: ${price_str} | VWAP: ${vwap_str}")
-                        
-                        # Add to pending alerts instead of sending immediately
-                        pending_alerts[symbol].append({
-                            'type': 'vwap_reclaim',
-                            'score': score,
-                            'message': alert_text
-                        })
-                        
-                        # Send the best alert for this symbol
-                        await send_best_alert(symbol)
-                        
-                        # Log event for tracking
-                        log_event(
-                            "vwap_reclaim", symbol,
-                            alert_price,
-                            curr_candle['volume'], event_time, vwap_reclaim_data)
-                        
-                        vwap_reclaim_was_true[symbol] = True
-                        alerted_symbols[symbol] = today
-                        last_alert_time[symbol]['vwap_reclaim'] = now
+        # DEBUG: Show VWAP reclaim detection logic (using VWAP baseline BEFORE current candle)
+        if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
+            logger.info(
+                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < vwap_before={vwap_before:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > vwap_before={vwap_before:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
+            )
+        logger.info(
+            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap_before={vwap_before:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap_before={vwap_before:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
+        )
+        # Use stored EMAs
+        emas = get_stored_emas(symbol, [5, 8, 13])
+        logger.info(
+            f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
+        )
+        if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
+            if (now - last_alert_time[symbol]['vwap_reclaim']) < timedelta(
+                    minutes=ALERT_COOLDOWN_MINUTES):
+                return
+            
+            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+            candle_time_vr = curr_candle['start_time'] + timedelta(minutes=1)
+            alert_price = get_display_price(symbol, curr_candle['close'], candle_time_vr)
+            
+            # 🚨 FIX: Ensure we have a valid price for the alert
+            if alert_price is None:
+                alert_price = curr_candle['close']  # Fallback to candle close
+            
+            # Calculate alert score and add to pending alerts
+            vwap_reclaim_data = {
+                "rvol": rvol,
+                "volume": curr_candle['volume'],
+                "price_move": candle_price_move,
+                "candle_price": curr_candle['close'],
+                "real_time_price": last_trade_price.get(symbol)
+            }
+            score = get_alert_score("vwap_reclaim", symbol, vwap_reclaim_data)
+            
+            price_str = fmt_price(alert_price)
+            vwap_str = fmt_price(vwap_before)  # 🚨 FIX: Use baseline VWAP (before current candle)
+            alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
+                          f"Price: ${price_str} | VWAP: ${vwap_str}")
+            
+            # Add to pending alerts instead of sending immediately
+            pending_alerts[symbol].append({
+                'type': 'vwap_reclaim',
+                'score': score,
+                'message': alert_text
+            })
+            
+            # Send the best alert for this symbol
+            await send_best_alert(symbol)
+            
+            # Log event for tracking
+            log_event(
+                "vwap_reclaim", symbol,
+                alert_price,
+                curr_candle['volume'], event_time, vwap_reclaim_data)
+            
+            vwap_reclaim_was_true[symbol] = True
+            alerted_symbols[symbol] = today
+            last_alert_time[symbol]['vwap_reclaim'] = now
 
     # Volume Spike Logic PATCH - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
     if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
@@ -3231,7 +3171,7 @@ async def ingest_polygon_events():
                                     continue
                                 
                                 # ✅ SLOW CHECK #3: Float lookup (only for stocks ≤$15) - 90% reduction in HTTP calls
-                                float_shares = await get_float_shares(symbol, current_price=price)
+                                float_shares = await get_float_shares(symbol)
                                 
                                 # Final eligibility check with float data
                                 if not is_eligible(symbol, price, float_shares, use_entry_price=is_tracked):
@@ -3624,7 +3564,7 @@ async def ingest_polygon_events():
                                     if not current_price and symbol in candles and len(candles[symbol]) > 0:
                                         current_price = candles[symbol][-1]['close']
 
-                                    float_shares = await get_float_shares(symbol, current_price=current_price)
+                                    float_shares = await get_float_shares(symbol)
                                     
                                     # 🚫 WARRANT FILTER: Block warrants from halt alerts
                                     if is_warrant(symbol):
@@ -3963,7 +3903,7 @@ async def rest_api_backup_scanner():
                             continue
                         
                         # Check eligibility (price, float, ETF filter, warrants)
-                        float_shares = await get_float_shares(symbol, current_price=current_price)
+                        float_shares = await get_float_shares(symbol)
                         if not is_eligible(symbol, current_price, float_shares, use_entry_price=False):
                             continue
                         
@@ -4139,7 +4079,7 @@ async def nasdaq_halt_monitor():
                                                     price_source = "candle"
                                                 
                                                 # Get float data
-                                                float_shares = await get_float_shares(symbol, current_price=current_price)
+                                                float_shares = await get_float_shares(symbol)
                                                 
                                                 # 🚨 STRICT RESUME FILTERING: Only alert if stock meets bot criteria
                                                 # Must have valid price ≤$15 AND float 500K-20M (or exception symbol)
@@ -4261,7 +4201,7 @@ async def nasdaq_halt_monitor():
                                             logger.info(f"[HALT PRICE] {symbol} - Using candle price ${current_price:.2f}")
                                         
                                         # Get float with detailed logging
-                                        float_shares = await get_float_shares(symbol, current_price=current_price)
+                                        float_shares = await get_float_shares(symbol)
                                         if float_shares:
                                             logger.info(f"[HALT FLOAT] {symbol} - Float: {float_shares/1e6:.2f}M shares")
                                         else:
