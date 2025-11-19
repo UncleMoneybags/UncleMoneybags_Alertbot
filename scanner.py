@@ -1000,8 +1000,11 @@ vwap_cum_pv = defaultdict(float)
 rvol_history = defaultdict(lambda: deque(maxlen=20))
 RVOL_MIN = 2.0
 
-EVENT_LOG_FILE = "/data/event_log.csv"
-OUTCOME_LOG_FILE = "/data/outcome_log.csv"
+# 🚨 RENDER FIX: Use environment variable for data directory or fall back to ./data
+# Render persistent disk is mounted at a specific path (not root /data)
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
+EVENT_LOG_FILE = f"{DATA_DIR}/event_log.csv"
+OUTCOME_LOG_FILE = f"{DATA_DIR}/outcome_log.csv"
 
 # --- AUTO ML TRAINING SYSTEM ---
 recent_alerts = {}  # symbol -> alert_time
@@ -4301,8 +4304,8 @@ async def nasdaq_halt_monitor():
 
 async def outcome_tracking_loop():
     """Background task for tracking alert outcomes (ML training disabled)"""
-    # Ensure /data directory exists for persistent storage
-    os.makedirs("/data", exist_ok=True)
+    # Ensure data directory exists for persistent storage
+    os.makedirs(DATA_DIR, exist_ok=True)
     
     while True:
         try:
@@ -4380,9 +4383,9 @@ async def main():
     
     logger.info("[STARTUP] ✅ Environment variables validated\n")
     
-    # 🚨 CRITICAL: Ensure /data directory exists for log files
-    os.makedirs("/data", exist_ok=True)
-    logger.info("[STARTUP] ✅ /data directory ready\n")
+    # 🚨 CRITICAL: Ensure data directory exists for log files
+    os.makedirs(DATA_DIR, exist_ok=True)
+    logger.info(f"[STARTUP] ✅ Data directory ready: {DATA_DIR}\n")
     
     # 🔒 Create asyncio locks in main() to bind to correct event loop
     _float_cache_lock = asyncio.Lock()
