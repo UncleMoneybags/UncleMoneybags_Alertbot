@@ -115,6 +115,12 @@ async def save_float_cache(force=False):
         force: If True, save immediately regardless of debounce timer
     """
     global _last_float_cache_save
+    
+    # 🚨 GUARD: Skip if lock not initialized (called before main() completes)
+    if _float_cache_lock is None:
+        logger.debug("[CACHE SAVE] Float cache lock not initialized, skipping save")
+        return
+    
     now = datetime.now(timezone.utc)
     
     # Debounce: only save if enough time has passed or forced
@@ -226,6 +232,12 @@ async def get_float_shares(ticker):
 async def save_ticker_type_cache(force=False):
     """Save ticker type cache to disk with debouncing."""
     global _last_ticker_type_save
+    
+    # 🚨 GUARD: Skip if lock not initialized (called before main() completes)
+    if _ticker_type_lock is None:
+        logger.debug("[CACHE SAVE] Ticker type cache lock not initialized, skipping save")
+        return
+    
     now = datetime.now(timezone.utc)
     
     if not force and (now - _last_ticker_type_save).total_seconds() < FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS:
