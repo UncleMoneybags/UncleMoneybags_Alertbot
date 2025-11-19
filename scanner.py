@@ -2109,7 +2109,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
     # Regular alerting logic follows (float filter applies only to alerts, not to gainers list)
     if not isinstance(candles[symbol], deque):
-        candles[symbol] = deque(candles[symbol], maxlen=20)
+        candles[symbol] = deque(candles[symbol], maxlen=CANDLE_MAXLEN)
     # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
     if not isinstance(vwap_candles[symbol], deque):
         vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
@@ -3222,7 +3222,7 @@ async def ingest_polygon_events():
                                         
                                         # Process the local candle through normal logic
                                         if not isinstance(candles[symbol], deque):
-                                            candles[symbol] = deque(candles[symbol], maxlen=20)
+                                            candles[symbol] = deque(candles[symbol], maxlen=CANDLE_MAXLEN)
                                         # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
                                         if not isinstance(vwap_candles[symbol], deque):
                                             vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
@@ -3232,6 +3232,8 @@ async def ingest_polygon_events():
                                         last_session = vwap_session_date[symbol]
                                         if last_session != session_date:
                                             vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                            vwap_cum_vol[symbol] = 0  # 🚨 FIX: Reset cumulative sums for new session
+                                            vwap_cum_pv[symbol] = 0
                                             vwap_session_date[symbol] = session_date
                                             vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                         
@@ -3404,7 +3406,7 @@ async def ingest_polygon_events():
                                 }
                                 if not isinstance(candles[symbol], deque):
                                     candles[symbol] = deque(candles[symbol],
-                                                            maxlen=20)
+                                                            maxlen=CANDLE_MAXLEN)
                                 # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
                                 if not isinstance(vwap_candles[symbol], deque):
                                     vwap_candles[symbol] = deque(
@@ -3415,6 +3417,8 @@ async def ingest_polygon_events():
                                 last_session = vwap_session_date[symbol]
                                 if last_session != session_date:
                                     vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                    vwap_cum_vol[symbol] = 0  # 🚨 FIX: Reset cumulative sums for new session
+                                    vwap_cum_pv[symbol] = 0
                                     vwap_session_date[symbol] = session_date
                                     vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                 
@@ -3446,6 +3450,8 @@ async def ingest_polygon_events():
                                             f"({price_change_pct*100:.1f}% change). Resetting VWAP."
                                         )
                                         vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                        vwap_cum_vol[symbol] = 0  # 🚨 FIX: Reset cumulative sums for corporate action
+                                        vwap_cum_pv[symbol] = 0
                                 
                                 vwap_candles[symbol].append(candle)
                                 vwap_cum_vol[symbol] += volume
