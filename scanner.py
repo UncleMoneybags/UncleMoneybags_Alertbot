@@ -3152,7 +3152,116 @@ async def ingest_polygon_events():
                                     logger.debug(f"[TRADE SKIP] {symbol} - Missing timestamp, cannot validate freshness")
                                     continue
 
-                                # 🚀 PERFORMANCE: Fast eligibility checks FIRST (no I/O) before slow float lookup
+                                # 🚨 FIX: Calculate trade_time FIRST (needed for local candle builder)
+                                # Polygon timestamps are in nanoseconds, divide by 1,000,000 to get seconds
+                                trade_time = datetime.fromtimestamp(trade_timestamp / 1_000_000, tz=timezone.utc)
+                                now_utc = datetime.now(timezone.utc)
+                                trade_age_seconds = (now_utc - trade_time).total_seconds()
+                                
+                                # Reject trades older than threshold (allows for network jitter)
+                                if trade_age_seconds > MAX_TRADE_AGE_SECONDS:
+                                    logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting (limit: {MAX_TRADE_AGE_SECONDS}s)")
+                                    continue
+
+                                # 🚨 LOCAL CANDLE AGGREGATION: Build 1-min candles from trades BEFORE eligibility filters
+                                # This ensures we build candles for ALL stocks, then on_new_candle() filters them
+                                current_minute = trade_time.replace(second=0, microsecond=0)
+                                
+                                # Initialize tracking structures if needed
+                                if symbol not in local_candle_builder:
+                                    local_candle_builder[symbol] = {
+                                        'minute': current_minute,
+                                        'open': price,
+                                        'high': price,
+                                        'low': price,
+                                        'close': price,
+                                        'volume': size,
+                                        'trade_count': 1
+                                    }
+                                elif local_candle_builder[symbol]['minute'] == current_minute:
+                                    # Same minute - update OHLCV
+                                    builder = local_candle_builder[symbol]
+                                    builder['high'] = max(builder['high'], price)
+                                    builder['low'] = min(builder['low'], price)
+                                    builder['close'] = price
+                                    builder['volume'] += size
+                                    builder['trade_count'] += 1
+                                else:
+                                    # New minute - create candle from previous minute and start new builder
+                                    prev_builder = local_candle_builder[symbol]
+                                    prev_minute = prev_builder['minute']
+                                    
+                                    # Only create local candle if we had trades (min 1 for early detection)
+                                    if prev_builder['trade_count'] >= 1:
+                                        local_candle = {
+                                            "open": prev_builder['open'],
+                                            "high": prev_builder['high'],
+                                            "low": prev_builder['low'],
+                                            "close": prev_builder['close'],
+                                            "volume": prev_builder['volume'],
+                                            "start_time": prev_minute,
+                                        }
+                                        
+                                        logger.debug(
+                                            f"[LOCAL CANDLE] {symbol} {prev_minute} o:{local_candle['open']} h:{local_candle['high']} l:{local_candle['low']} c:{local_candle['close']} v:{local_candle['volume']} (trades:{prev_builder['trade_count']})"
+                                        )
+                                        
+                                        # Process the local candle through normal logic
+                                        if not isinstance(candles[symbol], deque):
+                                            candles[symbol] = deque(candles[symbol], maxlen=20)
+                                        # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
+                                        if not isinstance(vwap_candles[symbol], deque):
+                                            vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
+                                        
+                                        candles[symbol].append(local_candle)
+                                        session_date = get_session_date(local_candle['start_time'])
+                                        last_session = vwap_session_date[symbol]
+                                        if last_session != session_date:
+                                            vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                            vwap_session_date[symbol] = session_date
+                                            vwap_reset_done[symbol] = False  # Reset flag for new trading day
+                                        
+                                        # Process VWAP reset at market open
+                                        eastern = pytz.timezone("America/New_York")
+                                        candle_time = prev_minute.astimezone(eastern).time()
+                                        market_open_time = dt_time(9, 30)
+                                        if candle_time >= market_open_time:
+                                            if not vwap_reset_done[symbol]:
+                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                                vwap_cum_vol[symbol] = 0
+                                                vwap_cum_pv[symbol] = 0
+                                                vwap_reset_done[symbol] = True
+                                                logger.info(f"[VWAP RESET] {symbol} - Cleared pre-market VWAP data at market open (9:30 AM)")
+                                        
+                                        vwap_candles[symbol].append(local_candle)
+                                        
+                                        # Trigger alert processing (on_new_candle does its own eligibility filtering)
+                                        await on_new_candle(
+                                            symbol,
+                                            local_candle['open'],
+                                            local_candle['high'],
+                                            local_candle['low'],
+                                            local_candle['close'],
+                                            local_candle['volume'],
+                                            prev_minute
+                                        )
+                                        
+                                        # Send best alert if any pending
+                                        if symbol in pending_alerts and pending_alerts[symbol]:
+                                            await send_best_alert(symbol)
+                                    
+                                    # Start new minute builder
+                                    local_candle_builder[symbol] = {
+                                        'minute': current_minute,
+                                        'open': price,
+                                        'high': price,
+                                        'low': price,
+                                        'close': price,
+                                        'volume': size,
+                                        'trade_count': 1
+                                    }
+
+                                # 🚀 PERFORMANCE: Fast eligibility checks for trade tracking (no I/O) before slow float lookup
                                 
                                 # 🎯 GRANDFATHERING: Use entry price for already-tracked stocks
                                 is_tracked = symbol in entry_price and entry_price[symbol] is not None
@@ -3173,30 +3282,20 @@ async def ingest_polygon_events():
                                 # ✅ SLOW CHECK #3: Float lookup (only for stocks ≤$15) - 90% reduction in HTTP calls
                                 float_shares = await get_float_shares(symbol)
                                 
-                                # Final eligibility check with float data
+                                # Final eligibility check with float data (for trade tracking only, not candle building)
                                 if not is_eligible(symbol, price, float_shares, use_entry_price=is_tracked):
                                     # If not eligible and was being tracked, clear entry price
                                     if is_tracked:
                                         logger.info(f"[GRANDFATHERING] {symbol} no longer eligible (float), removing from tracking (entry: ${entry_price[symbol]:.2f}, current: ${price:.2f})")
                                         entry_price[symbol] = None
-                                    continue  # Skip ineligible symbols completely
+                                    continue  # Skip tracking for ineligible symbols
                                 
                                 # 🎯 NEW STOCK: Record entry price when first eligible
                                 if not is_tracked:
                                     entry_price[symbol] = price
                                     logger.info(f"[GRANDFATHERING] {symbol} now eligible - locked entry price: ${price:.2f}")
 
-                                # 🚨 FIX: Use Polygon's timestamp to reject stale trades
-                                # Polygon timestamps are in nanoseconds, divide by 1,000,000 to get seconds
-                                trade_time = datetime.fromtimestamp(trade_timestamp / 1_000_000, tz=timezone.utc)
-                                now_utc = datetime.now(timezone.utc)
-                                trade_age_seconds = (now_utc - trade_time).total_seconds()
-                                
-                                # Reject trades older than threshold (allows for network jitter)
-                                if trade_age_seconds > MAX_TRADE_AGE_SECONDS:
-                                    logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting (limit: {MAX_TRADE_AGE_SECONDS}s)")
-                                    continue
-                                
+                                # Update last trade tracking for eligible stocks
                                 last_trade_price[symbol] = price
                                 last_trade_volume[symbol] = size
                                 last_trade_time[symbol] = trade_time  # Use Polygon's timestamp, not now()
@@ -3268,104 +3367,6 @@ async def ingest_polygon_events():
                                                 
                                             except Exception as resume_err:
                                                 logger.error(f"[RESUME ERROR] {symbol} - Failed to send resume alert: {resume_err}", exc_info=True)
-                                
-                                # 🚨 LOCAL CANDLE AGGREGATION: Build 1-min candles from trades when Polygon doesn't provide AM events
-                                # Track trades per minute for symbols missing Polygon candles
-                                current_minute = trade_time.replace(second=0, microsecond=0)
-                                
-                                # Initialize tracking structures if needed
-                                if symbol not in local_candle_builder:
-                                    local_candle_builder[symbol] = {
-                                        'minute': current_minute,
-                                        'open': price,
-                                        'high': price,
-                                        'low': price,
-                                        'close': price,
-                                        'volume': size,
-                                        'trade_count': 1
-                                    }
-                                elif local_candle_builder[symbol]['minute'] == current_minute:
-                                    # Same minute - update OHLCV
-                                    builder = local_candle_builder[symbol]
-                                    builder['high'] = max(builder['high'], price)
-                                    builder['low'] = min(builder['low'], price)
-                                    builder['close'] = price
-                                    builder['volume'] += size
-                                    builder['trade_count'] += 1
-                                else:
-                                    # New minute - create candle from previous minute and start new builder
-                                    prev_builder = local_candle_builder[symbol]
-                                    prev_minute = prev_builder['minute']
-                                    
-                                    # Only create local candle if we had trades (min 1 for early detection)
-                                    if prev_builder['trade_count'] >= 1:
-                                        local_candle = {
-                                            "open": prev_builder['open'],
-                                            "high": prev_builder['high'],
-                                            "low": prev_builder['low'],
-                                            "close": prev_builder['close'],
-                                            "volume": prev_builder['volume'],
-                                            "start_time": prev_minute,
-                                        }
-                                        
-                                        logger.debug(
-                                            f"[LOCAL CANDLE] {symbol} {prev_minute} o:{local_candle['open']} h:{local_candle['high']} l:{local_candle['low']} c:{local_candle['close']} v:{local_candle['volume']} (trades:{prev_builder['trade_count']})"
-                                        )
-                                        
-                                        # Process the local candle through normal logic
-                                        if not isinstance(candles[symbol], deque):
-                                            candles[symbol] = deque(candles[symbol], maxlen=20)
-                                        # 🚨 FIX: Keep vwap_candles as deque to prevent memory leak
-                                        if not isinstance(vwap_candles[symbol], deque):
-                                            vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
-                                        
-                                        candles[symbol].append(local_candle)
-                                        session_date = get_session_date(local_candle['start_time'])
-                                        last_session = vwap_session_date[symbol]
-                                        if last_session != session_date:
-                                            vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
-                                            vwap_session_date[symbol] = session_date
-                                            vwap_reset_done[symbol] = False  # Reset flag for new trading day
-                                        
-                                        # Process VWAP reset at market open
-                                        eastern = pytz.timezone("America/New_York")
-                                        candle_time = prev_minute.astimezone(eastern).time()
-                                        market_open_time = dt_time(9, 30)
-                                        if candle_time >= market_open_time:
-                                            if not vwap_reset_done[symbol]:
-                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
-                                                vwap_cum_vol[symbol] = 0
-                                                vwap_cum_pv[symbol] = 0
-                                                vwap_reset_done[symbol] = True
-                                                logger.info(f"[VWAP RESET] {symbol} - Cleared pre-market VWAP data at market open (9:30 AM)")
-                                        
-                                        vwap_candles[symbol].append(local_candle)
-                                        
-                                        # Trigger alert processing
-                                        await on_new_candle(
-                                            symbol,
-                                            local_candle['open'],
-                                            local_candle['high'],
-                                            local_candle['low'],
-                                            local_candle['close'],
-                                            local_candle['volume'],
-                                            prev_minute
-                                        )
-                                        
-                                        # Send best alert if any pending
-                                        if symbol in pending_alerts and pending_alerts[symbol]:
-                                            await send_best_alert(symbol)
-                                    
-                                    # Start new minute builder
-                                    local_candle_builder[symbol] = {
-                                        'minute': current_minute,
-                                        'open': price,
-                                        'high': price,
-                                        'low': price,
-                                        'close': price,
-                                        'volume': size,
-                                        'trade_count': 1
-                                    }
                             elif event.get("ev") == "AM":
                                 symbol = event["sym"]
                                 open_ = event["o"]
