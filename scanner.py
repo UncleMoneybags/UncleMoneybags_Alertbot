@@ -3255,17 +3255,24 @@ async def ingest_polygon_events():
                                             vwap_session_date[symbol] = session_date
                                             vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                         
-                                        # Process VWAP reset at market open
+                                        # 🚨 CRITICAL FIX: Reset VWAP at 9:30 AM to match TradingView (regular session only)
                                         eastern = pytz.timezone("America/New_York")
-                                        candle_time = prev_minute.astimezone(eastern).time()
+                                        candle_time_et = prev_minute.astimezone(eastern)
+                                        candle_time = candle_time_et.time()
                                         market_open_time = dt_time(9, 30)
+                                        
+                                        # Reset VWAP on FIRST candle at or after 9:30 AM
                                         if candle_time >= market_open_time:
                                             if not vwap_reset_done[symbol]:
-                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
+                                                logger.warning(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing ALL pre-market data (local candle)")
+                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # Clear ALL pre-market candles
                                                 vwap_cum_vol[symbol] = 0
                                                 vwap_cum_pv[symbol] = 0
                                                 vwap_reset_done[symbol] = True
-                                                logger.info(f"[VWAP RESET] {symbol} - Cleared pre-market VWAP data at market open (9:30 AM)")
+                                                logger.info(f"[VWAP RESET] {symbol} - Starting fresh VWAP from 9:30 AM (excludes pre-market)")
+                                        elif candle_time < market_open_time:
+                                            # Pre-market candle - mark reset as NOT done yet
+                                            vwap_reset_done[symbol] = False
                                         
                                         vwap_candles[symbol].append(local_candle)
                                         
@@ -3440,21 +3447,27 @@ async def ingest_polygon_events():
                                     vwap_session_date[symbol] = session_date
                                     vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                 
-                                # 🚨 FIX: Reset VWAP at 9:30 AM to exclude pre-market data
+                                # 🚨 CRITICAL FIX: Reset VWAP at 9:30 AM to match TradingView (regular session only)
                                 eastern = pytz.timezone("America/New_York")
-                                candle_time = start_time.astimezone(eastern).time()
+                                candle_time_et = start_time.astimezone(eastern)
+                                candle_time = candle_time_et.time()
                                 market_open_time = dt_time(9, 30)
                                 
-                                # If this is the first candle at or after 9:30 AM, reset VWAP (only once per day)
-                                if not vwap_reset_done.get(symbol, False) and len(vwap_candles[symbol]) > 0:
-                                    last_candle_time = vwap_candles[symbol][-1]['start_time'].astimezone(eastern).time()
-                                    # Reset if crossing from pre-market into regular session
-                                    if last_candle_time < market_open_time <= candle_time:
-                                        logger.info(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing pre-market data")
-                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # 🚨 FIX: Use deque not list
-                                        vwap_cum_vol[symbol] = 0
+                                # Reset VWAP on FIRST candle at or after 9:30 AM (once per trading day)
+                                # This ensures VWAP only includes regular session data (9:30am-4pm), matching TradingView
+                                if candle_time >= market_open_time:
+                                    # Check if we need to reset (first regular session candle of the day)
+                                    # 🚨 FIX: ALWAYS reset if not done (even if deque empty from local builder path)
+                                    if not vwap_reset_done.get(symbol, False):
+                                        logger.warning(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing ALL pre-market data (WebSocket)")
+                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # Clear ALL pre-market candles
+                                        vwap_cum_vol[symbol] = 0  # Reset cumulative sums
                                         vwap_cum_pv[symbol] = 0
-                                        vwap_reset_done[symbol] = True  # Prevent multiple resets per day
+                                        vwap_reset_done[symbol] = True  # Mark as reset for today
+                                        logger.info(f"[VWAP RESET] {symbol} - Starting fresh VWAP from 9:30 AM (excludes pre-market)")
+                                elif candle_time < market_open_time:
+                                    # Pre-market candle - mark reset as NOT done yet
+                                    vwap_reset_done[symbol] = False
                                 
                                 # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
                                 if len(vwap_candles[symbol]) > 0:
