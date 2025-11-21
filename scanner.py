@@ -2473,6 +2473,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         
         # 🚨 FIX: Require CONSECUTIVE candles (gap ≤ 1 minute, allowing small tolerance)
         # Prevents false alerts from non-contiguous candles after data gaps
+        # NOTE: Volume spikes are handled separately and don't reach this code
         if time_gap > timedelta(seconds=90):
             logger.info(
                 f"[VWAP SKIP] {symbol} - Candles not consecutive ({time_gap.total_seconds()}s gap), blocking non-contiguous crossover"
@@ -2715,7 +2716,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         last_alert_time[symbol]['volume_spike'] = now
 
     # --- EMA STACK LOGIC PATCH (SESSION-AWARE THRESHOLDS) ---
-    if (float_shares is not None and float_shares <= 20_000_000):
+    # 🚨 CRITICAL FIX: Skip EMA STACK if volume spike just alerted (no need for stacked setup)
+    if alerted_symbols.get(symbol) == today:
+        logger.debug(f"[EMA STACK] {symbol}: Skipping - volume spike already alerted today")
+    elif (float_shares is not None and float_shares <= 20_000_000):
         session_type = get_session_type(list(candles_seq)[-1]['start_time'])
         closes = [c['close']
                   for c in list(candles_seq)]  # Use all available candles
@@ -3465,9 +3469,6 @@ async def ingest_polygon_events():
                                         vwap_cum_pv[symbol] = 0
                                         vwap_reset_done[symbol] = True  # Mark as reset for today
                                         logger.info(f"[VWAP RESET] {symbol} - Starting fresh VWAP from 9:30 AM (excludes pre-market)")
-                                elif candle_time < market_open_time:
-                                    # Pre-market candle - mark reset as NOT done yet
-                                    vwap_reset_done[symbol] = False
                                 
                                 # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
                                 if len(vwap_candles[symbol]) > 0:
