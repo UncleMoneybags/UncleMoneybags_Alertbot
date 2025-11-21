@@ -720,7 +720,8 @@ async def backfill_stored_emas(symbol):
                     
                     regular_session_candles = []
                     for candle in candles:
-                        candle_time_ts = polygon_time_to_utc(candle['s'])
+                        # Use 't' field for historical API (milliseconds since epoch)
+                        candle_time_ts = polygon_time_to_utc(candle.get('t', candle.get('s', 0)))
                         candle_time_et = candle_time_ts.astimezone(eastern)
                         candle_time = candle_time_et.time()
                         
