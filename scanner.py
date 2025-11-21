@@ -3469,6 +3469,14 @@ async def ingest_polygon_events():
                                         vwap_cum_pv[symbol] = 0
                                         vwap_reset_done[symbol] = True  # Mark as reset for today
                                         logger.info(f"[VWAP RESET] {symbol} - Starting fresh VWAP from 9:30 AM (excludes pre-market)")
+                                        
+                                        # 🚨 CRITICAL FIX: Also reset EMAs at 9:30 AM to clear pre-market contamination
+                                        # Pre-market EMAs are dirty (mix of after-hours + pre-market data)
+                                        # Reset them so backfill triggers and gets CLEAN regular session data
+                                        logger.warning(f"[EMA RESET] {symbol} - Clearing pre-market EMAs at 9:30 AM for fresh regular session values")
+                                        for period in [5, 8, 13, 200]:
+                                            stored_emas[symbol][period] = ExponentialMovingAverage(period)  # Reset to uninitialized
+                                        logger.info(f"[EMA RESET] {symbol} - EMAs cleared, backfill will trigger on next candle for clean data")
                                 
                                 # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
                                 if len(vwap_candles[symbol]) > 0:
