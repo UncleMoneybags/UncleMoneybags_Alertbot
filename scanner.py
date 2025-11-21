@@ -712,8 +712,26 @@ async def backfill_stored_emas(symbol):
                         f"[EMA BACKFILL] {symbol} | Fetched {len(candles)} historical candles"
                     )
 
-                    # Seed EMAs with historical closes in chronological order
+                    # 🚨 CRITICAL FIX: Filter to regular session only (9:30 AM - 4:00 PM ET)
+                    # Pre-market candles contaminate EMAs - must use clean regular session data
+                    eastern = pytz.timezone("America/New_York")
+                    market_open = dt_time(9, 30)
+                    market_close = dt_time(16, 0)
+                    
+                    regular_session_candles = []
                     for candle in candles:
+                        candle_time_ts = polygon_time_to_utc(candle['s'])
+                        candle_time_et = candle_time_ts.astimezone(eastern)
+                        candle_time = candle_time_et.time()
+                        
+                        # Only include regular session candles (9:30 AM - 4:00 PM ET)
+                        if market_open <= candle_time <= market_close:
+                            regular_session_candles.append(candle)
+                    
+                    logger.info(f"[EMA BACKFILL] {symbol} | Filtered to {len(regular_session_candles)} regular session candles (excluded pre-market/after-hours)")
+
+                    # Seed EMAs with historical closes in chronological order (regular session only)
+                    for candle in regular_session_candles:
                         close_price = candle['c']
                         for period in [5, 8, 13, 200]:
                             stored_emas[symbol][period].update(close_price)
@@ -3475,7 +3493,7 @@ async def ingest_polygon_events():
                                         # Reset them so backfill triggers and gets CLEAN regular session data
                                         logger.warning(f"[EMA RESET] {symbol} - Clearing pre-market EMAs at 9:30 AM for fresh regular session values")
                                         for period in [5, 8, 13, 200]:
-                                            stored_emas[symbol][period] = ExponentialMovingAverage(period)  # Reset to uninitialized
+                                            stored_emas[symbol][period] = RunningEMA(period)  # Reset to uninitialized
                                         logger.info(f"[EMA RESET] {symbol} - EMAs cleared, backfill will trigger on next candle for clean data")
                                 
                                 # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
