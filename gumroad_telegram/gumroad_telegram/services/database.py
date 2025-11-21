@@ -39,15 +39,15 @@ class UserDatabase:
             logger.info("Database initialized")
     
     def link_user(self, email: str, telegram_id: int, gumroad_id: Optional[str] = None):
-        """Link a Gumroad email to Telegram user ID"""
+        """Link a Gumroad email to Telegram user ID (re-activates if previously removed)"""
         with self.lock:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO user_mappings (email, telegram_id, gumroad_id)
-                    VALUES (?, ?, ?)
+                    INSERT OR REPLACE INTO user_mappings (email, telegram_id, gumroad_id, removed_at)
+                    VALUES (?, ?, ?, NULL)
                 """, (email, telegram_id, gumroad_id))
                 conn.commit()
-                logger.info(f"Linked {email} -> Telegram ID {telegram_id}")
+                logger.info(f"Linked {email} -> Telegram ID {telegram_id} (re-activated if previously removed)")
     
     def get_telegram_id(self, email: str, gumroad_id: Optional[str] = None) -> Optional[int]:
         """Get Telegram user ID from email or Gumroad ID"""
