@@ -1046,6 +1046,24 @@ def get_min_volume_for_float(float_shares):
     else:  # Regular float (2M-20M)
         return 25_000  # Standard threshold
 
+# 🚨 DYNAMIC DOLLAR VOLUME BY PRICE - Catches penny stock runners like NCPL!
+def get_min_dollar_volume_for_price(price):
+    """Return adaptive dollar volume threshold based on stock price
+    
+    Penny stocks need lower dollar thresholds - $50K on a $0.71 stock is unrealistic (71K shares!)
+    This fix catches NCPL-type moves while maintaining quality filters for higher-priced stocks.
+    """
+    if price is None or price <= 0:
+        return 25_000  # Default
+    elif price < 0.50:
+        return 5_000  # Microcap: $5K minimum
+    elif price < 1.00:
+        return 10_000  # Penny stocks: $10K minimum (fixes NCPL issue)
+    elif price < 5.00:
+        return 25_000  # $1-$5: $25K minimum
+    else:
+        return 50_000  # $5+: $50K minimum
+
 # Exception list for hot stocks that bypass float restrictions
 FLOAT_EXCEPTION_SYMBOLS = {
     "OCTO", "GME", "AMC", "BBBY", "DWAC"
@@ -1968,14 +1986,15 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
     # 🚨 PERFECT SETUP: Increased thresholds to match Volume Spike quality standards
     # - RVOL 2.2x (up from 2.0x) to align with volume spike minimum
     # - Volume 250K (up from 100K) to ensure meaningful liquidity
-    # - Dollar volume $50K minimum to filter out low-liquidity garbage
+    # - Dollar volume adaptive by price to catch penny stock runners (fixes NCPL!)
     dollar_volume = last_volume * current_price_perfect if current_price_perfect else 0
+    min_dollar_volume_perfect = get_min_dollar_volume_for_price(current_price_perfect)
     perfect = ((ema5 > ema8 > ema13) and (ema5 >= 1.011 * ema13) and
                (current_price_perfect is not None
                 and current_price_perfect > vwap_value)  # 🚨 REAL-TIME PRICE!
                and (last_volume >= 250000) and (rvol > 2.2) and (last_rsi < 70)
                and (last_macd_hist > 0) and bullish_engulf
-               and (dollar_volume >= 50000))  # Minimum $50K traded for quality
+               and (dollar_volume >= min_dollar_volume_perfect))  # 🚨 Dynamic minimum by price
 
     # ---- PATCH: enforce ratio at alert time! ----
     if perfect:
@@ -2255,6 +2274,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         
         # WARMING UP = Early runner detection (low thresholds)
         min_vol_wu = get_min_volume_for_float(float_shares)  # 🚨 Adaptive: 7.5k for micro-floats, 25k for regular
+        min_dollar_volume_wu = get_min_dollar_volume_for_price(current_price_wu if current_price_wu else close_wu)
         warming_up_criteria = (
             volume_wu >= 1.5 * avg_vol_5
             and  # EARLY: Just 1.5x volume spike
@@ -2270,8 +2290,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and
             current_price_wu is not None and current_price_wu > vwap_wu
             and  # Above VWAP
-            dollar_volume_wu >= 50_000
-            and  # Lower dollar volume for early detection
+            dollar_volume_wu >= min_dollar_volume_wu
+            and  # 🚨 Dynamic minimum by price (fixes NCPL!)
             avg_vol_5 > 5_000
         )
         # 🚨 WARMING UP DEBUG
@@ -2577,10 +2597,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
         
         # 🚨 VWAP reclaim criteria: TRUE crossover + volume confirmation
+        # 🚨 CRITICAL FIX: Dynamic volume thresholds for penny stocks
+        vwap_reclaim_min_vol = get_min_volume_for_float(float_shares)
         vwap_reclaim_criteria = (
             is_true_crossover  # Previous candle closed below, current closed above!
             and candle_price_move >= 0.03  # Require 3% UPWARD move in the reclaim candle
-            and curr_candle['volume'] >= 50_000  # Volume threshold
+            and curr_candle['volume'] >= vwap_reclaim_min_vol  # Dynamic volume - catches penny stocks!
             and rvol >= 1.5  # RVOL threshold
         )
 
@@ -2816,12 +2838,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
 
             if session_type in ["premarket", "afterhours"]:
                 min_volume = 250_000
-                min_dollar_volume = 50_000
+                min_dollar_volume_base = 50_000
             else:
                 min_volume = 100_000
-                min_dollar_volume = 75_000
+                min_dollar_volume_base = 75_000
 
             dollar_volume = current_price_ema * last_volume
+            # 🚨 CRITICAL FIX: Dynamic dollar volume by price - catches penny stock EMA stacks!
+            min_dollar_volume = min(min_dollar_volume_base, get_min_dollar_volume_for_price(current_price_ema))
 
             # STRENGTHENED EMA stack criteria (5,8,13) - MUCH more selective for higher quality alerts
             # NOTE: VWAP check moved above - real-time price already confirmed > VWAP
@@ -3036,7 +3060,7 @@ async def premarket_gainers_alert_loop():
                                     ) / premarket_open_prices[sym] * 100
                         last_price = premarket_last_prices[sym]
                         total_vol = premarket_volumes.get(sym, 0)
-                        # 🎯 STRICT FILTERS: Price ≤$15, Volume ≥50k, Gain ≥5% for quality list
+                        # 🎯 STRICT FILTERS: Price ≤$15, Volume ≥50k, Gain ≥5% for quality list (fixed threshold for clean summary)
                         if last_price <= 15 and total_vol >= 50000 and pct_gain >= 5.0:
                             float_val = float_cache.get(sym)
                             float_str = f", Float: {float_val/1e6:.1f}M" if float_val else ""
