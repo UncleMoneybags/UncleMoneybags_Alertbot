@@ -58,13 +58,40 @@ async def handle_telegram_update(update: dict):
     Handle incoming Telegram messages for auto-onboarding
     
     Flow:
-    1. User messages bot with /start
-    2. Bot asks for their Gumroad email
-    3. User provides email
-    4. Bot auto-links Telegram ID to email
-    5. Bot sends them the channel invite link
+    1. User joins group → bot sends welcome message asking for email
+    2. User messages bot with /start
+    3. Bot asks for their Gumroad email
+    4. User provides email
+    5. Bot auto-links Telegram ID to email
+    6. Bot sends them the channel invite link
     """
     try:
+        # Handle group join events
+        my_chat_member = update.get('my_chat_member', {})
+        if my_chat_member:
+            new_member = my_chat_member.get('new_chat_member', {})
+            old_member = my_chat_member.get('old_chat_member', {})
+            new_status = new_member.get('status')
+            old_status = old_member.get('status')
+            
+            # User just joined the group
+            if new_status == 'member' and old_status != 'member':
+                user_id = new_member.get('user', {}).get('id')
+                username = new_member.get('user', {}).get('username', 'Member')
+                chat_id = int(my_chat_member.get('chat', {}).get('id'))
+                
+                if user_id and chat_id:
+                    user_states[user_id] = 'waiting_for_email'
+                    
+                    await send_message(
+                        user_id,
+                        f"👋 Welcome {username}!\n\n"
+                        f"To verify your access, please send me the email address you used to purchase.\n\n"
+                        f"Just reply with your email (e.g., user@example.com)"
+                    )
+                    logger.info(f"New member {user_id} ({username}) joined - sent welcome message")
+            return
+        
         message = update.get('message', {})
         chat_id = message.get('chat', {}).get('id')
         user_id = message.get('from', {}).get('id')
@@ -113,14 +140,14 @@ async def handle_telegram_update(update: dict):
                     f"⚠️ This link works ONLY ONCE and cannot be shared.\n\n"
                     f"Welcome aboard! 🎉"
                 )
-                logger.info(f"Successfully linked {email} -> Telegram ID {user_id}")
+                logger.info(f"Successfully linked {email} -> Telegram ID {user_id}, sent invite link")
             else:
                 await send_message(
                     chat_id,
-                    f"✅ Email verified!\n\n"
-                    f"However, I couldn't generate your invite link. Please contact support."
+                    f"✅ Email verified and linked to Telegram!\n\n"
+                    f"However, I couldn't generate your access link. Please contact support or try again in a few moments."
                 )
-                logger.error(f"Failed to create invite link for {email}")
+                logger.error(f"Failed to create invite link for {email} (Telegram ID: {user_id})")
             
             return
         
