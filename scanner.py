@@ -721,7 +721,16 @@ async def backfill_stored_emas(symbol):
                     regular_session_candles = []
                     for candle in candles:
                         # Use 't' field for historical API (milliseconds since epoch)
-                        candle_time_ts = polygon_time_to_utc(candle.get('t', candle.get('s', 0)))
+                        # 🚨 FIX: Normalize timestamp type (numeric or string) before conversion
+                        ts_val = candle.get('t', candle.get('s', 0))
+                        if isinstance(ts_val, str):
+                            try:
+                                from dateutil.parser import parse
+                                candle_time_ts = parse(ts_val)
+                            except:
+                                continue
+                        else:
+                            candle_time_ts = polygon_time_to_utc(ts_val)
                         candle_time_et = candle_time_ts.astimezone(eastern)
                         candle_time = candle_time_et.time()
                         
@@ -1040,7 +1049,7 @@ MAX_FLOAT_SHARES = 20_000_000  # UPDATED: Increased from 10M to 20M
 def get_min_volume_for_float(float_shares):
     """Return adaptive volume threshold based on float size - catches ULY-type micro-float runners"""
     if float_shares is None:
-        return 7_500  # FIXED: Treat unknown float as micro-float for max detection sensitivity
+        return 25_000  # 🚨 FIX: Conservative default for unknown float - prevents false positives
     elif float_shares < 2_000_000:  # FIXED: Micro-float threshold at 2M (was 3M)
         return 7_500  # 🚨 MUCH LOWER for micro-floats - catches 8-18k/min spikes
     else:  # Regular float (2M-20M)
@@ -2548,15 +2557,25 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # Problem: If we use VWAP that includes current candle, a strong current candle can
         # move VWAP above prev_close, creating a false "reclaim" signal
         # Solution: Compare both candles against VWAP calculated BEFORE current candle
+        # 🔒 THREAD-SAFE: Use halt_lock to guard concurrent VWAP cumulative sum access
         
         # Calculate VWAP baseline excluding current candle
         if symbol in vwap_cum_vol and symbol in vwap_cum_pv and vwap_cum_vol[symbol] > 0:
+            # 🔒 ATOMIC READ: Protect concurrent access to VWAP cumulative sums (if lock initialized)
+            if halt_lock is not None:
+                async with halt_lock:
+                    vol_snapshot = vwap_cum_vol[symbol]
+                    pv_snapshot = vwap_cum_pv[symbol]
+            else:
+                vol_snapshot = vwap_cum_vol[symbol]
+                pv_snapshot = vwap_cum_pv[symbol]
+            
             # Subtract current candle's contribution to get VWAP before it
             curr_typical = (curr_candle['high'] + curr_candle['low'] + curr_candle['close']) / 3
             curr_pv = curr_typical * curr_candle['volume']
             
-            vwap_vol_before = vwap_cum_vol[symbol] - curr_candle['volume']
-            vwap_pv_before = vwap_cum_pv[symbol] - curr_pv
+            vwap_vol_before = vol_snapshot - curr_candle['volume']
+            vwap_pv_before = pv_snapshot - curr_pv
             
             if vwap_vol_before > 0:
                 vwap_before = vwap_pv_before / vwap_vol_before
