@@ -1742,6 +1742,11 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     
     if len(candles_list) < 5:  # Need 5 candles (3 trailing + 2 consecutive green)
         return False, {}
+    
+    # 🚨 SAFETY GATE: Block sub-$0.10 penny stocks
+    curr_close = candles_list[-1]['close']
+    if curr_close < MIN_PRICE_THRESHOLD:
+        return False, {}
 
     curr_candle = candles_list[-1]
     prev_candle = candles_list[-2]
@@ -2301,6 +2306,11 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     if not is_market_scan_time(
     ) or close > 25.00:  # INCREASED: Higher ceiling for momentum moves
         return
+    
+    # 🚨 SAFETY GATE: Block ANY sub-$0.10 stock from alerting (prevents USDP, penny garbage)
+    if close < MIN_PRICE_THRESHOLD:
+        return
+    
     today = datetime.now(timezone.utc).date()
     candles_seq = candles[symbol]
     event_time = datetime.now(timezone.utc)
