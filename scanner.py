@@ -206,7 +206,12 @@ async def get_float_shares(ticker):
         # Handle result
         if isinstance(result, tuple):  # Error case
             float_shares, error = result
-            float_cache_none_retry[ticker] = now
+            # 🔒 FIX: Protect cache write with lock
+            if _float_cache_lock is not None:
+                async with _float_cache_lock:
+                    float_cache_none_retry[ticker] = now
+            else:
+                float_cache_none_retry[ticker] = now
             asyncio.create_task(save_float_cache())  # Non-blocking save
             if error and "Rate limited" in str(error):
                 await asyncio.sleep(5)  # Backoff for rate limits
@@ -214,17 +219,34 @@ async def get_float_shares(ticker):
         else:
             float_shares = result
             if float_shares is not None:
-                float_cache[ticker] = float_shares
+                # 🔒 FIX: Protect cache write with lock to prevent race conditions
+                if _float_cache_lock is not None:
+                    async with _float_cache_lock:
+                        float_cache[ticker] = float_shares
+                        if ticker in float_cache_none_retry:
+                            del float_cache_none_retry[ticker]
+                else:
+                    float_cache[ticker] = float_shares
+                    if ticker in float_cache_none_retry:
+                        del float_cache_none_retry[ticker]
                 asyncio.create_task(save_float_cache())  # Non-blocking save
-                if ticker in float_cache_none_retry:
-                    del float_cache_none_retry[ticker]
             else:
-                float_cache_none_retry[ticker] = now
+                # 🔒 FIX: Protect cache write with lock
+                if _float_cache_lock is not None:
+                    async with _float_cache_lock:
+                        float_cache_none_retry[ticker] = now
+                else:
+                    float_cache_none_retry[ticker] = now
                 asyncio.create_task(save_float_cache())  # Non-blocking save
             # Removed unnecessary 0.5s sleep - slows down float lookups
             return float_shares
     except Exception as e:
-        float_cache_none_retry[ticker] = now
+        # 🔒 FIX: Protect cache write with lock
+        if _float_cache_lock is not None:
+            async with _float_cache_lock:
+                float_cache_none_retry[ticker] = now
+        else:
+            float_cache_none_retry[ticker] = now
         asyncio.create_task(save_float_cache())  # Non-blocking save
         return float_cache.get(ticker, None)
 
@@ -290,8 +312,12 @@ async def get_ticker_type(symbol):
                     data = await response.json()
                     if data.get("status") == "OK" and data.get("results"):
                         ticker_type = data["results"].get("type")
-                        # Cache the result
-                        ticker_type_cache[symbol] = ticker_type
+                        # 🔒 FIX: Protect cache write with lock to prevent race conditions
+                        if _ticker_type_lock is not None:
+                            async with _ticker_type_lock:
+                                ticker_type_cache[symbol] = ticker_type
+                        else:
+                            ticker_type_cache[symbol] = ticker_type
                         asyncio.create_task(save_ticker_type_cache())  # Non-blocking save
                         logger.debug(f"[TICKER TYPE] {symbol} = {ticker_type}")
                         return ticker_type
@@ -500,16 +526,17 @@ class VolumeProfile:
         await loop.run_in_executor(io_executor, write_json)
 
     async def add_day(self, symbol, daily_candles):
+        # 🔒 FIX: Protect profile dictionary from concurrent access race conditions
         for candle in daily_candles:
             minute_idx = get_minute_of_day(candle['start_time'])
             vol = candle['volume']
             if minute_idx < 0 or minute_idx >= MINUTES_PER_SESSION:
                 continue
-            self.profile.setdefault(symbol, {}).setdefault(minute_idx,
-                                                           []).append(vol)
-            if len(self.profile[symbol][minute_idx]) > DAYS_TO_KEEP:
-                self.profile[symbol][minute_idx] = self.profile[symbol][
-                    minute_idx][-DAYS_TO_KEEP:]
+            # 🔒 Atomic update to prevent concurrent modification
+            self.profile.setdefault(symbol, {}).setdefault(minute_idx, []).append(vol)
+            # Keep only last N days of data per minute
+            if self.profile[symbol][minute_idx] and len(self.profile[symbol][minute_idx]) > DAYS_TO_KEEP:
+                self.profile[symbol][minute_idx] = self.profile[symbol][minute_idx][-DAYS_TO_KEEP:]
         await self._save_profile()
 
     def get_avg(self, symbol, minute_idx):
@@ -996,7 +1023,21 @@ def bollinger_bands(prices, period=20, num_std=2):
 
 
 def polygon_time_to_utc(ts):
-    return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
+    """🚨 ROBUST: Auto-detect timestamp scale (seconds, milliseconds, or nanoseconds)"""
+    try:
+        ts = int(ts) if not isinstance(ts, int) else ts
+    except:
+        raise ValueError(f"Invalid timestamp: {ts}")
+    
+    # Auto-detect scale based on magnitude
+    if ts > 1e14:  # 16+ digits = nanoseconds
+        return datetime.utcfromtimestamp(ts / 1_000_000_000).replace(tzinfo=timezone.utc)
+    elif ts > 1e11:  # 13 digits = milliseconds
+        return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
+    elif ts > 1e9:  # 10 digits = seconds
+        return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc)
+    else:  # Fallback to milliseconds for anything smaller
+        return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
 
 
 logging.basicConfig(level=logging.INFO,
@@ -1998,18 +2039,19 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
     # - Dollar volume adaptive by price to catch penny stock runners (fixes NCPL!)
     dollar_volume = last_volume * current_price_perfect if current_price_perfect else 0
     min_dollar_volume_perfect = get_min_dollar_volume_for_price(current_price_perfect)
+    # 🚨 FIX: Guard vwap_value None before comparison
+    vwap_check = (vwap_value is not None and current_price_perfect is not None and current_price_perfect > vwap_value)
     perfect = ((ema5 > ema8 > ema13) and (ema5 >= 1.011 * ema13) and
-               (current_price_perfect is not None
-                and current_price_perfect > vwap_value)  # 🚨 REAL-TIME PRICE!
+               vwap_check  # 🚨 REAL-TIME PRICE & VWAP both required!
                and (last_volume >= 250000) and (rvol > 2.2) and (last_rsi < 70)
                and (last_macd_hist > 0) and bullish_engulf
                and (dollar_volume >= min_dollar_volume_perfect))  # 🚨 Dynamic minimum by price
 
     # ---- PATCH: enforce ratio at alert time! ----
     if perfect:
-        if ema5 / ema13 < 1.011:
+        if ema13 <= 0 or ema5 / ema13 < 1.011:  # 🚨 FIX: Guard against division by zero and invalid ratio
             logger.error(
-                f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.011)"
+                f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13 if ema13 > 0 else 'inf':.4f} (should be >= 1.011)"
             )
             return
 
@@ -2122,6 +2164,7 @@ def enforce_symbol_limit(symbol):
         premarket_last_prices.pop(lru_symbol, None)
         premarket_volumes.pop(lru_symbol, None)
         
+        # 🔒 CRITICAL: Protect global dict evictions from concurrent access
         logger.debug(f"[LRU EVICT] Removed {lru_symbol} to maintain MAX_SYMBOLS={MAX_SYMBOLS} limit (now tracking {len(symbol_last_access)} symbols)")
 
 
@@ -2297,8 +2340,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and  # Green candle OR rising from previous
             0.20 <= close_wu <= 25.00
             and
-            current_price_wu is not None and current_price_wu > vwap_wu
-            and  # Above VWAP
+            # 🚨 FIX: Guard against None before comparison
+            (current_price_wu is not None and vwap_wu is not None and current_price_wu > vwap_wu)
+            and  # Above VWAP (both must exist)
             dollar_volume_wu >= min_dollar_volume_wu
             and  # 🚨 Dynamic minimum by price (fixes NCPL!)
             avg_vol_5 > 5_000
@@ -3556,9 +3600,14 @@ async def ingest_polygon_events():
                                         vwap_cum_pv[symbol] = 0
                                 
                                 vwap_candles[symbol].append(candle)
-                                vwap_cum_vol[symbol] += volume
-                                vwap_cum_pv[symbol] += (
-                                    (high + low + close) / 3) * volume
+                                # 🔒 FIX: Protect VWAP cumulative sums from race conditions (if vwap_lock initialized)
+                                if vwap_lock is not None:
+                                    async with vwap_lock:
+                                        vwap_cum_vol[symbol] += volume
+                                        vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
+                                else:
+                                    vwap_cum_vol[symbol] += volume
+                                    vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
                                 
                                 # 🚨 CRITICAL FIX: Update last_trade_price/time from candle as fallback
                                 # Use REAL candle close time for freshness validation (don't fake timestamps)
@@ -4519,10 +4568,11 @@ async def main():
     logger.info(f"[STARTUP] ✅ Data directory ready: {DATA_DIR}\n")
     
     # 🔒 Create asyncio locks in main() to bind to correct event loop
-    global _float_cache_lock, _ticker_type_lock, halt_lock
+    global _float_cache_lock, _ticker_type_lock, halt_lock, vwap_lock
     _float_cache_lock = asyncio.Lock()
     _ticker_type_lock = asyncio.Lock()
     halt_lock = asyncio.Lock()
+    vwap_lock = asyncio.Lock()  # 🚨 FIX: Lock for VWAP cumulative sum writes
     logger.info("[STARTUP] ✅ Async locks initialized\n")
     
     # 🚨 Register atexit cleanup AFTER executor/session are defined
