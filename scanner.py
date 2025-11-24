@@ -1756,6 +1756,16 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     # Track VWAP position for logging (optional - not required for alert)
     current_price_spike = last_trade_price.get(symbol)
     above_vwap = (current_price_spike is not None and vwap_value is not None and current_price_spike > vwap_value)
+    
+    # 🚨 FRESHNESS CHECK: Verify real-time price is fresh before proceeding with spike logic
+    current_trade_time_spike = last_trade_time.get(symbol)
+    if current_trade_time_spike is not None and current_price_spike is not None:
+        now_spike_check = datetime.now(timezone.utc)
+        spike_price_age = (now_spike_check - current_trade_time_spike).total_seconds()
+        if spike_price_age > MAX_PRICE_AGE_SECONDS:
+            # Price is stale - don't use it for volume spike detection
+            current_price_spike = None
+            above_vwap = False
 
     # 🚨 ADAPTIVE volume threshold - catches ULY-type micro-float spikes (8-18k shares/min)
     min_volume = get_min_volume_for_float(float_shares)  # 7.5k for micro-floats, 25k for regular
@@ -1866,7 +1876,7 @@ def get_ny_date():
 
 
 # 🚀 FRESHNESS THRESHOLDS: Consolidated timestamp validation constants
-MAX_PRICE_AGE_SECONDS = 30  # RELAXED: Catch big movers even with data delays (was 5s, too strict)
+MAX_PRICE_AGE_SECONDS = 5  # STRICT: Alert only on fresh trades within 5 seconds (prevents stale price alerts like ATON $4.41 when price was $3.43)
 MAX_TRADE_AGE_SECONDS = 15  # Tolerates network jitter/lag - prevents missing alerts due to delayed trades
 
 
@@ -2086,6 +2096,15 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
 
     # ---- PATCH: enforce ratio at alert time! ----
     if perfect:
+        # 🚨 FRESHNESS CHECK: Verify real-time price is fresh before alerting
+        real_time_price_perfect = last_trade_price.get(symbol)
+        real_time_time_perfect = last_trade_time.get(symbol)
+        if real_time_price_perfect is not None and real_time_time_perfect is not None:
+            now_check_perfect = datetime.now(timezone.utc)
+            price_age_perfect = (now_check_perfect - real_time_time_perfect).total_seconds()
+            if price_age_perfect > MAX_PRICE_AGE_SECONDS:
+                logger.info(f"[PERFECT SETUP BLOCKED] {symbol} - Real-time price is stale ({price_age_perfect:.1f}s old, limit: {MAX_PRICE_AGE_SECONDS}s)")
+                return
         if ema13 <= 0 or ema5 / ema13 < 1.011:  # 🚨 FIX: Guard against division by zero and invalid ratio
             logger.error(
                 f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13 if ema13 > 0 else 'inf':.4f} (should be >= 1.011)"
