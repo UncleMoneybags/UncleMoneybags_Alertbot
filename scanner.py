@@ -1604,6 +1604,7 @@ halt_last_alert_time = {}  # Track last halt alert time per symbol to prevent sp
 halt_resume_alert_time = {}  # Track last resume alert time per symbol to prevent duplicates
 halted_stocks = {}  # Track actively halted stocks {symbol: {'time': halt_time, 'price': price, 'halt_key': key}}
 halt_lock = None  # Concurrency lock - created in main() to avoid event loop binding issues
+vwap_lock = None  # VWAP cumulative sum protection - created in main()
 
 ALERT_COOLDOWN_MINUTES = 1  # 🚨 REDUCED to 1 minute - catch rapid momentum shifts
 # 🚨 NEW: Track last alert time PER ALERT TYPE (not just per symbol)
@@ -3405,9 +3406,8 @@ async def ingest_polygon_events():
                                             vwap_session_date[symbol] = session_date
                                             # 🔒 CRITICAL: Protect vwap_reset_done with lock
                                             if vwap_lock is not None:
-                                                await vwap_lock.acquire()
-                                                vwap_reset_done[symbol] = False
-                                                vwap_lock.release()
+                                                async with vwap_lock:
+                                                    vwap_reset_done[symbol] = False
                                             else:
                                                 vwap_reset_done[symbol] = False
                                         
