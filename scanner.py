@@ -417,19 +417,20 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
     # Block: ETF, ETN (Exchange-Traded Note), WARRANT, FUND, UNIT, SP (Structured Product)
     ticker_type = ticker_type_cache.get(symbol)
     
-    # 🚨 CRITICAL FIX: FAIL-CLOSED for unknown ticker types (prevents ETF race condition)
-    # If ticker type is unknown (None), BLOCK symbol until verified by Polygon API
-    # This prevents new ETFs from alerting on first candle before cache populates
+    # 🚨 CRITICAL FIX: FAIL-OPEN for unknown ticker types (allow real stocks, background verification catches ETFs)
+    # If ticker type is unknown (None), ALLOW symbol through - Polygon API will verify on next cycle
+    # This prevents legitimate stocks like AEHL from being silenced during 1-2 min API verification window
+    # Risk: New ETFs may alert for 1-2 candles before verification completes (acceptable tradeoff vs missing real runners)
     if ticker_type is None:
         filter_counts["ticker_type_unknown"] = filter_counts.get("ticker_type_unknown", 0) + 1
         if filter_counts["ticker_type_unknown"] % 100 == 1:
-            logger.info(
-                f"[FILTER DEBUG] {symbol} filtered: Ticker type unknown, blocking until verified by Polygon API (count: {filter_counts['ticker_type_unknown']})"
+            logger.debug(
+                f"[FILTER DEBUG] {symbol} - Ticker type unknown, allowing through for alert processing (Polygon verification in progress) (count: {filter_counts['ticker_type_unknown']})"
             )
-        return False  # Block unknown symbols (will be verified on next candle after API completes)
+        # ALLOW symbol through - Polygon will verify on next cycle and block if ETF
     
     # Ticker type is known - check if it's a blocked type
-    if ticker_type in ['ETF', 'ETN', 'WARRANT', 'FUND', 'UNIT', 'SP']:
+    elif ticker_type in ['ETF', 'ETN', 'WARRANT', 'FUND', 'UNIT', 'SP']:
         filter_counts["polygon_etf"] = filter_counts.get("polygon_etf", 0) + 1
         if filter_counts["polygon_etf"] % 50 == 1:
             logger.info(
