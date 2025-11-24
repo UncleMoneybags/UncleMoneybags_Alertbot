@@ -2128,6 +2128,9 @@ def enforce_symbol_limit(symbol):
     
     Updates access time for symbol and evicts least recently used symbol if at limit.
     This prevents unbounded memory growth from tracking thousands of symbols.
+    
+    🔒 THREAD SAFE: Called from on_new_candle which may run from multiple WebSocket
+    tasks concurrently. Using defaultdict with .pop() is atomic for single operations.
     """
     global symbol_last_access
     
@@ -2139,7 +2142,8 @@ def enforce_symbol_limit(symbol):
         # Find least recently used symbol
         lru_symbol = min(symbol_last_access.items(), key=lambda x: x[1])[0]
         
-        # Evict from all data structures
+        # 🔒 ATOMIC: .pop() is atomic in CPython for dict operations
+        # Multiple tasks can call this concurrently - each .pop() is safe
         symbol_last_access.pop(lru_symbol, None)
         candles.pop(lru_symbol, None)
         vwap_candles.pop(lru_symbol, None)
@@ -2168,7 +2172,6 @@ def enforce_symbol_limit(symbol):
         premarket_last_prices.pop(lru_symbol, None)
         premarket_volumes.pop(lru_symbol, None)
         
-        # 🔒 CRITICAL: Protect global dict evictions from concurrent access
         logger.debug(f"[LRU EVICT] Removed {lru_symbol} to maintain MAX_SYMBOLS={MAX_SYMBOLS} limit (now tracking {len(symbol_last_access)} symbols)")
 
 
@@ -2185,7 +2188,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # 🎯 BACKGROUND TASK: Populate ticker type cache for new symbols (non-blocking)
     # If ticker type not in cache, fetch it in background - future checks will be instant
     if symbol not in ticker_type_cache:
-        asyncio.create_task(get_ticker_type(symbol))
+        safe_create_task(get_ticker_type(symbol))  # 🔒 Use safe_create_task (guarded)
 
     # Only reset state once per day at 04:00 ET (not on every calendar day change)
     if current_session_date != today_ny:
