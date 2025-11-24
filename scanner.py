@@ -1740,7 +1740,7 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
         except:
             return False, {}
     
-    if len(candles_list) < 5:  # Need 5 candles (3 trailing + 2 consecutive green)
+    if len(candles_list) < 4:  # Need 4 candles minimum (2 trailing + 2 for spike detection)
         return False, {}
     
     # 🚨 SAFETY GATE: Block sub-$0.10 penny stocks
@@ -1753,10 +1753,14 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     curr_volume = curr_candle['volume']
     symbol = curr_candle.get('symbol', '?')
 
-    # ADAPTIVE: Use 3 trailing candles for RVOL baseline (before the move)
-    trailing_volumes = [c['volume'] for c in candles_list[-5:-2]]
-    trailing_avg = sum(trailing_volumes) / 3 if len(
-        trailing_volumes) == 3 else 1
+    # ADAPTIVE: Use trailing candles for RVOL baseline (before the move)
+    # With 4 candles: use 2 trailing, with 5+ candles: use 3 trailing
+    if len(candles_list) >= 5:
+        trailing_volumes = [c['volume'] for c in candles_list[-5:-2]]  # 3 trailing candles
+    else:  # len == 4
+        trailing_volumes = [c['volume'] for c in candles_list[-4:-2]]  # 2 trailing candles
+    
+    trailing_avg = sum(trailing_volumes) / len(trailing_volumes) if trailing_volumes else 1
     rvol = curr_volume / trailing_avg if trailing_avg > 0 else 0
     
     # Track VWAP position for logging (optional - not required for alert)
