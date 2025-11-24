@@ -32,34 +32,27 @@ except ImportError:
 
 # 🚀 SAFETY NET: Register cleanup handler for unexpected exits
 def cleanup_resources():
-    """Emergency cleanup handler for unexpected shutdowns
+    """Emergency cleanup handler for unexpected shutdowns - SYNCHRONOUS SAFE
     
     Ensures both HTTP session and ThreadPoolExecutor are properly closed
-    even if normal shutdown path is bypassed.
+    even if normal shutdown path is bypassed. Uses synchronous-only operations
+    to work reliably in atexit (no event loop guaranteed).
     """
-    # Use globals().get() to safely handle cleanup even if vars not yet defined
     http_session = globals().get("http_session")
     io_executor = globals().get("io_executor")
     
     try:
-        # Close HTTP session to prevent connection leaks
-        if http_session and not http_session.closed:
-            import asyncio
+        # SYNC-ONLY: Close HTTP session connector directly (no async/await)
+        if http_session:
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(http_session.close())
-                else:
-                    loop.run_until_complete(http_session.close())
-                logger.info("[ATEXIT] Closed HTTP session")
-            except:
-                # If async close fails, at least attempt sync cleanup
-                try:
+                # Close connector to release sockets synchronously
+                if hasattr(http_session, "connector") and http_session.connector:
                     http_session.connector.close()
-                except:
-                    pass
+                logger.info("[ATEXIT] Closed HTTP session connector (sync)")
+            except Exception as e:
+                logger.debug(f"[ATEXIT] HTTP connector close attempt: {e}")
         
-        # Shutdown executor with wait=True to ensure in-flight writes complete
+        # Shutdown executor with wait=True (executor.shutdown is synchronous and safe)
         if io_executor:
             io_executor.shutdown(wait=True)
             logger.info("[ATEXIT] Executor shutdown complete (waited for in-flight tasks)")
@@ -72,6 +65,17 @@ MARKET_OPEN = dt_time(4, 0)
 MARKET_CLOSE = dt_time(20, 0)
 eastern = pytz.timezone("America/New_York")
 logger = logging.getLogger(__name__)
+
+# 🔒 HELPER: Safe task scheduling that checks for running event loop
+def safe_create_task(coro):
+    """Schedule task only if event loop exists. Prevents crashes on startup."""
+    try:
+        loop = asyncio.get_running_loop()
+        return loop.create_task(coro)
+    except RuntimeError:
+        # No running loop - can't schedule. Log and skip (common on early imports).
+        logger.debug(f"[SAFE_TASK] No running loop to schedule task")
+        return None
 
 # 🚀 PERFORMANCE: Reusable HTTP session (30-50% faster than creating new sessions)
 http_session = None
@@ -212,7 +216,7 @@ async def get_float_shares(ticker):
                     float_cache_none_retry[ticker] = now
             else:
                 float_cache_none_retry[ticker] = now
-            asyncio.create_task(save_float_cache())  # Non-blocking save
+            safe_create_task(save_float_cache())  # Non-blocking save (guarded)
             if error and "Rate limited" in str(error):
                 await asyncio.sleep(5)  # Backoff for rate limits
             return float_cache.get(ticker, None)
@@ -229,7 +233,7 @@ async def get_float_shares(ticker):
                     float_cache[ticker] = float_shares
                     if ticker in float_cache_none_retry:
                         del float_cache_none_retry[ticker]
-                asyncio.create_task(save_float_cache())  # Non-blocking save
+                safe_create_task(save_float_cache())  # Non-blocking save (guarded)
             else:
                 # 🔒 FIX: Protect cache write with lock
                 if _float_cache_lock is not None:
@@ -237,7 +241,7 @@ async def get_float_shares(ticker):
                         float_cache_none_retry[ticker] = now
                 else:
                     float_cache_none_retry[ticker] = now
-                asyncio.create_task(save_float_cache())  # Non-blocking save
+                safe_create_task(save_float_cache())  # Non-blocking save (guarded)
             # Removed unnecessary 0.5s sleep - slows down float lookups
             return float_shares
     except Exception as e:
@@ -247,7 +251,7 @@ async def get_float_shares(ticker):
                 float_cache_none_retry[ticker] = now
         else:
             float_cache_none_retry[ticker] = now
-        asyncio.create_task(save_float_cache())  # Non-blocking save
+        safe_create_task(save_float_cache())  # Non-blocking save (guarded)
         return float_cache.get(ticker, None)
 
 
@@ -318,7 +322,7 @@ async def get_ticker_type(symbol):
                                 ticker_type_cache[symbol] = ticker_type
                         else:
                             ticker_type_cache[symbol] = ticker_type
-                        asyncio.create_task(save_ticker_type_cache())  # Non-blocking save
+                        safe_create_task(save_ticker_type_cache())  # Non-blocking save (guarded)
                         logger.debug(f"[TICKER TYPE] {symbol} = {ticker_type}")
                         return ticker_type
                 elif response.status == 429:  # Rate limit
@@ -3558,31 +3562,30 @@ async def ingest_polygon_events():
                                     vwap_reset_done[symbol] = False  # Reset flag for new trading day
                                 
                                 # 🚨 CRITICAL FIX: Reset VWAP at 9:30 AM to match TradingView (regular session only)
-                                eastern = pytz.timezone("America/New_York")
+                                # 🔒 LOCK: Protect from concurrent reset by multiple candles arriving simultaneously
                                 candle_time_et = start_time.astimezone(eastern)
                                 candle_time = candle_time_et.time()
                                 market_open_time = dt_time(9, 30)
                                 
                                 # Reset VWAP on FIRST candle at or after 9:30 AM (once per trading day)
                                 # This ensures VWAP only includes regular session data (9:30am-4pm), matching TradingView
-                                if candle_time >= market_open_time:
-                                    # Check if we need to reset (first regular session candle of the day)
-                                    # 🚨 FIX: ALWAYS reset if not done (even if deque empty from local builder path)
-                                    if not vwap_reset_done.get(symbol, False):
-                                        logger.warning(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing ALL pre-market data (WebSocket)")
-                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # Clear ALL pre-market candles
-                                        vwap_cum_vol[symbol] = 0  # Reset cumulative sums
-                                        vwap_cum_pv[symbol] = 0
-                                        vwap_reset_done[symbol] = True  # Mark as reset for today
-                                        logger.info(f"[VWAP RESET] {symbol} - Starting fresh VWAP from 9:30 AM (excludes pre-market)")
-                                        
-                                        # 🚨 CRITICAL FIX: Also reset EMAs at 9:30 AM to clear pre-market contamination
-                                        # Pre-market EMAs are dirty (mix of after-hours + pre-market data)
-                                        # Reset them so backfill triggers and gets CLEAN regular session data
-                                        logger.warning(f"[EMA RESET] {symbol} - Clearing pre-market EMAs at 9:30 AM for fresh regular session values")
-                                        for period in [5, 8, 13, 200]:
-                                            stored_emas[symbol][period] = RunningEMA(period)  # Reset to uninitialized
-                                        logger.info(f"[EMA RESET] {symbol} - EMAs cleared, backfill will trigger on next candle for clean data")
+                                if candle_time >= market_open_time and not vwap_reset_done.get(symbol, False):
+                                    # 🔒 Acquire lock before checking/updating reset flag to prevent concurrent resets
+                                    async with vwap_lock:
+                                        # Double-check after acquiring lock (another task may have reset already)
+                                        if not vwap_reset_done.get(symbol, False):
+                                            logger.warning(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing ALL pre-market data")
+                                            vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
+                                            vwap_cum_vol[symbol] = 0
+                                            vwap_cum_pv[symbol] = 0
+                                            vwap_reset_done[symbol] = True
+                                            logger.info(f"[VWAP RESET] {symbol} - Fresh VWAP from 9:30 AM (excludes pre-market)")
+                                            
+                                            # 🔒 Reset EMAs under same lock to prevent contamination
+                                            logger.warning(f"[EMA RESET] {symbol} - Clearing pre-market EMAs at 9:30 AM")
+                                            for period in [5, 8, 13, 200]:
+                                                stored_emas[symbol][period] = RunningEMA(period)
+                                            logger.info(f"[EMA RESET] {symbol} - EMAs cleared, backfill will trigger on next candle")
                                 
                                 # 🚨 CORPORATE ACTION DETECTION: Reset VWAP on splits/reverse splits
                                 if len(vwap_candles[symbol]) > 0:
