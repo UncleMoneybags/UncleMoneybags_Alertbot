@@ -1782,13 +1782,25 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     prev_momentum = (curr_candle['close'] - prev_candle['close']
                      ) / prev_candle['close'] if prev_candle['close'] > 0 else 0
     
-    # 🚀 SUSTAINED MOMENTUM: Require 2 consecutive green candles
+    # 🚀 SUSTAINED MOMENTUM: Require 2 consecutive green candles (or allow single-candle at market open with extreme volume)
     # This prevents alerting on single-candle spikes that fail immediately (MAMK issue)
+    # BUT: Allow single-candle spikes during first 5 minutes of market open with extreme volume (catches FTRK runners)
     prev_green = prev_candle['close'] > prev_candle['open']
     curr_green = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005
     
-    # Require BOTH current AND previous candle to be green (2 consecutive)
-    sustained_momentum = curr_green and prev_green
+    # Check if we're in early market hours (extended window for runners that spike throughout morning/afternoon)
+    ny_tz = pytz.timezone("America/New_York")
+    curr_time_ny = datetime.now(timezone.utc).astimezone(ny_tz).time()
+    is_early_regular = (curr_time_ny >= dt_time(9, 30) and curr_time_ny < dt_time(14, 30))  # 9:30 AM - 2:30 PM (catches FTRK-style runners all morning/early afternoon)
+    is_early_premarket = (curr_time_ny >= dt_time(4, 0) and curr_time_ny < dt_time(9, 30))  # 4:00 AM - 9:30 AM (full premarket)
+    is_early_open = is_early_regular or is_early_premarket
+    
+    # Early session (morning/early afternoon): Allow single green candle + extreme volume (RVOL 3x+) to catch runners like FTRK
+    # After 2:30 PM: Require 2 consecutive green candles to prevent false late-afternoon/EOD alerts
+    if is_early_open and rvol >= 3.0:
+        sustained_momentum = curr_green  # Single candle OK if extreme volume during early session
+    else:
+        sustained_momentum = curr_green and prev_green  # Standard: 2 consecutive green (late afternoon)
     
     # Price must still be rising overall
     is_green_candle = curr_candle['close'] > curr_candle['open'] and price_momentum >= 0.005  # 0.5%+ for early detection
