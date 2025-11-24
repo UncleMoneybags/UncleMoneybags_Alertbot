@@ -1026,22 +1026,54 @@ def bollinger_bands(prices, period=20, num_std=2):
     return lower_band, sma, upper_band
 
 
+# 🚨 CRITICAL FIX: Deduplicate candles to prevent double-counting in VWAP
+def append_or_replace_candle(dq, new_candle):
+    """Append new_candle or replace last if same start_time (dedup).
+    
+    When both local builder + Polygon AM produce candle for same minute,
+    we must dedupe to prevent double-counted VWAP cumulative sums.
+    
+    Returns: (True, old_candle) if replaced, (True, None) if appended, (False, None) if no-op
+    """
+    if dq and dq[-1]['start_time'] == new_candle['start_time']:
+        # Same minute - replace (prefer AM aggregate as authoritative)
+        old = dq[-1]
+        dq[-1] = new_candle
+        logger.debug(f"[DEDUP] Replaced candle at {new_candle['start_time']}")
+        return (True, old)
+    else:
+        # New minute - append
+        dq.append(new_candle)
+        return (True, None)
+
+
 def polygon_time_to_utc(ts):
-    """🚨 ROBUST: Auto-detect timestamp scale (seconds, milliseconds, or nanoseconds)"""
+    """🚨 CRITICAL FIX: Auto-detect timestamp scale with CORRECT thresholds
+    
+    Real 2024-2025 timestamps:
+    - seconds ~ 1e9 (10 digits)
+    - milliseconds ~ 1e12 (13 digits)  
+    - microseconds ~ 1e15 (16 digits)
+    - nanoseconds ~ 1e18 (19 digits)
+    
+    Wrong thresholds caused candle boundaries off, VWAP miscalculations, stale timestamps.
+    """
     try:
         ts = int(ts) if not isinstance(ts, int) else ts
     except:
         raise ValueError(f"Invalid timestamp: {ts}")
     
-    # Auto-detect scale based on magnitude
-    if ts > 1e14:  # 16+ digits = nanoseconds
-        return datetime.utcfromtimestamp(ts / 1_000_000_000).replace(tzinfo=timezone.utc)
-    elif ts > 1e11:  # 13 digits = milliseconds
-        return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
-    elif ts > 1e9:  # 10 digits = seconds
-        return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc)
+    # Auto-detect scale based on magnitude (correct thresholds)
+    if ts >= 1e18:  # 🚨 FIXED: 19+ digits = nanoseconds (was >1e14)
+        return datetime.fromtimestamp(ts / 1_000_000_000, tz=timezone.utc)
+    elif ts >= 1e15:  # 16+ digits = microseconds (was >1e14)
+        return datetime.fromtimestamp(ts / 1_000_000, tz=timezone.utc)
+    elif ts >= 1e12:  # 13 digits = milliseconds (was >1e11)
+        return datetime.fromtimestamp(ts / 1_000, tz=timezone.utc)
+    elif ts >= 1e9:  # 10 digits = seconds (was >1e9)
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
     else:  # Fallback to milliseconds for anything smaller
-        return datetime.utcfromtimestamp(ts / 1000).replace(tzinfo=timezone.utc)
+        return datetime.fromtimestamp(ts / 1_000, tz=timezone.utc)
 
 
 logging.basicConfig(level=logging.INFO,
@@ -3301,9 +3333,9 @@ async def ingest_polygon_events():
                                     logger.debug(f"[TRADE SKIP] {symbol} - Missing timestamp, cannot validate freshness")
                                     continue
 
-                                # 🚨 FIX: Calculate trade_time FIRST (needed for local candle builder)
-                                # Polygon timestamps are in nanoseconds, divide by 1,000,000,000 to get seconds
-                                trade_time = datetime.fromtimestamp(trade_timestamp / 1_000_000_000, tz=timezone.utc)
+                                # 🚨 FIX: Use polygon_time_to_utc for ROBUST timestamp conversion
+                                # Handles auto-detection of seconds/ms/us/ns scales
+                                trade_time = polygon_time_to_utc(trade_timestamp)
                                 now_utc = datetime.now(timezone.utc)
                                 trade_age_seconds = (now_utc - trade_time).total_seconds()
                                 
@@ -3362,7 +3394,8 @@ async def ingest_polygon_events():
                                         if not isinstance(vwap_candles[symbol], deque):
                                             vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
                                         
-                                        candles[symbol].append(local_candle)
+                                        # 🚨 DEDUP: Use append_or_replace to prevent double-counting
+                                        append_or_replace_candle(candles[symbol], local_candle)
                                         session_date = get_session_date(local_candle['start_time'])
                                         last_session = vwap_session_date[symbol]
                                         if last_session != session_date:
@@ -3370,7 +3403,13 @@ async def ingest_polygon_events():
                                             vwap_cum_vol[symbol] = 0  # 🚨 FIX: Reset cumulative sums for new session
                                             vwap_cum_pv[symbol] = 0
                                             vwap_session_date[symbol] = session_date
-                                            vwap_reset_done[symbol] = False  # Reset flag for new trading day
+                                            # 🔒 CRITICAL: Protect vwap_reset_done with lock
+                                            if vwap_lock is not None:
+                                                await vwap_lock.acquire()
+                                                vwap_reset_done[symbol] = False
+                                                vwap_lock.release()
+                                            else:
+                                                vwap_reset_done[symbol] = False
                                         
                                         # 🚨 CRITICAL FIX: Reset VWAP at 9:30 AM to match TradingView (regular session only)
                                         eastern = pytz.timezone("America/New_York")
@@ -3380,18 +3419,31 @@ async def ingest_polygon_events():
                                         
                                         # Reset VWAP on FIRST candle at or after 9:30 AM
                                         if candle_time >= market_open_time:
-                                            if not vwap_reset_done[symbol]:
-                                                logger.warning(f"[VWAP RESET] {symbol} - Market open at 9:30 AM, clearing ALL pre-market data (local candle)")
-                                                vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)  # Clear ALL pre-market candles
-                                                vwap_cum_vol[symbol] = 0
-                                                vwap_cum_pv[symbol] = 0
-                                                vwap_reset_done[symbol] = True
-                                                logger.info(f"[VWAP RESET] {symbol} - Starting fresh VWAP from 9:30 AM (excludes pre-market)")
+                                            # 🔒 Check & set under lock to prevent concurrent resets
+                                            if vwap_lock is not None:
+                                                async with vwap_lock:
+                                                    if not vwap_reset_done.get(symbol, False):
+                                                        logger.warning(f"[VWAP RESET] {symbol} - Market open at 9:30 AM (local candle)")
+                                                        vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
+                                                        vwap_cum_vol[symbol] = 0
+                                                        vwap_cum_pv[symbol] = 0
+                                                        vwap_reset_done[symbol] = True
+                                            else:
+                                                if not vwap_reset_done.get(symbol, False):
+                                                    vwap_candles[symbol] = deque(maxlen=CANDLE_MAXLEN)
+                                                    vwap_cum_vol[symbol] = 0
+                                                    vwap_cum_pv[symbol] = 0
+                                                    vwap_reset_done[symbol] = True
                                         elif candle_time < market_open_time:
                                             # Pre-market candle - mark reset as NOT done yet
-                                            vwap_reset_done[symbol] = False
+                                            if vwap_lock is not None:
+                                                async with vwap_lock:
+                                                    vwap_reset_done[symbol] = False
+                                            else:
+                                                vwap_reset_done[symbol] = False
                                         
-                                        vwap_candles[symbol].append(local_candle)
+                                        # 🚨 DEDUP: Use helper to prevent double-counting from AM aggregates
+                                        append_or_replace_candle(vwap_candles[symbol], local_candle)
                                         
                                         # Trigger alert processing (on_new_candle does its own eligibility filtering)
                                         await on_new_candle(
@@ -3553,7 +3605,8 @@ async def ingest_polygon_events():
                                 if not isinstance(vwap_candles[symbol], deque):
                                     vwap_candles[symbol] = deque(
                                         vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
-                                candles[symbol].append(candle)
+                                # 🚨 DEDUP: Use append_or_replace to prevent double-counting
+                                append_or_replace_candle(candles[symbol], candle)
                                 session_date = get_session_date(
                                     candle['start_time'])
                                 last_session = vwap_session_date[symbol]
@@ -3566,6 +3619,7 @@ async def ingest_polygon_events():
                                 
                                 # 🚨 CRITICAL FIX: Reset VWAP at 9:30 AM to match TradingView (regular session only)
                                 # 🔒 LOCK: Protect from concurrent reset by multiple candles arriving simultaneously
+                                eastern = pytz.timezone("America/New_York")  # Define locally for clarity
                                 candle_time_et = start_time.astimezone(eastern)
                                 candle_time = candle_time_et.time()
                                 market_open_time = dt_time(9, 30)
@@ -3573,7 +3627,7 @@ async def ingest_polygon_events():
                                 # Reset VWAP on FIRST candle at or after 9:30 AM (once per trading day)
                                 # This ensures VWAP only includes regular session data (9:30am-4pm), matching TradingView
                                 if candle_time >= market_open_time and not vwap_reset_done.get(symbol, False):
-                                    # 🔒 Acquire lock before checking/updating reset flag to prevent concurrent resets
+                                    # 🔒 Acquire vwap_lock (not halt_lock!) before checking/updating reset flag
                                     async with vwap_lock:
                                         # Double-check after acquiring lock (another task may have reset already)
                                         if not vwap_reset_done.get(symbol, False):
@@ -3605,13 +3659,26 @@ async def ingest_polygon_events():
                                         vwap_cum_vol[symbol] = 0  # 🚨 FIX: Reset cumulative sums for corporate action
                                         vwap_cum_pv[symbol] = 0
                                 
-                                vwap_candles[symbol].append(candle)
-                                # 🔒 FIX: Protect VWAP cumulative sums from race conditions (if vwap_lock initialized)
+                                # 🚨 DEDUP: Check if this is a duplicate from local builder
+                                replaced, old_candle = append_or_replace_candle(vwap_candles[symbol], candle)
+                                
+                                # 🔒 FIX: Protect VWAP cumulative sums from race conditions
+                                # If replaced, adjust sums: subtract old, add new
                                 if vwap_lock is not None:
                                     async with vwap_lock:
+                                        if old_candle is not None:
+                                            # Replaced: subtract old contribution, add new
+                                            old_tp = (old_candle['high'] + old_candle['low'] + old_candle['close']) / 3
+                                            vwap_cum_vol[symbol] -= old_candle['volume']
+                                            vwap_cum_pv[symbol] -= old_tp * old_candle['volume']
+                                        # Add new candle
                                         vwap_cum_vol[symbol] += volume
                                         vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
                                 else:
+                                    if old_candle is not None:
+                                        old_tp = (old_candle['high'] + old_candle['low'] + old_candle['close']) / 3
+                                        vwap_cum_vol[symbol] -= old_candle['volume']
+                                        vwap_cum_pv[symbol] -= old_tp * old_candle['volume']
                                     vwap_cum_vol[symbol] += volume
                                     vwap_cum_pv[symbol] += ((high + low + close) / 3) * volume
                                 
@@ -3652,16 +3719,9 @@ async def ingest_polygon_events():
                                         logger.debug(f"[LULD SKIP] {symbol} - Indicator {indicators} (not a halt)")
                                         continue
                                     
-                                    # Robust timestamp parsing (Polygon uses nanoseconds for LULD)
+                                    # 🚨 FIX: Use polygon_time_to_utc for CORRECT scale detection
                                     try:
-                                        if timestamp > 1e15:  # Nanoseconds
-                                            halt_time = datetime.fromtimestamp(timestamp / 1_000_000_000, tz=timezone.utc)
-                                        elif timestamp > 1e12:  # Microseconds
-                                            halt_time = datetime.fromtimestamp(timestamp / 1_000_000, tz=timezone.utc)
-                                        elif timestamp > 1e9:  # Milliseconds
-                                            halt_time = datetime.fromtimestamp(timestamp / 1_000, tz=timezone.utc)
-                                        else:  # Seconds
-                                            halt_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                                        halt_time = polygon_time_to_utc(timestamp)
                                     except Exception as e:
                                         logger.error(f"[LULD ERROR] {symbol} - Invalid timestamp {timestamp}: {e}")
                                         continue
