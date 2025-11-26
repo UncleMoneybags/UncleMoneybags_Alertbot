@@ -2636,6 +2636,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             last_alert_time[symbol]['runner'] = now
 
     # VWAP Reclaim Logic - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
+    # 🚨 FIXED: Use skip_vwap_reclaim flag instead of return to NOT block volume spike/other alerts
+    skip_vwap_reclaim = False
     if len(candles_seq) >= 2 and len(vwap_candles[symbol]) >= 3:
         prev_candle = list(candles_seq)[-2]
         curr_candle = list(candles_seq)[-1]
@@ -2647,41 +2649,42 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             logger.debug(
                 f"[VWAP SKIP] {symbol} - Waiting for previous candle to finalize (gap: {time_gap.total_seconds()}s)"
             )
-            return  # Skip - prev candle not finalized yet
+            skip_vwap_reclaim = True  # Skip VWAP reclaim only - NOT other alerts!
         
         # 🚨 FIX: Require CONSECUTIVE candles (gap ≤ 1 minute, allowing small tolerance)
         # Prevents false alerts from non-contiguous candles after data gaps
-        # NOTE: Volume spikes are handled separately and don't reach this code
-        if time_gap > timedelta(seconds=90):
+        if not skip_vwap_reclaim and time_gap > timedelta(seconds=90):
             logger.info(
                 f"[VWAP SKIP] {symbol} - Candles not consecutive ({time_gap.total_seconds()}s gap), blocking non-contiguous crossover"
             )
-            return  # Skip - candles too far apart, not a real-time crossover
+            skip_vwap_reclaim = True  # Skip VWAP reclaim only - NOT other alerts!
         
-        # 🚨 FIX: Require CURRENT candle to be FRESH (within last 90 seconds)
-        # Prevents delayed batch processing from triggering stale alerts
-        curr_candle_age = now - curr_candle['start_time']
-        if curr_candle_age > timedelta(seconds=90):
-            logger.info(
-                f"[VWAP SKIP] {symbol} - Current candle too old ({curr_candle_age.total_seconds()}s ago), blocking delayed alert"
-            )
-            return  # Skip - current candle is stale/delayed
+        # 🚨 FIX: Require CURRENT candle to be FRESH (within last 3 minutes - RELAXED from 90s)
+        # Still prevents delayed batch processing but allows normal candle processing lag
+        if not skip_vwap_reclaim:
+            curr_candle_age = now - curr_candle['start_time']
+            if curr_candle_age > timedelta(minutes=3):
+                logger.info(
+                    f"[VWAP SKIP] {symbol} - Current candle too old ({curr_candle_age.total_seconds()}s ago), blocking delayed VWAP reclaim"
+                )
+                skip_vwap_reclaim = True  # Skip VWAP reclaim only - NOT other alerts!
         
-        # 🚨 FIX: Require previous candle to be RECENT (within last 3 minutes)
+        # 🚨 FIX: Require previous candle to be RECENT (within last 5 minutes)
         # Prevents false alerts from comparing current candle against stale/old candles
-        prev_candle_age = now - prev_candle['start_time']
-        if prev_candle_age > timedelta(minutes=3):
-            logger.info(
-                f"[VWAP SKIP] {symbol} - Previous candle too old ({prev_candle_age.total_seconds()/60:.1f} min ago), blocking stale crossover"
-            )
-            return  # Skip - comparing against stale candle would create false alert
+        if not skip_vwap_reclaim:
+            prev_candle_age = now - prev_candle['start_time']
+            if prev_candle_age > timedelta(minutes=5):
+                logger.info(
+                    f"[VWAP SKIP] {symbol} - Previous candle too old ({prev_candle_age.total_seconds()/60:.1f} min ago), blocking stale crossover"
+                )
+                skip_vwap_reclaim = True  # Skip VWAP reclaim only - NOT other alerts!
         
         # Require sufficient VWAP data (need at least 3 candles BEFORE current)
-        if len(vwap_candles[symbol]) < 4:
+        if not skip_vwap_reclaim and len(vwap_candles[symbol]) < 4:
             logger.info(
                 f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data for reclaim, blocking alert (need 4+, have {len(vwap_candles[symbol])})"
             )
-            return  # Block VWAP reclaim if insufficient data
+            skip_vwap_reclaim = True  # Skip VWAP reclaim only - NOT other alerts!
         
         # 🚨 CRITICAL FIX: Calculate VWAP EXCLUDING current candle to prevent false reclaims
         # Problem: If we use VWAP that includes current candle, a strong current candle can
@@ -2689,132 +2692,137 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # Solution: Compare both candles against VWAP calculated BEFORE current candle
         # 🔒 THREAD-SAFE: Use halt_lock to guard concurrent VWAP cumulative sum access
         
-        # Calculate VWAP baseline excluding current candle
-        if symbol in vwap_cum_vol and symbol in vwap_cum_pv and vwap_cum_vol[symbol] > 0:
-            # 🔒 ATOMIC READ: Protect concurrent access to VWAP cumulative sums (if lock initialized)
-            if halt_lock is not None:
-                async with halt_lock:
+        # Only proceed with VWAP reclaim if not skipped
+        if not skip_vwap_reclaim:
+            # Calculate VWAP baseline excluding current candle
+            vwap_before = None
+            if symbol in vwap_cum_vol and symbol in vwap_cum_pv and vwap_cum_vol[symbol] > 0:
+                # 🔒 ATOMIC READ: Protect concurrent access to VWAP cumulative sums (if lock initialized)
+                if halt_lock is not None:
+                    async with halt_lock:
+                        vol_snapshot = vwap_cum_vol[symbol]
+                        pv_snapshot = vwap_cum_pv[symbol]
+                else:
                     vol_snapshot = vwap_cum_vol[symbol]
                     pv_snapshot = vwap_cum_pv[symbol]
+                
+                # Subtract current candle's contribution to get VWAP before it
+                curr_typical = (curr_candle['high'] + curr_candle['low'] + curr_candle['close']) / 3
+                curr_pv = curr_typical * curr_candle['volume']
+                
+                vwap_vol_before = vol_snapshot - curr_candle['volume']
+                vwap_pv_before = pv_snapshot - curr_pv
+                
+                if vwap_vol_before > 0:
+                    vwap_before = vwap_pv_before / vwap_vol_before
+                else:
+                    logger.info(f"[VWAP PROTECTION] {symbol} - Invalid VWAP baseline (zero volume), skipping VWAP reclaim")
+                    skip_vwap_reclaim = True
             else:
-                vol_snapshot = vwap_cum_vol[symbol]
-                pv_snapshot = vwap_cum_pv[symbol]
+                # Fallback: calculate from candles excluding current
+                vwap_before = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
+                if vwap_before is None:
+                    logger.info(f"[VWAP PROTECTION] {symbol} - Could not calculate VWAP baseline, skipping VWAP reclaim")
+                    skip_vwap_reclaim = True
+        
+        # Only proceed with VWAP reclaim calculation if not skipped
+        if not skip_vwap_reclaim and vwap_before is not None:
+            trailing_vols = [c['volume'] for c in candles_list[:-1]]
+            rvol = 0
+            if trailing_vols:
+                avg_trailing = sum(trailing_vols[-20:]) / min(
+                    len(trailing_vols), 20)
+                rvol = curr_candle[
+                    'volume'] / avg_trailing if avg_trailing > 0 else 0
             
-            # Subtract current candle's contribution to get VWAP before it
-            curr_typical = (curr_candle['high'] + curr_candle['low'] + curr_candle['close']) / 3
-            curr_pv = curr_typical * curr_candle['volume']
+            # 🚨 CRITICAL FIX: VWAP reclaim uses ONLY candle closes for crossover detection
+            # Compare BOTH candles against the SAME VWAP BASELINE (calculated BEFORE current candle)
+            prev_close = prev_candle['close']
+            curr_close = curr_candle['close']
             
-            vwap_vol_before = vol_snapshot - curr_candle['volume']
-            vwap_pv_before = pv_snapshot - curr_pv
+            # True crossover: previous candle closed below VWAP baseline, current candle closes above it
+            prev_below_vwap = (vwap_before is not None and prev_close < vwap_before)
+            curr_above_vwap = (vwap_before is not None and curr_close > vwap_before * 1.005)  # 0.5% buffer
             
-            if vwap_vol_before > 0:
-                vwap_before = vwap_pv_before / vwap_vol_before
-            else:
-                logger.info(f"[VWAP PROTECTION] {symbol} - Invalid VWAP baseline (zero volume), blocking alert")
-                return
-        else:
-            # Fallback: calculate from candles excluding current
-            vwap_before = vwap_candles_numpy(list(vwap_candles[symbol])[:-1])
-            if vwap_before is None:
-                logger.info(f"[VWAP PROTECTION] {symbol} - Could not calculate VWAP baseline, blocking alert")
-                return
-        
-        trailing_vols = [c['volume'] for c in candles_list[:-1]]
-        rvol = 0
-        if trailing_vols:
-            avg_trailing = sum(trailing_vols[-20:]) / min(
-                len(trailing_vols), 20)
-            rvol = curr_candle[
-                'volume'] / avg_trailing if avg_trailing > 0 else 0
-        
-        # 🚨 CRITICAL FIX: VWAP reclaim uses ONLY candle closes for crossover detection
-        # Compare BOTH candles against the SAME VWAP BASELINE (calculated BEFORE current candle)
-        prev_close = prev_candle['close']
-        curr_close = curr_candle['close']
-        
-        # True crossover: previous candle closed below VWAP baseline, current candle closes above it
-        prev_below_vwap = (vwap_before is not None and prev_close < vwap_before)
-        curr_above_vwap = (vwap_before is not None and curr_close > vwap_before * 1.005)  # 0.5% buffer
-        
-        # TRUE CROSSOVER = previous closed below AND current closed above (same baseline, EXCLUDING current!)
-        # Fresh/consecutive candle checks above ensure this is a REAL-TIME crossover, not stale data
-        is_true_crossover = prev_below_vwap and curr_above_vwap
-        
-        # Require UPWARD price movement for VWAP reclaim
-        candle_price_move = (
-            curr_candle['close'] - curr_candle['open']
-        ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
-        
-        # 🚨 VWAP reclaim criteria: TRUE crossover + volume confirmation
-        # 🚨 CRITICAL FIX: Dynamic volume thresholds for penny stocks
-        vwap_reclaim_min_vol = get_min_volume_for_float(float_shares)
-        vwap_reclaim_criteria = (
-            is_true_crossover  # Previous candle closed below, current closed above!
-            and candle_price_move >= 0.03  # Require 3% UPWARD move in the reclaim candle
-            and curr_candle['volume'] >= vwap_reclaim_min_vol  # Dynamic volume - catches penny stocks!
-            and rvol >= 1.5  # RVOL threshold
-        )
-
-        # DEBUG: Show VWAP reclaim detection logic (using VWAP baseline BEFORE current candle)
-        if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
-            logger.info(
-                f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < vwap_before={vwap_before:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > vwap_before={vwap_before:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
+            # TRUE CROSSOVER = previous closed below AND current closed above (same baseline, EXCLUDING current!)
+            # Fresh/consecutive candle checks above ensure this is a REAL-TIME crossover, not stale data
+            is_true_crossover = prev_below_vwap and curr_above_vwap
+            
+            # Require UPWARD price movement for VWAP reclaim
+            candle_price_move = (
+                curr_candle['close'] - curr_candle['open']
+            ) / curr_candle['open'] if curr_candle['open'] > 0 else 0
+            
+            # 🚨 VWAP reclaim criteria: TRUE crossover + volume confirmation
+            # 🚨 CRITICAL FIX: Dynamic volume thresholds for penny stocks
+            vwap_reclaim_min_vol = get_min_volume_for_float(float_shares)
+            vwap_reclaim_criteria = (
+                is_true_crossover  # Previous candle closed below, current closed above!
+                and candle_price_move >= 0.03  # Require 3% UPWARD move in the reclaim candle
+                and curr_candle['volume'] >= vwap_reclaim_min_vol  # Dynamic volume - catches penny stocks!
+                and rvol >= 1.5  # RVOL threshold
             )
-        logger.info(
-            f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap_before={vwap_before:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap_before={vwap_before:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
-        )
-        # Use stored EMAs
-        emas = get_stored_emas(symbol, [5, 8, 13])
-        logger.info(
-            f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
-        )
-        if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
-            if (now - last_alert_time[symbol]['vwap_reclaim']) < timedelta(
-                    minutes=ALERT_COOLDOWN_MINUTES):
-                return
-            
-            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
-            candle_time_vr = curr_candle['start_time'] + timedelta(minutes=1)
-            alert_price = get_display_price(symbol, curr_candle['close'], candle_time_vr)
-            
-            # 🚨 FIX: Ensure we have a valid price for the alert
-            if alert_price is None:
-                alert_price = curr_candle['close']  # Fallback to candle close
-            
-            # Calculate alert score and add to pending alerts
-            vwap_reclaim_data = {
-                "rvol": rvol,
-                "volume": curr_candle['volume'],
-                "price_move": candle_price_move,
-                "candle_price": curr_candle['close'],
-                "real_time_price": last_trade_price.get(symbol)
-            }
-            score = get_alert_score("vwap_reclaim", symbol, vwap_reclaim_data)
-            
-            price_str = fmt_price(alert_price)
-            vwap_str = fmt_price(vwap_before)  # 🚨 FIX: Use baseline VWAP (before current candle)
-            alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
-                          f"Price: ${price_str} | VWAP: ${vwap_str}")
-            
-            # Add to pending alerts instead of sending immediately
-            pending_alerts[symbol].append({
-                'type': 'vwap_reclaim',
-                'score': score,
-                'message': alert_text
-            })
-            
-            # Send the best alert for this symbol
-            await send_best_alert(symbol)
-            
-            # Log event for tracking
-            log_event(
-                "vwap_reclaim", symbol,
-                alert_price,
-                curr_candle['volume'], event_time, vwap_reclaim_data)
-            
-            vwap_reclaim_was_true[symbol] = True
-            alerted_symbols[symbol] = today
-            last_alert_time[symbol]['vwap_reclaim'] = now
+
+            # DEBUG: Show VWAP reclaim detection logic (using VWAP baseline BEFORE current candle)
+            if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
+                logger.info(
+                    f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < vwap_before={vwap_before:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > vwap_before={vwap_before:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
+                )
+            logger.info(
+                f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap_before={vwap_before:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap_before={vwap_before:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
+            )
+            # Use stored EMAs
+            emas = get_stored_emas(symbol, [5, 8, 13])
+            logger.info(
+                f"[EMA DEBUG] {symbol} | VWAP Reclaim | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
+            )
+            if vwap_reclaim_criteria and not vwap_reclaim_was_true[symbol]:
+                # Check cooldown - only skip VWAP reclaim, not other alerts
+                cooldown_ok = (now - last_alert_time[symbol]['vwap_reclaim']) >= timedelta(minutes=ALERT_COOLDOWN_MINUTES)
+                
+                if cooldown_ok:
+                    # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+                    candle_time_vr = curr_candle['start_time'] + timedelta(minutes=1)
+                    alert_price = get_display_price(symbol, curr_candle['close'], candle_time_vr)
+                    
+                    # 🚨 FIX: Ensure we have a valid price for the alert
+                    if alert_price is None:
+                        alert_price = curr_candle['close']  # Fallback to candle close
+                    
+                    # Calculate alert score and add to pending alerts
+                    vwap_reclaim_data = {
+                        "rvol": rvol,
+                        "volume": curr_candle['volume'],
+                        "price_move": candle_price_move,
+                        "candle_price": curr_candle['close'],
+                        "real_time_price": last_trade_price.get(symbol)
+                    }
+                    score = get_alert_score("vwap_reclaim", symbol, vwap_reclaim_data)
+                    
+                    price_str = fmt_price(alert_price)
+                    vwap_str = fmt_price(vwap_before)  # 🚨 FIX: Use baseline VWAP (before current candle)
+                    alert_text = (f"📈 <b>{escape_html(symbol)}</b> VWAP Reclaim!\n"
+                                  f"Price: ${price_str} | VWAP: ${vwap_str}")
+                    
+                    # Add to pending alerts instead of sending immediately
+                    pending_alerts[symbol].append({
+                        'type': 'vwap_reclaim',
+                        'score': score,
+                        'message': alert_text
+                    })
+                    
+                    # Send the best alert for this symbol
+                    await send_best_alert(symbol)
+                    
+                    # Log event for tracking
+                    log_event(
+                        "vwap_reclaim", symbol,
+                        alert_price,
+                        curr_candle['volume'], event_time, vwap_reclaim_data)
+                    
+                    vwap_reclaim_was_true[symbol] = True
+                    alerted_symbols[symbol] = today
+                    last_alert_time[symbol]['vwap_reclaim'] = now
 
     # Volume Spike Logic - VWAP is optional (momentum/volume filters prevent false alerts)
     # Get VWAP if available (for scoring), but don't block if missing
