@@ -617,6 +617,37 @@ async def perform_connection_backfill():
                             for candle_data in candles:
                                 candle_time = polygon_time_to_utc(
                                     candle_data['t'])
+                                
+                                # 🚨 CRITICAL FIX: ADD CANDLE TO DEQUE BEFORE calling on_new_candle()
+                                # on_new_candle() expects candles to already be in the deque!
+                                # This was causing ZYXI to be stuck at 2 candles forever.
+                                candle = {
+                                    "open": candle_data['o'],
+                                    "high": candle_data['h'],
+                                    "low": candle_data['l'],
+                                    "close": candle_data['c'],
+                                    "volume": candle_data['v'],
+                                    "start_time": candle_time,
+                                }
+                                
+                                # Ensure deques exist with proper maxlen
+                                if not isinstance(candles[symbol], deque):
+                                    candles[symbol] = deque(candles[symbol], maxlen=CANDLE_MAXLEN)
+                                if not isinstance(vwap_candles[symbol], deque):
+                                    vwap_candles[symbol] = deque(vwap_candles[symbol], maxlen=CANDLE_MAXLEN)
+                                
+                                # Add candle to both deques
+                                append_or_replace_candle(candles[symbol], candle)
+                                
+                                # Add to VWAP candles only during regular session (9:30 AM - 4:00 PM ET)
+                                eastern = pytz.timezone("America/New_York")
+                                candle_et = candle_time.astimezone(eastern)
+                                market_open = candle_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                                market_close = candle_et.replace(hour=16, minute=0, second=0, microsecond=0)
+                                
+                                if market_open <= candle_et < market_close:
+                                    append_or_replace_candle(vwap_candles[symbol], candle)
+                                
                                 await on_new_candle(
                                     symbol,
                                     candle_data['o'],  # open
@@ -2367,15 +2398,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         vwap_value = get_valid_vwap(symbol)
         if vwap_value is None:
             logger.info(
-                f"[VWAP GUARD] {symbol} - Blocking perfect setup alert - insufficient VWAP data"
+                f"[VWAP GUARD] {symbol} - Skipping perfect setup - insufficient VWAP data"
             )
-            return  # Block perfect setup alerts without valid VWAP
-        if not ema_stack_was_true[symbol]:
+            # 🚨 FIXED: Don't return! Let other alerts fire (volume spike, etc)
+        elif not ema_stack_was_true[symbol]:
             await alert_perfect_setup(symbol, closes, volumes, highs, lows,
                                       candles_list[-30:], vwap_value)
 
     # --- Warming Up Logic with STRICT MOMENTUM REQUIREMENTS ---
     # GITHUB FIX: Require exactly 6 candles (5 prior + current) for accurate avg_vol_5
+    # 🚨 FIXED: Use skip flag instead of return to NOT block subsequent alerts
+    skip_warming_up = False
     if len(candles_list) >= 6:
         last_6 = candles_list[-6:]
         prev_5 = last_6[:-1]  # The 5 candles before current
@@ -2395,9 +2428,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         vwap_wu = get_valid_vwap(symbol)
         if vwap_wu is None:
             logger.info(
-                f"[VWAP GUARD] {symbol} - Blocking warming up alert - insufficient VWAP data"
+                f"[VWAP GUARD] {symbol} - Skipping warming up - insufficient VWAP data"
             )
-            return  # Block warming up alerts without valid VWAP
+            skip_warming_up = True  # 🚨 FIXED: Don't return! Let other alerts fire
         # GITHUB FIX: Use real-time price for dollar volume (matches VWAP requirement)
         dollar_volume_wu = current_price_wu * volume_wu if current_price_wu else close_wu * volume_wu
         
@@ -2447,77 +2480,85 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             f"[EMA DEBUG] {symbol} | Warming Up | EMA5={emas.get('ema5', 'N/A')}, EMA8={emas.get('ema8', 'N/A')}, EMA13={emas.get('ema13', 'N/A')}"
         )
         # 🚨 FIX: Don't fire Warming Up if Runner already alerted (progression hierarchy)
-        if warming_up_criteria and not warming_up_was_true[symbol] and not runner_was_true[symbol]:
+        if not skip_warming_up and warming_up_criteria and not warming_up_was_true[symbol] and not runner_was_true[symbol]:
+            # Check cooldown - skip warming up but DON'T block other alerts
             if (now - last_alert_time[symbol]['warming_up']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
-                return
+                skip_warming_up = True
             
-            # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
-            real_time_price_wu = last_trade_price.get(symbol)
-            real_time_timestamp_wu = last_trade_time.get(symbol)
+            if not skip_warming_up:
+                # 🚨 REAL-TIME PRICE CONFIRMATION: Require FRESH price above VWAP
+                real_time_price_wu = last_trade_price.get(symbol)
+                real_time_timestamp_wu = last_trade_time.get(symbol)
+                
+                # Check if we have real-time price data (explicit None check to catch $0.00)
+                if real_time_price_wu is None or real_time_timestamp_wu is None:
+                    logger.info(f"[WARMING UP BLOCKED] {symbol} - No real-time price available for confirmation")
+                    skip_warming_up = True
             
-            # Check if we have real-time price data (explicit None check to catch $0.00)
-            if real_time_price_wu is None or real_time_timestamp_wu is None:
-                logger.info(f"[WARMING UP BLOCKED] {symbol} - No real-time price available for confirmation")
-                return
+            if not skip_warming_up:
+                # Recompute NOW to ensure freshness check reflects actual alert moment
+                now_fresh_wu = datetime.now(timezone.utc)
+                
+                # Verify price data is FRESH (≤30 seconds old)
+                price_age_wu = (now_fresh_wu - real_time_timestamp_wu).total_seconds()
+                if price_age_wu > MAX_PRICE_AGE_SECONDS:
+                    logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is stale ({price_age_wu:.1f}s old, limit: {MAX_PRICE_AGE_SECONDS}s)")
+                    skip_warming_up = True
             
-            # Recompute NOW to ensure freshness check reflects actual alert moment
-            now_fresh_wu = datetime.now(timezone.utc)
+            if not skip_warming_up:
+                # Verify real-time price is ACTUALLY above VWAP (not just from criteria check)
+                if real_time_price_wu <= vwap_wu:
+                    logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price ${real_time_price_wu:.2f} NOT above VWAP ${vwap_wu:.2f}")
+                    skip_warming_up = True
             
-            # Verify price data is FRESH (≤30 seconds old)
-            price_age_wu = (now_fresh_wu - real_time_timestamp_wu).total_seconds()
-            if price_age_wu > MAX_PRICE_AGE_SECONDS:
-                logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is stale ({price_age_wu:.1f}s old, limit: {MAX_PRICE_AGE_SECONDS}s)")
-                return
-            
-            # Verify real-time price is ACTUALLY above VWAP (not just from criteria check)
-            if real_time_price_wu <= vwap_wu:
-                logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price ${real_time_price_wu:.2f} NOT above VWAP ${vwap_wu:.2f}")
-                return
-            
-            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
-            candle_time_wu = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
-            alert_price = get_display_price(symbol, close_wu, candle_time_wu)
-            if alert_price is None:
-                alert_price = close_wu  # Fallback to candle close
-            log_event(
-                "warming_up",
-                symbol,
-                alert_price,
-                volume_wu,
-                event_time,
-                {
-                    "price_move": price_move_wu,
-                    "dollar_volume": dollar_volume_wu,
-                    "candle_price": close_wu,
-                    "real_time_price": last_trade_price.get(symbol)
+            # Only send warming up alert if not skipped
+            if not skip_warming_up:
+                # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+                candle_time_wu = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
+                alert_price = get_display_price(symbol, close_wu, candle_time_wu)
+                if alert_price is None:
+                    alert_price = close_wu  # Fallback to candle close
+                log_event(
+                    "warming_up",
+                    symbol,
+                    alert_price,
+                    volume_wu,
+                    event_time,
+                    {
+                        "price_move": price_move_wu,
+                        "dollar_volume": dollar_volume_wu,
+                        "candle_price": close_wu,
+                        "real_time_price": last_trade_price.get(symbol)
+                    })
+                price_str = fmt_price(alert_price)
+                alert_text = (f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
+                              f"Current Price: ${price_str}")
+                # Calculate alert score and add to pending alerts
+                alert_data = {
+                    'rvol': volume_wu / avg_vol_5,
+                    'volume': volume_wu,
+                    'price_move': price_move_wu
+                }
+                score = get_alert_score("warming_up", symbol, alert_data)
+
+                # Add to pending alerts instead of sending immediately
+                pending_alerts[symbol].append({
+                    'type': 'warming_up',
+                    'score': score,
+                    'message': alert_text
                 })
-            price_str = fmt_price(alert_price)
-            alert_text = (f"🌡️ <b>{escape_html(symbol)}</b> Warming Up\n"
-                          f"Current Price: ${price_str}")
-            # Calculate alert score and add to pending alerts
-            alert_data = {
-                'rvol': volume_wu / avg_vol_5,
-                'volume': volume_wu,
-                'price_move': price_move_wu
-            }
-            score = get_alert_score("warming_up", symbol, alert_data)
 
-            # Add to pending alerts instead of sending immediately
-            pending_alerts[symbol].append({
-                'type': 'warming_up',
-                'score': score,
-                'message': alert_text
-            })
+                # Send the best alert for this symbol
+                await send_best_alert(symbol)
 
-            # Send the best alert for this symbol
-            await send_best_alert(symbol)
-
-            warming_up_was_true[symbol] = True
-            alerted_symbols[symbol] = today
-            last_alert_time[symbol]['warming_up'] = now
+                warming_up_was_true[symbol] = True
+                alerted_symbols[symbol] = today
+                last_alert_time[symbol]['warming_up'] = now
 
     # --- Runner Logic with trend check, upper wick filter, real-time price in alert, and debug logging ---
+    # 🚨 FIXED: Use skip flag instead of return to NOT block subsequent alerts
+    skip_runner = False
     if len(candles_list) >= 6:
         last_6 = candles_list[-6:]
         volumes_5 = [c['volume'] for c in last_6[:-1]]
@@ -2531,10 +2572,12 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         # 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
         if not vwap_candles[symbol] or len(vwap_candles[symbol]) < 3:
             logger.info(
-                f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, blocking runner alert"
+                f"[VWAP PROTECTION] {symbol} - Insufficient VWAP data, skipping runner alert"
             )
-            return  # Block all alerts if no VWAP data
-        vwap_rn = vwap_candles_numpy(vwap_candles[symbol])
+            skip_runner = True  # 🚨 FIXED: Don't return! Let volume spike/EMA stack fire
+            vwap_rn = None
+        else:
+            vwap_rn = vwap_candles_numpy(vwap_candles[symbol])
 
         # 🔥 EARLY DETECTION: Check for momentum trend (2 out of 3 rising)
         closes_for_trend = [c['close'] for c in last_6[-3:]]
@@ -2581,59 +2624,62 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             volume_rn >= min_vol_rn  # 🚨 ADAPTIVE minimum (catches ULY 8-18k spikes!)
         )
 
-        if runner_criteria and not runner_was_true[symbol]:
+        if not skip_runner and runner_criteria and not runner_was_true[symbol]:
+            # Check cooldown - skip runner but DON'T block other alerts
             if (now - last_alert_time[symbol]['runner']) < timedelta(
                     minutes=ALERT_COOLDOWN_MINUTES):
-                return
+                skip_runner = True
             
-            # 🚨 STRICT VWAP VALIDATION - Checks ONLY real-time price (no candle fallback)
-            vwap_valid, real_time_price_rn, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_rn, "RUNNER")
-            if not vwap_valid:
-                logger.info(vwap_reason)
-                return
+            if not skip_runner:
+                # 🚨 STRICT VWAP VALIDATION - Checks ONLY real-time price (no candle fallback)
+                vwap_valid, real_time_price_rn, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_rn, "RUNNER")
+                if not vwap_valid:
+                    logger.info(vwap_reason)
+                    skip_runner = True
             
-            # Calculate alert score and add to pending alerts
-            alert_data = {
-                'rvol': volume_rn / avg_vol_5,
-                'volume': volume_rn,
-                'price_move': price_move_rn
-            }
-            score = get_alert_score("runner", symbol, alert_data)
+            if not skip_runner:
+                # Calculate alert score and add to pending alerts
+                alert_data = {
+                    'rvol': volume_rn / avg_vol_5,
+                    'volume': volume_rn,
+                    'price_move': price_move_rn
+                }
+                score = get_alert_score("runner", symbol, alert_data)
 
-            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
-            candle_time_rn = last_6[-1]['start_time'] + timedelta(minutes=1)
-            alert_price = get_display_price(symbol, close_rn, candle_time_rn)
-            if alert_price is None:
-                alert_price = close_rn  # Fallback to candle close
-            log_event(
-                "runner", symbol, alert_price,
-                volume_rn, event_time, {
-                    "price_move": price_move_rn,
-                    "trend_closes": closes_for_trend,
-                    "rising_closes": rising_closes,
-                    "vwap": vwap_rn,
-                    "candle_price": close_rn,
-                    "real_time_price": last_trade_price.get(symbol),
-                    "alert_score": score
+                # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+                candle_time_rn = last_6[-1]['start_time'] + timedelta(minutes=1)
+                alert_price = get_display_price(symbol, close_rn, candle_time_rn)
+                if alert_price is None:
+                    alert_price = close_rn  # Fallback to candle close
+                log_event(
+                    "runner", symbol, alert_price,
+                    volume_rn, event_time, {
+                        "price_move": price_move_rn,
+                        "trend_closes": closes_for_trend,
+                        "rising_closes": rising_closes,
+                        "vwap": vwap_rn,
+                        "candle_price": close_rn,
+                        "real_time_price": last_trade_price.get(symbol),
+                        "alert_score": score
+                    })
+                price_str = fmt_price(alert_price)
+                alert_text = (
+                    f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
+                    f"Current Price: ${price_str} (+{price_move_rn*100:.1f}%)")
+
+                # Add to pending alerts instead of sending immediately
+                pending_alerts[symbol].append({
+                    'type': 'runner',
+                    'score': score,
+                    'message': alert_text
                 })
-            price_str = fmt_price(alert_price)
-            alert_text = (
-                f"🏃‍♂️ <b>{escape_html(symbol)}</b> Runner\n"
-                f"Current Price: ${price_str} (+{price_move_rn*100:.1f}%)")
 
-            # Add to pending alerts instead of sending immediately
-            pending_alerts[symbol].append({
-                'type': 'runner',
-                'score': score,
-                'message': alert_text
-            })
+                # Send the best alert for this symbol
+                await send_best_alert(symbol)
 
-            # Send the best alert for this symbol
-            await send_best_alert(symbol)
-
-            runner_was_true[symbol] = True
-            runner_alerted_today[symbol] = today
-            last_alert_time[symbol]['runner'] = now
+                runner_was_true[symbol] = True
+                runner_alerted_today[symbol] = today
+                last_alert_time[symbol]['runner'] = now
 
     # VWAP Reclaim Logic - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
     # 🚨 FIXED: Use skip_vwap_reclaim flag instead of return to NOT block volume spike/other alerts
@@ -2852,66 +2898,70 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 f"[🔥 SPIKE DATA] {symbol} | RVOL={spike_data['rvol']:.2f} | Volume={spike_data['volume']} | Above_VWAP={spike_data['above_vwap']} | Price_move={spike_data['price_move']*100:.1f}%"
             )
 
+    # 🚨 FIXED: Use skip flag instead of return to NOT block EMA stack
+    skip_volume_spike = False
     if spike_detected and not volume_spike_was_true[symbol]:
         if (now - last_alert_time[symbol]['volume_spike']) < timedelta(
                 minutes=ALERT_COOLDOWN_MINUTES):
             logger.info(
                 f"[COOLDOWN] {symbol}: Skipping volume_spike alert due to cooldown ({(now - last_alert_time[symbol]['volume_spike']).total_seconds():.0f}s ago)"
             )
-            return
+            skip_volume_spike = True  # 🚨 FIXED: Don't return! Let EMA stack fire
         
-        # 🚨 VWAP VALIDATION - Optional (only if VWAP available)
-        # Volume spike momentum/price filters already prevent false alerts
-        if vwap_value is not None:
-            vwap_valid, real_time_price_vs, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "VOLUME SPIKE")
-            if not vwap_valid:
-                logger.info(vwap_reason)
-                return
+        if not skip_volume_spike:
+            # 🚨 VWAP VALIDATION - Optional (only if VWAP available)
+            # Volume spike momentum/price filters already prevent false alerts
+            if vwap_value is not None:
+                vwap_valid, real_time_price_vs, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "VOLUME SPIKE")
+                if not vwap_valid:
+                    logger.info(vwap_reason)
+                    skip_volume_spike = True  # 🚨 FIXED: Don't return! Let EMA stack fire
 
-        # Calculate alert score and add to pending alerts
-        score = get_alert_score("volume_spike", symbol, spike_data)
+        if not skip_volume_spike:
+            # Calculate alert score and add to pending alerts
+            score = get_alert_score("volume_spike", symbol, spike_data)
 
-        # DEBUG: Log volume spike alert addition
-        if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"]:
-            logger.info(
-                f"[📊 VOLUME SPIKE] {symbol} | Adding to pending_alerts | Score: {score} | Volume: {spike_data['volume']} | RVOL: {spike_data['rvol']:.2f}"
-            )
+            # DEBUG: Log volume spike alert addition
+            if symbol in ["OCTO", "GRND", "EQS", "OSRH", "BJDX", "EBMT"]:
+                logger.info(
+                    f"[📊 VOLUME SPIKE] {symbol} | Adding to pending_alerts | Score: {score} | Volume: {spike_data['volume']} | RVOL: {spike_data['rvol']:.2f}"
+                )
 
-        # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
-        candle_time_vs = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
-        alert_price = get_display_price(symbol, close, candle_time_vs)
-        if alert_price is None:
-            alert_price = close  # Fallback to candle close
-        price_str = fmt_price(alert_price)
-        rvol_str = f"{spike_data['rvol']:.1f}"
+            # 🚨 FIX: Use FRESHEST available price (real-time trade vs candle close)
+            candle_time_vs = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
+            alert_price = get_display_price(symbol, close, candle_time_vs)
+            if alert_price is None:
+                alert_price = close  # Fallback to candle close
+            price_str = fmt_price(alert_price)
+            rvol_str = f"{spike_data['rvol']:.1f}"
 
-        alert_text = (f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
-                      f"Price: ${price_str}")
+            alert_text = (f"🔥 <b>{escape_html(symbol)}</b> Volume Spike\n"
+                          f"Price: ${price_str}")
 
-        # Add to pending alerts instead of sending immediately
-        pending_alerts[symbol].append({
-            'type': 'volume_spike',
-            'score': score,
-            'message': alert_text
-        })
-
-        # Send the best alert for this symbol
-        await send_best_alert(symbol)
-
-        event_time = now
-        log_event(
-            "volume_spike", symbol, alert_price,
-            volume, event_time, {
-                "candle_price": close,
-                "real_time_price": last_trade_price.get(symbol),
-                "rvol": spike_data['rvol'],
-                "vwap": vwap_value,
-                "price_move": spike_data['price_move'],
-                "alert_score": score
+            # Add to pending alerts instead of sending immediately
+            pending_alerts[symbol].append({
+                'type': 'volume_spike',
+                'score': score,
+                'message': alert_text
             })
-        volume_spike_was_true[symbol] = True
-        alerted_symbols[symbol] = today
-        last_alert_time[symbol]['volume_spike'] = now
+
+            # Send the best alert for this symbol
+            await send_best_alert(symbol)
+
+            event_time = now
+            log_event(
+                "volume_spike", symbol, alert_price,
+                volume, event_time, {
+                    "candle_price": close,
+                    "real_time_price": last_trade_price.get(symbol),
+                    "rvol": spike_data['rvol'],
+                    "vwap": vwap_value,
+                    "price_move": spike_data['price_move'],
+                    "alert_score": score
+                })
+            volume_spike_was_true[symbol] = True
+            alerted_symbols[symbol] = today
+            last_alert_time[symbol]['volume_spike'] = now
 
     # --- EMA STACK LOGIC PATCH (SESSION-AWARE THRESHOLDS) ---
     # 🚨 CRITICAL FIX: Skip EMA STACK if volume spike just alerted (no need for stacked setup)
