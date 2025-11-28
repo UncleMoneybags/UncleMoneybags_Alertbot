@@ -2684,7 +2684,17 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # VWAP Reclaim Logic - 🚨 CRITICAL FIX: Never allow alerts without valid VWAP data
     # 🚨 FIXED: Use skip_vwap_reclaim flag instead of return to NOT block volume spike/other alerts
     skip_vwap_reclaim = False
-    if len(candles_seq) >= 2 and len(vwap_candles[symbol]) >= 3:
+    
+    # 🚨 CRITICAL FIX: Block VWAP reclaim alerts during PRE-MARKET (before 9:30 AM ET)
+    # Pre-market VWAP is unreliable - thin volume, choppy price action, noisy crossovers
+    # VWAP reclaim only makes sense during regular session when VWAP is meaningful
+    ny_tz = pytz.timezone("America/New_York")
+    current_time_ny = datetime.now(timezone.utc).astimezone(ny_tz).time()
+    if current_time_ny < dt_time(9, 30):
+        logger.debug(f"[VWAP SKIP] {symbol} - Pre-market ({current_time_ny}), blocking VWAP reclaim (unreliable before 9:30 AM)")
+        skip_vwap_reclaim = True
+    
+    if not skip_vwap_reclaim and len(candles_seq) >= 2 and len(vwap_candles[symbol]) >= 3:
         prev_candle = list(candles_seq)[-2]
         curr_candle = list(candles_seq)[-1]
         
@@ -2984,22 +2994,34 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         ny_tz = pytz.timezone("America/New_York")
         current_time = datetime.now(timezone.utc).astimezone(ny_tz).time()
         use_200_ema = current_time >= dt_time(11, 0) and len(closes) >= 90
-
-        if len(closes) < min_candles:
+        
+        # 🚨 CRITICAL FIX: If EMAs are ALREADY INITIALIZED (from backfill), trust them!
+        # The backfill uses 175+ historical candles to seed EMAs, so they're already accurate
+        # Only require min_candles for fresh symbols that haven't been backfilled yet
+        emas_initialized = stored_emas[symbol][5].initialized and stored_emas[symbol][8].initialized and stored_emas[symbol][13].initialized
+        
+        if not emas_initialized and len(closes) < min_candles:
             logger.info(
                 f"[EMA STACK] {symbol}: Skipping - need {min_candles} candles, have {len(closes)} for {session_type}"
             )
+        elif not emas_initialized:
+            # EMAs not initialized and we have enough candles - but still need EMAs
+            logger.info(
+                f"[EMA STACK] {symbol}: Skipping - EMAs not yet initialized (waiting for backfill)"
+            )
         else:
             # Get stored EMAs (much faster and more accurate)
+            # 🚨 FIX: Log that we're trusting backfilled EMAs even with few live candles
+            backfill_note = f" (BACKFILLED, {len(closes)} live)" if len(closes) < min_candles else f" ({len(closes)} candles)"
             if use_200_ema:
                 ema_periods = [5, 8, 13, 200]
                 logger.info(
-                    f"[EMA STACK] {symbol}: Using stored 5,8,13,200 EMAs (after 11am, {len(closes)} candles)"
+                    f"[EMA STACK] {symbol}: Using stored 5,8,13,200 EMAs{backfill_note}"
                 )
             else:
                 ema_periods = [5, 8, 13]
                 logger.info(
-                    f"[EMA STACK] {symbol}: Using stored 5,8,13 EMAs only (before 11am, {len(closes)} candles)"
+                    f"[EMA STACK] {symbol}: Using stored 5,8,13 EMAs{backfill_note}"
                 )
 
             emas = get_stored_emas(symbol, ema_periods)
