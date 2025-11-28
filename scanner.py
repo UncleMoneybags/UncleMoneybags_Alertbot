@@ -2604,8 +2604,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[RUNNER DEBUG] {symbol} | Closes: {closes_for_trend} | Rising closes: {rising_closes}/2 | Price trend: {price_rising_trend} | Volume trend: {volume_rising_trend}"
         )
+        vwap_rn_str = f"{vwap_rn:.4f}" if vwap_rn is not None else "N/A"
         logger.info(
-            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn:.4f} | Real-time Price={current_price_rn} | Candle Close={close_rn} | Above VWAP={current_price_rn is not None and current_price_rn > vwap_rn} | Volume={volume_rn}"
+            f"[ALERT DEBUG] {symbol} | Alert Type: runner | VWAP={vwap_rn_str} | Real-time Price={current_price_rn} | Candle Close={close_rn} | Above VWAP={current_price_rn is not None and vwap_rn is not None and current_price_rn > vwap_rn} | Volume={volume_rn}"
         )
         # Use stored EMAs for Runner Detection
         emas = get_stored_emas(symbol, [5, 8, 13])
@@ -3130,15 +3131,18 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema_stack_criteria = base_ema_criteria and momentum_confirmed
 
             if ema_stack_criteria and not ema_stack_was_true[symbol]:
-                # 🚨 CRITICAL: Guard against None vwap_value in calculation
+                # 🚨 CRITICAL: Guard against None/zero values in calculations
                 vwap_margin = ((current_price_ema - vwap_value) / vwap_value * 100) if vwap_value else 0
-                ema13_margin = (current_price_ema - ema13) / ema13 * 100
+                ema13_margin = (current_price_ema - ema13) / ema13 * 100 if ema13 > 0 else 0
+                ratio_val = ema5 / ema13 if ema13 > 0 else 0
+                vwap_str_ema = f"{vwap_value:.2f}" if vwap_value is not None else "N/A"
                 logger.info(
-                    f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_value:.2f}, real_time={current_price_ema:.2f}, candle_close={candle_close:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ema5/ema13:.4f}, vwap_margin={vwap_margin:.1f}%, ema13_margin={ema13_margin:.1f}%"
+                    f"[EMA STACK ALERT] {symbol}: session={session_type}, ema5={ema5:.2f}, ema8={ema8:.2f}, ema13={ema13:.2f}{ema200_str}, vwap={vwap_str_ema}, real_time={current_price_ema:.2f}, candle_close={candle_close:.2f}, volume={last_volume}, dollar_volume={dollar_volume:.2f}, ratio={ratio_val:.4f}, vwap_margin={vwap_margin:.1f}%, ema13_margin={ema13_margin:.1f}%"
                 )
-                if ema5 / ema13 < 1.011:
+                if ema13 <= 0 or ema5 / ema13 < 1.011:
+                    ratio_str_ema = f"{ema5/ema13:.4f}" if ema13 > 0 else "inf"
                     logger.error(
-                        f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13:.4f} (should be >= 1.011)"
+                        f"[BUG] EMA stack alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ratio_str_ema} (should be >= 1.011)"
                     )
                     return
                 if (now - last_alert_time[symbol]['ema_stack']) < timedelta(
