@@ -803,17 +803,23 @@ async def backfill_stored_emas(symbol):
                     
                     logger.info(f"[EMA BACKFILL] {symbol} | Filtered to {len(regular_session_candles)} regular session candles (excluded pre-market/after-hours)")
 
+                    # 🚨 FIX: Guard against 0 regular session candles (pre-market only stocks)
+                    if len(regular_session_candles) == 0:
+                        logger.warning(f"[EMA BACKFILL] {symbol} | No regular session candles available (pre-market only), skipping backfill")
+                        return False
+                    
                     # Seed EMAs with historical closes in chronological order (regular session only)
                     for candle in regular_session_candles:
                         close_price = candle['c']
                         for period in [5, 8, 13, 200]:
                             stored_emas[symbol][period].update(close_price)
 
-                    # Log final seeded values
+                    # Log final seeded values (safe - we have at least 1 candle)
                     emas = get_stored_emas(symbol, [5, 8, 13, 200])
-                    logger.info(
-                        f"[EMA BACKFILL] {symbol} | Seeded EMAs - EMA5: {emas['ema5']:.4f} | EMA8: {emas['ema8']:.4f} | EMA13: {emas['ema13']:.4f} | EMA200: {emas['ema200']:.4f}"
-                    )
+                    if emas['ema5'] is not None:
+                        logger.info(
+                            f"[EMA BACKFILL] {symbol} | Seeded EMAs - EMA5: {emas['ema5']:.4f} | EMA8: {emas['ema8']:.4f} | EMA13: {emas['ema13']:.4f} | EMA200: {emas['ema200']:.4f}"
+                        )
                     return True
                 else:
                     logger.warning(
@@ -2159,8 +2165,9 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
                 logger.info(f"[PERFECT SETUP BLOCKED] {symbol} - Real-time price is stale ({price_age_perfect:.1f}s old, limit: {MAX_PRICE_AGE_SECONDS}s)")
                 return
         if ema13 <= 0 or ema5 / ema13 < 1.011:  # 🚨 FIX: Guard against division by zero and invalid ratio
+            ratio_str = f"{ema5/ema13:.4f}" if ema13 > 0 else "inf"
             logger.error(
-                f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ema5/ema13 if ema13 > 0 else 'inf':.4f} (should be >= 1.011)"
+                f"[BUG] Perfect Setup alert would have fired but ratio invalid! {symbol}: ema5={ema5:.4f}, ema13={ema13:.4f}, ratio={ratio_str} (should be >= 1.011)"
             )
             return
 
