@@ -3673,10 +3673,11 @@ async def ingest_polygon_events():
                                         if trade_time > halt_time and time_since_halt < 20:  # Within 20 min of halt
                                             try:
                                                 # 🚨 VALIDATE TRADE DATA: Ensure valid price AND volume before confirming resume
-                                                if not price or not isinstance(price, (int, float)) or price <= 0:
+                                                # 🚨 FIX: Use explicit None checks (not falsy) to avoid masking valid 0.0 values
+                                                if price is None or not isinstance(price, (int, float)) or price <= 0:
                                                     logger.warning(f"[RESUME SKIP] {symbol} - Invalid resume price: {price}")
                                                     continue
-                                                if not size or not isinstance(size, (int, float)) or size <= 0:
+                                                if size is None or not isinstance(size, (int, float)) or size <= 0:
                                                     logger.warning(f"[RESUME SKIP] {symbol} - Invalid resume volume: {size}")
                                                     continue
                                                 
@@ -3919,7 +3920,7 @@ async def ingest_polygon_events():
                                     
                                     # Get price and float for filtering
                                     current_price = last_trade_price.get(symbol)
-                                    if not current_price:
+                                    if current_price is None:  # 🚨 FIX: Explicit None check
                                         # Fallback to yfinance (safer with exception handling)
                                         try:
                                             def _fetch_price():
@@ -3936,7 +3937,7 @@ async def ingest_polygon_events():
                                         except Exception as e:
                                             logger.warning(f"[LULD] {symbol} - yfinance failed: {e}")
                                     
-                                    if not current_price and symbol in candles and len(candles[symbol]) > 0:
+                                    if current_price is None and symbol in candles and len(candles[symbol]) > 0:  # 🚨 FIX: Explicit None check
                                         current_price = candles[symbol][-1]['close']
 
                                     float_shares = await get_float_shares(symbol)
@@ -3952,7 +3953,7 @@ async def ingest_polygon_events():
                                         continue
                                     
                                     # Filter: price must be ≤$15 and float 500K-20M
-                                    if not current_price:
+                                    if current_price is None:  # 🚨 FIX: Explicit None check
                                         logger.info(f"[LULD SKIP] {symbol} - No price data available")
                                         continue
                                         
@@ -4449,7 +4450,7 @@ async def nasdaq_halt_monitor():
                                                 current_price = last_trade_price.get(symbol)
                                                 price_source = "last_trade"
                                                 
-                                                if not current_price and symbol in candles and len(candles[symbol]) > 0:
+                                                if current_price is None and symbol in candles and len(candles[symbol]) > 0:  # 🚨 FIX: Explicit None check
                                                     current_price = candles[symbol][-1]['close']
                                                     price_source = "candle"
                                                 
@@ -4462,7 +4463,7 @@ async def nasdaq_halt_monitor():
                                                 filter_reason = None
                                                 
                                                 # Price must be known and ≤$15 to alert
-                                                if not current_price:
+                                                if current_price is None:  # 🚨 FIX: Explicit None check
                                                     filter_reason = "no price data available"
                                                     logger.info(f"[RESUME FILTERED] {symbol} - {filter_reason}")
                                                 elif current_price > PRICE_THRESHOLD:
@@ -4554,7 +4555,7 @@ async def nasdaq_halt_monitor():
                                         current_price = last_trade_price.get(symbol)
                                         price_source = "last_trade"
                                         
-                                        if not current_price:
+                                        if current_price is None:  # 🚨 FIX: Explicit None check
                                             logger.info(f"[HALT PRICE] {symbol} - No last_trade_price, trying yfinance (non-blocking)...")
                                             try:
                                                 def _fetch_price():
@@ -4570,7 +4571,7 @@ async def nasdaq_halt_monitor():
                                             except Exception as yf_error:
                                                 logger.warning(f"[HALT PRICE] {symbol} - yfinance failed: {yf_error}")
                                         
-                                        if not current_price and symbol in candles and len(candles[symbol]) > 0:
+                                        if current_price is None and symbol in candles and len(candles[symbol]) > 0:  # 🚨 FIX: Explicit None check
                                             current_price = candles[symbol][-1]['close']
                                             price_source = "candle"
                                             logger.info(f"[HALT PRICE] {symbol} - Using candle price ${current_price:.2f}")
@@ -4588,7 +4589,7 @@ async def nasdaq_halt_monitor():
                                         filter_reason = None
                                         
                                         # Price must be known and ≤$15 to alert
-                                        if not current_price:
+                                        if current_price is None:  # 🚨 FIX: Explicit None check
                                             filter_reason = "no price data available"
                                             logger.info(f"[NASDAQ FILTERED] {symbol} - {filter_reason}")
                                         elif current_price > PRICE_THRESHOLD:
