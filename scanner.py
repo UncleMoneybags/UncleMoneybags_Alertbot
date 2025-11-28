@@ -790,7 +790,7 @@ async def backfill_stored_emas(symbol):
                             try:
                                 from dateutil.parser import parse
                                 candle_time_ts = parse(ts_val)
-                            except:
+                            except Exception:  # 🚨 FIX: Never use bare except
                                 continue
                         else:
                             candle_time_ts = polygon_time_to_utc(ts_val)
@@ -1098,7 +1098,7 @@ def polygon_time_to_utc(ts):
     """
     try:
         ts = int(ts) if not isinstance(ts, int) else ts
-    except:
+    except Exception:  # 🚨 FIX: Never use bare except
         raise ValueError(f"Invalid timestamp: {ts}")
     
     # Auto-detect scale based on magnitude (correct thresholds)
@@ -1774,7 +1774,7 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
         # If not a deque, try to convert or return early
         try:
             candles_list = list(candles_seq)
-        except:
+        except Exception:  # 🚨 FIX: Never use bare except
             return False, {}
     
     if len(candles_list) < 4:  # Need 4 candles minimum (2 trailing + 2 for spike detection)
@@ -3905,7 +3905,7 @@ async def ingest_polygon_events():
                                                 if trade_dt > halt_time:
                                                     logger.info(f"[LULD SKIP] {symbol} - Stock traded after halt (resumed)")
                                                     continue
-                                            except:
+                                            except Exception:  # 🚨 FIX: Never use bare except
                                                 pass
 
                                     logger.warning(f"[LULD HALT] {symbol} - Indicator 17 at {halt_time_et.strftime('%I:%M:%S %p ET')}")
@@ -4262,7 +4262,7 @@ async def rest_api_backup_scanner():
                         prev_close = prev_day.get("c")  # Previous close
                         volume = day.get("v", 0)
                         
-                        if not current_price or not prev_close or prev_close == 0:
+                        if current_price is None or prev_close is None or prev_close == 0:  # 🚨 FIX: Explicit None checks
                             continue
                         
                         # Calculate % gain
@@ -4391,7 +4391,7 @@ async def nasdaq_halt_monitor():
             with open("halted_symbols.pkl", "rb") as f:
                 ever_halted_symbols = pickle.load(f)
             logger.info(f"[HALT TRACKER] Loaded {len(ever_halted_symbols)} previously halted symbols from disk")
-        except:
+        except Exception:  # 🚨 FIX: Never use bare except
             logger.warning("[HALT TRACKER] Could not load halted_symbols.pkl, starting fresh")
             ever_halted_symbols = set()
     
