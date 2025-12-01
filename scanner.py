@@ -1809,7 +1809,7 @@ def check_volume_spike(candles_seq, vwap_value, float_shares=None):
     if current_trade_time_spike is not None and current_price_spike is not None:
         now_spike_check = datetime.now(timezone.utc)
         spike_price_age = (now_spike_check - current_trade_time_spike).total_seconds()
-        if spike_price_age > MAX_PRICE_AGE_SECONDS:
+        if spike_price_age > MAX_PRICE_AGE_VOLUME_SPIKE:
             # Price is stale - don't use it for volume spike detection
             current_price_spike = None
             above_vwap = False
@@ -1934,8 +1934,17 @@ def get_ny_date():
     return now_ny.date()
 
 
-# 🚀 FRESHNESS THRESHOLDS: Consolidated timestamp validation constants
-MAX_PRICE_AGE_SECONDS = 5  # STRICT: Alert only on fresh trades within 5 seconds (prevents stale price alerts like ATON $4.41 when price was $3.43)
+# 🚀 FRESHNESS THRESHOLDS: Tiered by alert type
+# Volume Spike: STRICT (5s) - needs real-time confirmation for entry signals
+# EMA Stack / Warming Up: RELAXED (30s) - pattern-based alerts, catches low-volume runners like FLYE
+# Perfect Setup / VWAP Reclaim / Runner: MODERATE (15s) - balance between speed and accuracy
+MAX_PRICE_AGE_SECONDS = 5  # Default: STRICT (backwards compatibility)
+MAX_PRICE_AGE_VOLUME_SPIKE = 5  # Volume spike needs fresh confirmation
+MAX_PRICE_AGE_EMA_STACK = 30  # EMA stack is pattern-based, can tolerate older trades
+MAX_PRICE_AGE_WARMING_UP = 30  # Warming up is also pattern-based
+MAX_PRICE_AGE_PERFECT_SETUP = 15  # Strong setup, moderate tolerance
+MAX_PRICE_AGE_VWAP_RECLAIM = 15  # VWAP reclaim needs reasonably fresh data
+MAX_PRICE_AGE_RUNNER = 15  # Runner needs reasonably fresh data
 MAX_TRADE_AGE_SECONDS = 15  # Tolerates network jitter/lag - prevents missing alerts due to delayed trades
 
 
@@ -2161,8 +2170,8 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
         if real_time_price_perfect is not None and real_time_time_perfect is not None:
             now_check_perfect = datetime.now(timezone.utc)
             price_age_perfect = (now_check_perfect - real_time_time_perfect).total_seconds()
-            if price_age_perfect > MAX_PRICE_AGE_SECONDS:
-                logger.info(f"[PERFECT SETUP BLOCKED] {symbol} - Real-time price is stale ({price_age_perfect:.1f}s old, limit: {MAX_PRICE_AGE_SECONDS}s)")
+            if price_age_perfect > MAX_PRICE_AGE_PERFECT_SETUP:
+                logger.info(f"[PERFECT SETUP BLOCKED] {symbol} - Real-time price is stale ({price_age_perfect:.1f}s old, limit: {MAX_PRICE_AGE_PERFECT_SETUP}s)")
                 return
         if ema13 <= 0 or ema5 / ema13 < 1.011:  # 🚨 FIX: Guard against division by zero and invalid ratio
             ratio_str = f"{ema5/ema13:.4f}" if ema13 > 0 else "inf"
@@ -2507,10 +2516,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 # Recompute NOW to ensure freshness check reflects actual alert moment
                 now_fresh_wu = datetime.now(timezone.utc)
                 
-                # Verify price data is FRESH (≤30 seconds old)
+                # Verify price data is FRESH (≤30 seconds old for pattern-based alerts)
                 price_age_wu = (now_fresh_wu - real_time_timestamp_wu).total_seconds()
-                if price_age_wu > MAX_PRICE_AGE_SECONDS:
-                    logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is stale ({price_age_wu:.1f}s old, limit: {MAX_PRICE_AGE_SECONDS}s)")
+                if price_age_wu > MAX_PRICE_AGE_WARMING_UP:
+                    logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is stale ({price_age_wu:.1f}s old, limit: {MAX_PRICE_AGE_WARMING_UP}s)")
                     skip_warming_up = True
             
             if not skip_warming_up:
@@ -2640,7 +2649,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             
             if not skip_runner:
                 # 🚨 STRICT VWAP VALIDATION - Checks ONLY real-time price (no candle fallback)
-                vwap_valid, real_time_price_rn, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_rn, "RUNNER")
+                vwap_valid, real_time_price_rn, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_rn, "RUNNER", MAX_PRICE_AGE_RUNNER)
                 if not vwap_valid:
                     logger.info(vwap_reason)
                     skip_runner = True
@@ -2930,7 +2939,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             # 🚨 VWAP VALIDATION - Optional (only if VWAP available)
             # Volume spike momentum/price filters already prevent false alerts
             if vwap_value is not None:
-                vwap_valid, real_time_price_vs, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "VOLUME SPIKE")
+                vwap_valid, real_time_price_vs, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "VOLUME SPIKE", MAX_PRICE_AGE_VOLUME_SPIKE)
                 if not vwap_valid:
                     logger.info(vwap_reason)
                     skip_volume_spike = True  # 🚨 FIXED: Don't return! Let EMA stack fire
@@ -3058,7 +3067,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             candle_close = closes[-1]
 
             # 🚨 STRICT VWAP VALIDATION - Checks ONLY real-time price (no candle fallback)
-            vwap_valid, real_time_price_ema, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "EMA STACK")
+            # 🚀 TIERED: EMA Stack uses 30s threshold to catch low-volume runners like FLYE
+            vwap_valid, real_time_price_ema, vwap_reason = validate_price_above_vwap_strict(symbol, vwap_value, "EMA STACK", MAX_PRICE_AGE_EMA_STACK)
             if not vwap_valid:
                 logger.info(vwap_reason)
                 return
@@ -3161,10 +3171,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 # Recompute NOW to ensure freshness check reflects actual alert moment
                 now_fresh_ema = datetime.now(timezone.utc)
                 
-                # Verify price data is FRESH (≤30 seconds old)
+                # Verify price data is FRESH (≤30 seconds old for pattern-based alerts like FLYE)
                 price_age_ema = (now_fresh_ema - real_time_timestamp_ema).total_seconds()
-                if price_age_ema > MAX_PRICE_AGE_SECONDS:
-                    logger.info(f"[EMA STACK BLOCKED] {symbol} - Real-time price is stale ({price_age_ema:.1f}s old)")
+                if price_age_ema > MAX_PRICE_AGE_EMA_STACK:
+                    logger.info(f"[EMA STACK BLOCKED] {symbol} - Real-time price is stale ({price_age_ema:.1f}s old, limit: {MAX_PRICE_AGE_EMA_STACK}s)")
                     return
                 
                 # Verify real-time price is ACTUALLY above VWAP (not just from get_display_price fallback)
