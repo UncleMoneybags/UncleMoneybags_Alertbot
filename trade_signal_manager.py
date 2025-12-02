@@ -189,7 +189,7 @@ class TakeProfitPlanner:
     @staticmethod
     def calculate_fib_extensions(point_a: float, point_b: float, point_c: float) -> List[Tuple[float, str]]:
         """Calculate Fibonacci extension levels from ABC points."""
-        if not all([point_a, point_b, point_c]) or point_a >= point_b:
+        if point_a is None or point_b is None or point_c is None or point_a >= point_b:
             return []
         
         range_ab = point_b - point_a
@@ -548,7 +548,7 @@ class TakeProfitPlanner:
             "Fib 50%": 4,
             "Fib 62%": 4,
             "EMA 8": 5,
-            "EMA 13": 5,  # Using EMA 13 as EMA 21 not available in scanner
+            "EMA 21": 5,
             "Psych": 6,
         }
         
@@ -570,7 +570,7 @@ class TakeProfitPlanner:
             all_levels.append((ema8, "EMA 8", SUPPORT_PRIORITY["EMA 8"]))
         
         if ema21 and min_entry <= ema21 < max_entry:
-            all_levels.append((ema21, "EMA 13", SUPPORT_PRIORITY["EMA 13"]))
+            all_levels.append((ema21, "EMA 21", SUPPORT_PRIORITY.get("EMA 21", 5)))
         
         # Calculate Fib retracements from recent swing
         if recent_candles and len(recent_candles) >= 5:
@@ -584,7 +584,7 @@ class TakeProfitPlanner:
                 fib_levels = cls.calculate_fib_retracements(swing_low, swing_high)
                 for price, label in fib_levels:
                     if min_entry <= price < max_entry:
-                        priority = SUPPORT_PRIORITY.get(label.replace("Fib ", "Fib ").replace("%", "%"), 4)
+                        priority = SUPPORT_PRIORITY.get(label, 4)
                         all_levels.append((price, label, priority))
         
         # Add psychological support levels
@@ -700,7 +700,7 @@ class DynamicTargetCalculator:
     @staticmethod
     def _calculate_atr(candles: List[Dict[str, float]], periods: int = ATR_PERIODS) -> float:
         # Use the last `periods` candles, compute TRs
-        use = candles[-(min(len(candles), periods) + 0) :]
+        use = candles[-min(len(candles), periods):]
         if len(use) < 2:
             return 0.0
         trs = []
