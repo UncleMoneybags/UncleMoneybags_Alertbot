@@ -336,13 +336,15 @@ class TakeProfitPlanner:
             logger.debug(f"[TP] Stop loss using default {BASE_STOP_LOSS_PCT*100}%: {stop_loss:.4f}")
         
         # STEP 2: Calculate risk per share (with minimum floor)
+        # CRITICAL: If risk is too small, adjust stop_loss outward to match
+        # This ensures displayed R:R matches internal calculations
         risk_per_share = entry_price - stop_loss
         min_risk = entry_price * MIN_RISK_FLOOR_PCT
         if risk_per_share < min_risk:
-            logger.debug(f"[TP] Risk floor applied: {risk_per_share:.4f} -> {min_risk:.4f}")
+            old_sl = stop_loss
+            stop_loss = entry_price - min_risk  # Adjust SL outward
             risk_per_share = min_risk
-        else:
-            risk_per_share = risk_per_share
+            logger.debug(f"[TP] Risk floor applied: SL adjusted {old_sl:.4f} -> {stop_loss:.4f} (risk={min_risk:.4f})")
         
         # STEP 3: Collect all technical levels (must be above entry)
         all_levels: List[Tuple[float, str, int]] = []
@@ -501,7 +503,7 @@ class TakeProfitPlanner:
         
         for ret in FIB_RETRACEMENTS:
             level = swing_high - (range_size * ret)
-            pct_label = f"{int(ret * 100)}%"
+            pct_label = f"{int(round(ret * 100))}%"  # 0.618 -> 62%, 0.382 -> 38%
             levels.append((level, f"Fib {pct_label}"))
         
         return levels
