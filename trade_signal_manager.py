@@ -188,7 +188,13 @@ class TakeProfitPlanner:
     
     @staticmethod
     def calculate_fib_extensions(point_a: float, point_b: float, point_c: float) -> List[Tuple[float, str]]:
-        """Calculate Fibonacci extension levels from ABC points."""
+        """
+        Calculate Fibonacci extension levels from ABC points.
+        
+        Formula: target = C + (B - A) * extension
+        This anchors at point C (pullback low) and projects the AB range forward.
+        Common trader approach for momentum continuation targets.
+        """
         if point_a is None or point_b is None or point_c is None or point_a >= point_b:
             return []
         
@@ -203,33 +209,38 @@ class TakeProfitPlanner:
     
     @staticmethod
     def get_psychological_levels(entry_price: float, max_levels: int = 5) -> List[Tuple[float, str]]:
-        """Generate psychological price levels above entry."""
+        """Generate psychological price levels above entry (deduplicated)."""
+        seen_prices: set = set()
         levels = []
         
         if entry_price < 1.0:
             increments = [0.10, 0.25, 0.50, 0.75, 1.00]
             base = int(entry_price * 10) / 10
             for inc in increments:
-                level = base + inc
-                if level > entry_price * 1.01:
+                level = round(base + inc, 4)
+                if level > entry_price * 1.01 and level not in seen_prices:
+                    seen_prices.add(level)
                     levels.append((level, "Psych"))
                     if len(levels) >= max_levels:
                         break
         elif entry_price < 10.0:
             base = int(entry_price)
             for i in range(1, max_levels + 1):
-                half = base + 0.5 * i
-                whole = base + i
-                if half > entry_price * 1.01:
+                half = round(base + 0.5 * i, 4)
+                whole = round(float(base + i), 4)
+                if half > entry_price * 1.01 and half not in seen_prices:
+                    seen_prices.add(half)
                     levels.append((half, "Psych"))
-                if whole > entry_price * 1.01:
+                if whole > entry_price * 1.01 and whole not in seen_prices:
+                    seen_prices.add(whole)
                     levels.append((whole, "Psych"))
         else:
             base = int(entry_price)
             for i in range(1, max_levels + 1):
-                level = base + i
-                if level > entry_price * 1.01:
-                    levels.append((float(level), "Psych"))
+                level = round(float(base + i), 4)
+                if level > entry_price * 1.01 and level not in seen_prices:
+                    seen_prices.add(level)
+                    levels.append((level, "Psych"))
         
         return sorted(levels, key=lambda x: x[0])[:max_levels]
     
@@ -312,17 +323,26 @@ class TakeProfitPlanner:
         }
         
         # STEP 1: Calculate stop loss FIRST (needed for R calculations)
+        # PML (pre-market low) takes precedence over PDL (previous day low)
+        # Rationale: PML is more recent intraday support, PDL is prior session
         if pml and pml < entry_price:
             stop_loss = pml * 0.99
+            logger.debug(f"[TP] Stop loss set from PML: {stop_loss:.4f}")
         elif pdl and pdl < entry_price:
             stop_loss = pdl * 0.99
+            logger.debug(f"[TP] Stop loss set from PDL: {stop_loss:.4f}")
         else:
             stop_loss = entry_price * (1 - BASE_STOP_LOSS_PCT)
+            logger.debug(f"[TP] Stop loss using default {BASE_STOP_LOSS_PCT*100}%: {stop_loss:.4f}")
         
         # STEP 2: Calculate risk per share (with minimum floor)
         risk_per_share = entry_price - stop_loss
         min_risk = entry_price * MIN_RISK_FLOOR_PCT
-        risk_per_share = max(risk_per_share, min_risk)
+        if risk_per_share < min_risk:
+            logger.debug(f"[TP] Risk floor applied: {risk_per_share:.4f} -> {min_risk:.4f}")
+            risk_per_share = min_risk
+        else:
+            risk_per_share = risk_per_share
         
         # STEP 3: Collect all technical levels (must be above entry)
         all_levels: List[Tuple[float, str, int]] = []
@@ -394,6 +414,7 @@ class TakeProfitPlanner:
             tp1 = generate_fallback_tp(0)
             tp2 = generate_fallback_tp(1)
             tp3 = generate_fallback_tp(2)
+            logger.debug(f"[TP] No technical levels found, using risk-based fallback: TP1={tp1:.4f} TP2={tp2:.4f} TP3={tp3:.4f}")
             return (round(tp1, 4), round(tp2, 4), round(tp3, 4), round(stop_loss, 4))
         
         # STEP 7: Apply confluence detection and priority sorting
@@ -437,11 +458,12 @@ class TakeProfitPlanner:
         
         for slot in range(3):
             for level_price, source, priority in sorted_by_priority:
-                if level_price in used_prices:
+                rounded_price = round(level_price, 6)
+                if rounded_price in used_prices:
                     continue
                 if is_valid_for_slot(level_price, slot):
                     tp_levels[slot] = level_price
-                    used_prices.add(level_price)
+                    used_prices.add(rounded_price)
                     break
             
             # If no valid technical level, use fallback for this slot
