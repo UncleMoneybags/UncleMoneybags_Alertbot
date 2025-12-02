@@ -20,6 +20,7 @@ import sys
 import requests
 import pandas as pd
 import time
+import random
 
 # 🚀 PERFORMANCE: Use uvloop for faster event loop (Linux/macOS)
 try:
@@ -65,6 +66,25 @@ MARKET_OPEN = dt_time(4, 0)
 MARKET_CLOSE = dt_time(20, 0)
 eastern = pytz.timezone("America/New_York")
 logger = logging.getLogger(__name__)
+
+# Rotating closing phrases for market close alert (picked at random)
+CLOSE_PHRASES = [
+    "Market closed. Reconvene in pre-market — stay ready.",
+    "Market's closed. See you in pre-market to hunt the next move.",
+    "That's a wrap for today. Meet back in pre-market — keep alerts on.",
+    "Market closed. Rest up — pre-market starts the next move.",
+    "End of day — reconvene in pre-market for fresh setups.",
+    "Trading day wrapped. Catch you at pre-market for the open movers.",
+    "Market closed. Recharge and return for pre-market action.",
+    "Close bell rung. Back in pre-market to secure the bag.",
+    "Market shut. Reassemble in pre-market — be ready for runners.",
+    "Day over. Reconvene at pre-market for the next opportunity.",
+    "Markets closed. Keep the scanners warm — pre-market starts soon.",
+    "Trading closed. See you in pre-market — stay sharp.",
+    "Market closed. We'll reconvene in pre-market — don't miss the open.",
+    "That's it for today. Pre-market tomorrow — bring your A-game.",
+    "Market closed. Rest, review, and return for pre-market setups."
+]
 
 # 🔒 HELPER: Safe task scheduling that checks for running event loop
 def safe_create_task(coro):
@@ -3351,11 +3371,12 @@ async def market_close_alert_loop():
         now_utc = datetime.now(timezone.utc)
         now_est = now_utc.astimezone(eastern)
 
-        # Only send alert on trading days (Mon-Thu) at 8:01 PM (narrow 2-minute window to avoid restart spam)
+        # Only send alert on trading days (Mon-Thu) at 8:00 PM sharp (1-minute window)
         if now_est.weekday() in (0, 1, 2, 3):
-            if (dt_time(20, 1) <= now_est.time() <= dt_time(20, 3)) and not sent_today:
-                await send_all_alerts(
-                    "Market Closed. Reconvene in pre market tomorrow.")
+            if (dt_time(20, 0) <= now_est.time() <= dt_time(20, 1)) and not sent_today:
+                # Pick a random closing phrase for variety
+                close_msg = random.choice(CLOSE_PHRASES)
+                await send_all_alerts(close_msg)
                 event_time = datetime.now(timezone.utc)
                 log_event("market_close", "CLOSE", 0, 0, event_time)
                 sent_today = True
