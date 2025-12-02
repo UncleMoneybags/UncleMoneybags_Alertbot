@@ -22,6 +22,9 @@ import pandas as pd
 import time
 import random
 
+# Trade Signal Integration - Buy signals with TP levels
+from trade_signal_integration import init_trade_signals, shutdown_trade_signals, queue_alert
+
 # 🚀 PERFORMANCE: Use uvloop for faster event loop (Linux/macOS)
 try:
     import uvloop
@@ -127,6 +130,14 @@ _float_cache_lock = None  # 🔒 Created in main() to avoid event loop binding i
 ticker_type_cache = {}  # {symbol: type_code} e.g., {"SPY": "ETF", "AAPL": "CS"}
 _last_ticker_type_save = datetime.min.replace(tzinfo=timezone.utc)
 _ticker_type_lock = None  # Created in main() to avoid event loop binding issues
+
+# 🎯 DAILY LEVELS CACHE: Store PDH/PDL for confluence-based entry calculation
+# {symbol: {'pdh': float, 'pdl': float, 'date': str}}
+daily_levels_cache = {}
+
+# 🎯 PRE-MARKET LEVELS: Track PMH/PML during pre-market session
+# {symbol: {'pmh': float, 'pml': float, 'date': str}}
+premarket_levels = defaultdict(lambda: {'pmh': None, 'pml': None, 'date': None})
 
 
 async def save_float_cache(force=False):
@@ -359,6 +370,105 @@ async def get_ticker_type(symbol):
 load_float_cache()
 load_ticker_type_cache()
 # --- END FLOAT PATCH ---
+
+
+async def get_daily_levels(symbol):
+    """Fetch PDH/PDL (Previous Day High/Low) from Polygon API.
+    
+    Uses caching to avoid repeated API calls. Cache is valid for current trading day.
+    
+    Returns:
+        dict: {'pdh': float, 'pdl': float} or {'pdh': None, 'pdl': None} if unavailable
+    """
+    now = datetime.now(timezone.utc)
+    eastern = pytz.timezone("America/New_York")
+    today_str = now.astimezone(eastern).strftime("%Y-%m-%d")
+    
+    # Check cache first
+    if symbol in daily_levels_cache:
+        cached = daily_levels_cache[symbol]
+        if cached.get('date') == today_str:
+            return {'pdh': cached.get('pdh'), 'pdl': cached.get('pdl')}
+    
+    # Fetch from Polygon snapshot API
+    try:
+        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
+        params = {"apiKey": POLYGON_API_KEY}
+        
+        async with api_semaphore:
+            async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("status") == "OK" and data.get("ticker"):
+                        ticker_data = data["ticker"]
+                        prev_day = ticker_data.get("prevDay", {})
+                        
+                        pdh = prev_day.get("h")  # Previous Day High
+                        pdl = prev_day.get("l")  # Previous Day Low
+                        
+                        # Cache the result
+                        daily_levels_cache[symbol] = {
+                            'pdh': pdh,
+                            'pdl': pdl,
+                            'date': today_str
+                        }
+                        
+                        logger.debug(f"[DAILY LEVELS] {symbol} - PDH: {pdh}, PDL: {pdl}")
+                        return {'pdh': pdh, 'pdl': pdl}
+                        
+                elif response.status == 429:
+                    logger.warning(f"[DAILY LEVELS] Rate limited on {symbol}")
+                else:
+                    logger.debug(f"[DAILY LEVELS] {symbol} - API error: {response.status}")
+                    
+    except Exception as e:
+        logger.debug(f"[DAILY LEVELS] {symbol} - Error: {e}")
+    
+    return {'pdh': None, 'pdl': None}
+
+
+def update_premarket_levels(symbol, price):
+    """Track pre-market high/low during pre-market session (4 AM - 9:30 AM ET).
+    
+    Call this when receiving trade ticks during pre-market hours.
+    """
+    now = datetime.now(timezone.utc)
+    eastern = pytz.timezone("America/New_York")
+    now_et = now.astimezone(eastern)
+    today_str = now_et.strftime("%Y-%m-%d")
+    
+    # Only track during pre-market (4 AM - 9:30 AM ET)
+    if now_et.hour < 4 or (now_et.hour == 9 and now_et.minute >= 30) or now_et.hour >= 10:
+        return
+    
+    # Reset for new day
+    if premarket_levels[symbol].get('date') != today_str:
+        premarket_levels[symbol] = {'pmh': price, 'pml': price, 'date': today_str}
+        return
+    
+    # Update high/low
+    current = premarket_levels[symbol]
+    if current['pmh'] is None or price > current['pmh']:
+        premarket_levels[symbol]['pmh'] = price
+    if current['pml'] is None or price < current['pml']:
+        premarket_levels[symbol]['pml'] = price
+
+
+def get_premarket_levels(symbol):
+    """Get current pre-market high/low for a symbol.
+    
+    Returns:
+        dict: {'pmh': float, 'pml': float} or {'pmh': None, 'pml': None}
+    """
+    now = datetime.now(timezone.utc)
+    eastern = pytz.timezone("America/New_York")
+    today_str = now.astimezone(eastern).strftime("%Y-%m-%d")
+    
+    levels = premarket_levels.get(symbol, {})
+    if levels.get('date') == today_str:
+        return {'pmh': levels.get('pmh'), 'pml': levels.get('pml')}
+    return {'pmh': None, 'pml': None}
+
 
 # Filtering counters for debugging
 filter_counts = defaultdict(int)
@@ -1745,6 +1855,62 @@ async def send_best_alert(symbol):
         logger.info(
             f"[ALERT SENT] {symbol} | {best_alert['type']} | Score: {best_alert['score']}"
         )
+        
+        # 🚀 QUEUE BUY SIGNAL: Send to TradeSignalManager for TP/SL calculation
+        alert_price = best_alert.get('price', last_trade_price.get(symbol))
+        alert_rvol = best_alert.get('rvol', 1.0)
+        alert_type = best_alert.get('type', 'Unknown')
+        ml_score = best_alert.get('ml_score', best_alert['score'] / 100.0)
+        
+        if alert_price and alert_price > 0:
+            try:
+                # Get VWAP for this symbol
+                vwap_value = get_valid_vwap(symbol)
+                
+                # Get EMAs (5, 8, 13) - Note: EMA21 not stored, use EMA13 as closest
+                emas = get_stored_emas(symbol, periods=[5, 8, 13])
+                ema8 = emas.get('ema8')
+                ema13 = emas.get('ema13')  # Use EMA13 as alternative to EMA21
+                
+                # Get recent candles for Fib calculation
+                recent_candles_list = list(candles[symbol])[-20:] if symbol in candles else None
+                
+                # Get session high from candles (intraday high)
+                session_high = None
+                if recent_candles_list:
+                    highs = [c.get('high', c.get('h', 0)) for c in recent_candles_list if c.get('high', c.get('h', 0))]
+                    if highs:
+                        session_high = max(highs)
+                
+                # Fetch PDH/PDL from Polygon API (cached)
+                daily = await get_daily_levels(symbol)
+                pdh = daily.get('pdh')
+                pdl = daily.get('pdl')
+                
+                # Get PMH/PML from pre-market tracking
+                premarket = get_premarket_levels(symbol)
+                pmh = premarket.get('pmh')
+                pml = premarket.get('pml')
+                
+                await queue_alert(
+                    symbol=symbol,
+                    price=float(alert_price),
+                    rvol=float(alert_rvol),
+                    alert_type=alert_type,
+                    ml_score=ml_score,
+                    vwap=vwap_value,
+                    ema8=ema8,
+                    ema21=ema13,  # Using EMA13 as EMA21 not stored
+                    recent_candles=recent_candles_list,
+                    session_high=session_high,
+                    pdh=pdh,
+                    pdl=pdl,
+                    pmh=pmh,
+                    pml=pml,
+                )
+                logger.info(f"[BUY SIGNAL] Queued {symbol} @ ${alert_price:.4f} | RVOL: {alert_rvol:.1f} | Type: {alert_type} | PDH: {pdh} | PDL: {pdl}")
+            except Exception as e:
+                logger.error(f"[BUY SIGNAL] Failed to queue {symbol}: {e}")
     else:
         logger.info(
             f"[ALERT SKIPPED] {symbol} | Best score: {best_alert['score']} (threshold: 20)"
@@ -2227,7 +2393,9 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
         pending_alerts[symbol].append({
             'type': 'perfect_setup',
             'score': score,
-            'message': alert_text
+            'message': alert_text,
+            'price': alert_price,
+            'rvol': rvol
         })
 
         # Send the best alert for this symbol
@@ -2582,7 +2750,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 pending_alerts[symbol].append({
                     'type': 'warming_up',
                     'score': score,
-                    'message': alert_text
+                    'message': alert_text,
+                    'price': alert_price,
+                    'rvol': volume_wu / avg_vol_5 if avg_vol_5 > 0 else 1.0
                 })
 
                 # Send the best alert for this symbol
@@ -2708,7 +2878,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 pending_alerts[symbol].append({
                     'type': 'runner',
                     'score': score,
-                    'message': alert_text
+                    'message': alert_text,
+                    'price': alert_price,
+                    'rvol': rvol_rn if 'rvol_rn' in dir() else 2.0
                 })
 
                 # Send the best alert for this symbol
@@ -2901,7 +3073,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     pending_alerts[symbol].append({
                         'type': 'vwap_reclaim',
                         'score': score,
-                        'message': alert_text
+                        'message': alert_text,
+                        'price': alert_price,
+                        'rvol': rvol if 'rvol' in dir() else 2.0
                     })
                     
                     # Send the best alert for this symbol
@@ -2989,7 +3163,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             pending_alerts[symbol].append({
                 'type': 'volume_spike',
                 'score': score,
-                'message': alert_text
+                'message': alert_text,
+                'price': alert_price,
+                'rvol': spike_data.get('rvol', 1.0)
             })
 
             # Send the best alert for this symbol
@@ -3237,7 +3413,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 pending_alerts[symbol].append({
                     'type': 'ema_stack',
                     'score': score,
-                    'message': alert_text
+                    'message': alert_text,
+                    'price': alert_price,
+                    'rvol': last_volume / 100000 if last_volume > 100000 else 1.0
                 })
 
                 # Send the best alert for this symbol
@@ -4718,7 +4896,7 @@ async def nasdaq_halt_monitor():
 
 
 async def outcome_tracking_loop():
-    """Background task for tracking alert outcomes (ML training disabled)"""
+    """Background task for tracking alert outcomes and nightly ML retraining"""
     # Ensure data directory exists for persistent storage
     os.makedirs(DATA_DIR, exist_ok=True)
     
@@ -4727,12 +4905,11 @@ async def outcome_tracking_loop():
             # Check alert outcomes every 5 minutes
             await check_alert_outcomes()
 
-            # 🔧 ML TRAINING DISABLED: Only collecting data for future use
-            # To enable: uncomment the retrain_model_if_needed() call below
-            # ny_time = datetime.now(timezone.utc).astimezone(
-            #     pytz.timezone("America/New_York"))
-            # if ny_time.hour == 20 and ny_time.minute < 5:  # 8:00-8:05 PM ET
-            #     await retrain_model_if_needed()
+            # 🚀 ML TRAINING ENABLED: Retrain model nightly at 8:00-8:05 PM ET
+            ny_time = datetime.now(timezone.utc).astimezone(
+                pytz.timezone("America/New_York"))
+            if ny_time.hour == 20 and ny_time.minute < 5:  # 8:00-8:05 PM ET
+                await retrain_model_if_needed()
 
         except Exception as e:
             logger.error(f"[OUTCOME TRACKING] Error in outcome tracking loop: {e}")
@@ -4851,6 +5028,10 @@ async def main():
     http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     logger.info("[HTTP SESSION] Created reusable HTTP session for better performance")
     
+    # 🚀 Initialize Trade Signal Integration (Buy signals with TP levels)
+    trade_signal_integration = await init_trade_signals()
+    logger.info("[TRADE SIGNALS] ✅ Buy signal integration initialized")
+    
     logger.info("Main event loop running. Press Ctrl+C to exit.")
     ingest_task = asyncio.create_task(ingest_polygon_events())
     # Enabling just the scheduled alerts (9:24:55am and 8:01pm)
@@ -4915,6 +5096,10 @@ async def main():
         #     await rest_backup_task
         # except asyncio.CancelledError:
         #     pass
+        
+        # 🚀 Shutdown Trade Signal Integration
+        await shutdown_trade_signals()
+        logger.info("[TRADE SIGNALS] Trade signal integration stopped")
         
         # 🚀 PERFORMANCE: Close reusable HTTP session
         if http_session:
