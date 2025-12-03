@@ -738,13 +738,13 @@ async def perform_connection_backfill():
                     if response.status == 200:
                         data = await response.json()
                         if data.get('status') == 'OK' and data.get('results'):
-                            candles = data['results']
+                            result_candles = data['results']
                             logger.info(
-                                f"[BACKFILL] {symbol}: Processing {len(candles)} missed candles"
+                                f"[BACKFILL] {symbol}: Processing {len(result_candles)} missed candles"
                             )
 
                             # Process each missed candle through alert logic
-                            for candle_data in candles:
+                            for candle_data in result_candles:
                                 candle_time = polygon_time_to_utc(
                                     candle_data['t'])
                                 
