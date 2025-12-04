@@ -2122,15 +2122,15 @@ def get_ny_date():
 
 # 🚀 FRESHNESS THRESHOLDS: Tiered by alert type
 # Volume Spike: STRICT (5s) - needs real-time confirmation for entry signals
-# EMA Stack / Warming Up: RELAXED (30s) - pattern-based alerts, catches low-volume runners like FLYE
+# EMA Stack / Warming Up: RELAXED (180s) - pattern-based alerts, catches low-volume runners
 # Perfect Setup / VWAP Reclaim / Runner: MODERATE (15s) - balance between speed and accuracy
 MAX_PRICE_AGE_SECONDS = 5  # Default: STRICT (backwards compatibility)
 MAX_PRICE_AGE_VOLUME_SPIKE = 5  # Volume spike needs fresh confirmation
-MAX_PRICE_AGE_EMA_STACK = 30  # EMA stack is pattern-based, can tolerate older trades
-MAX_PRICE_AGE_WARMING_UP = 30  # Warming up is also pattern-based
-MAX_PRICE_AGE_PERFECT_SETUP = 15  # Strong setup, moderate tolerance
-MAX_PRICE_AGE_VWAP_RECLAIM = 15  # VWAP reclaim needs reasonably fresh data
-MAX_PRICE_AGE_RUNNER = 15  # Runner needs reasonably fresh data
+MAX_PRICE_AGE_EMA_STACK = 180  # 🚨 INCREASED from 30s to 180s for low-volume stocks (PMCB-style)
+MAX_PRICE_AGE_WARMING_UP = 180  # 🚨 INCREASED from 30s to 180s for low-volume stocks
+MAX_PRICE_AGE_PERFECT_SETUP = 60  # 🚨 INCREASED from 15s to 60s for pattern-based alerts
+MAX_PRICE_AGE_VWAP_RECLAIM = 60  # 🚨 INCREASED from 15s to 60s for pattern-based alerts
+MAX_PRICE_AGE_RUNNER = 60  # 🚨 INCREASED from 15s to 60s for pattern-based alerts
 MAX_TRADE_AGE_SECONDS = 15  # Tolerates network jitter/lag - prevents missing alerts due to delayed trades
 
 
