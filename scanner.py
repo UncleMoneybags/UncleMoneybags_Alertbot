@@ -2136,10 +2136,23 @@ MAX_TRADE_AGE_SECONDS = 15  # Tolerates network jitter/lag - prevents missing al
 
 def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_PRICE_AGE_SECONDS):
     """Get freshest available price - compares real-time trade vs candle close timestamps
-    Returns None if all data is stale (>max_age_seconds) to prevent false alerts"""
+    Returns None if all data is stale (>max_age_seconds) to prevent false alerts
+    
+    CRITICAL: Always validates fallback (candle close) against last_trade_price to detect 
+    corrupted candles. If candle close deviates >10% from last trade, uses last trade instead.
+    """
     trade_price = last_trade_price.get(symbol)
     trade_time = last_trade_time.get(symbol)
     now = datetime.now(timezone.utc)
+    
+    # 🚨 OUTLIER DETECTION: Validate fallback (candle close) against last trade price
+    # If candle close deviates >10% from last trade, it's likely corrupted
+    validated_fallback = fallback
+    if trade_price is not None and fallback is not None and trade_price > 0:
+        deviation = abs(fallback - trade_price) / trade_price
+        if deviation > 0.10:  # >10% deviation = corrupted candle
+            logger.warning(f"[PRICE OUTLIER] {symbol} - Candle close ${fallback:.4f} deviates {deviation*100:.1f}% from last trade ${trade_price:.4f} - using last trade")
+            validated_fallback = trade_price
     
     # If we have a real-time trade price with timestamp
     if trade_price is not None and trade_time is not None:
@@ -2152,26 +2165,31 @@ def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_
             if trade_age < fallback_age and trade_age < max_age_seconds:
                 return trade_price
             elif fallback_age < max_age_seconds:
-                return fallback
-            # Both stale - return None to block alerts
+                return validated_fallback  # Use validated fallback
+            # Both stale - return trade price if within relaxed window (30s)
+            if trade_age < 30:
+                logger.info(f"[PRICE FALLBACK] {symbol} - Both prices stale, using trade ${trade_price:.4f} (age {trade_age:.1f}s)")
+                return trade_price
             return None
         
         # No fallback timestamp - use trade if fresh enough
         if trade_age < max_age_seconds:
             return trade_price
-        # Trade is stale and no fallback timestamp - return None
+        # Trade is stale but still better than nothing - use if within 30s
+        if trade_age < 30:
+            return trade_price
         return None
     
-    # No valid real-time data - use fallback only if we have its timestamp and it's fresh
+    # No valid real-time data - use validated fallback only if we have its timestamp and it's fresh
     if fallback_time is not None:
         fallback_age = (now - fallback_time).total_seconds()
         if fallback_age < max_age_seconds:
-            return fallback
+            return validated_fallback
         # Fallback is stale - return None
         return None
     
-    # No timestamp info - return fallback as last resort (for compatibility)
-    return fallback
+    # No timestamp info - return validated fallback as last resort (for compatibility)
+    return validated_fallback
 
 
 def validate_price_above_vwap_strict(symbol, vwap_value, alert_type, max_age_seconds=MAX_PRICE_AGE_SECONDS):
@@ -2370,7 +2388,9 @@ async def alert_perfect_setup(symbol, closes, volumes, highs, lows,
         candle_time_ps = candles_seq[-1]['start_time'] + timedelta(minutes=1)
         alert_price = get_display_price(symbol, last_close, candle_time_ps)
         if alert_price is None:
-            alert_price = last_close  # Fallback to candle close
+            # 🚨 CRITICAL FIX: Use last_trade_price (accurate) instead of candle close (may be corrupted)
+            alert_price = last_trade_price.get(symbol) or last_close
+            logger.warning(f"[PRICE FALLBACK] {symbol} Perfect Setup - Using last_trade=${alert_price:.4f} instead of stale data")
         alert_text = (
             f"🚨 <b>PERFECT SETUP</b> 🚨\n"
             f"<b>{escape_html(symbol)}</b> | ${fmt_price(alert_price)} | Vol: {int(last_volume/1000)}K | RVOL: {rvol:.1f}\n\n"
@@ -2722,7 +2742,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 candle_time_wu = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
                 alert_price = get_display_price(symbol, close_wu, candle_time_wu)
                 if alert_price is None:
-                    alert_price = close_wu  # Fallback to candle close
+                    # 🚨 CRITICAL FIX: Use last_trade_price (accurate) instead of candle close (may be corrupted)
+                    alert_price = last_trade_price.get(symbol) or close_wu
+                    logger.warning(f"[PRICE FALLBACK] {symbol} Warming Up - Using last_trade=${alert_price:.4f} instead of stale data")
                 log_event(
                     "warming_up",
                     symbol,
@@ -2857,7 +2879,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 candle_time_rn = last_6[-1]['start_time'] + timedelta(minutes=1)
                 alert_price = get_display_price(symbol, close_rn, candle_time_rn)
                 if alert_price is None:
-                    alert_price = close_rn  # Fallback to candle close
+                    # 🚨 CRITICAL FIX: Use last_trade_price (accurate) instead of candle close (may be corrupted)
+                    alert_price = last_trade_price.get(symbol) or close_rn
+                    logger.warning(f"[PRICE FALLBACK] {symbol} Runner - Using last_trade=${alert_price:.4f} instead of stale data")
                 log_event(
                     "runner", symbol, alert_price,
                     volume_rn, event_time, {
@@ -3152,7 +3176,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             candle_time_vs = list(candles_seq)[-1]['start_time'] + timedelta(minutes=1)
             alert_price = get_display_price(symbol, close, candle_time_vs)
             if alert_price is None:
-                alert_price = close  # Fallback to candle close
+                # 🚨 CRITICAL FIX: Use last_trade_price (accurate) instead of candle close (may be corrupted)
+                alert_price = last_trade_price.get(symbol) or close
+                logger.warning(f"[PRICE FALLBACK] {symbol} Volume Spike - Using last_trade=${alert_price:.4f} instead of stale data")
             price_str = fmt_price(alert_price)
             rvol_str = f"{spike_data['rvol']:.1f}"
 
@@ -3381,7 +3407,9 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 candle_time_ema = last_candle['start_time'] + timedelta(minutes=1)
                 alert_price = get_display_price(symbol, candle_close, candle_time_ema)
                 if alert_price is None:
-                    alert_price = candle_close  # Fallback to candle close
+                    # 🚨 CRITICAL FIX: Use last_trade_price (accurate) instead of candle close (may be corrupted)
+                    alert_price = last_trade_price.get(symbol) or candle_close
+                    logger.warning(f"[PRICE FALLBACK] {symbol} EMA Stack - Using last_trade=${alert_price:.4f} instead of stale data")
                 log_event(
                     "ema_stack", symbol,
                     alert_price, last_volume,
