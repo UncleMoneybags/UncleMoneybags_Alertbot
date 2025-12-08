@@ -120,6 +120,13 @@ entry_price = defaultdict(lambda: None)
 
 float_cache = {}
 float_cache_none_retry = {}
+
+# 🚨 MANUAL FLOAT OVERRIDES - Correct bad yfinance data
+# Add tickers here with their CORRECT float in shares (not millions)
+# Example: "WVE": 10_000_000 means 10M float
+FLOAT_OVERRIDES = {
+    # "WVE": 10_000_000,  # Uncomment and set correct value if yfinance is wrong
+}
 FLOAT_CACHE_NONE_RETRY_MIN = 10  # minutes
 FLOAT_CACHE_SAVE_DEBOUNCE_SECONDS = 300  # Only save every 5 minutes to reduce disk I/O
 _last_float_cache_save = datetime.min.replace(tzinfo=timezone.utc)
@@ -215,6 +222,10 @@ async def get_float_shares(ticker):
     Runs blocking yfinance call in thread pool to prevent event loop stalling.
     Uses debounced cache saving to reduce disk I/O overhead.
     """
+    # 🚨 CHECK MANUAL OVERRIDES FIRST - bypass yfinance for known bad data
+    if ticker in FLOAT_OVERRIDES:
+        return FLOAT_OVERRIDES[ticker]
+    
     now = datetime.now(timezone.utc)
     # Check positive/real float first
     if ticker in float_cache and float_cache[ticker] is not None:
@@ -1295,7 +1306,7 @@ AFTERHOURS_MIN_VOLUME = 100000  # STRICT: Require 100k+ volume for after-hours a
 # 🚀 MEMORY MANAGEMENT: LRU tracking for symbol eviction
 symbol_last_access = {}  # symbol -> last access timestamp
 
-MIN_FLOAT_SHARES = 500_000
+MIN_FLOAT_SHARES = 300_000  # 🚨 LOWERED from 500K to 300K to catch micro-floats like TWG
 MAX_FLOAT_SHARES = 20_000_000  # UPDATED: Increased from 10M to 20M
 
 # 🚨 ADAPTIVE VOLUME THRESHOLDS FOR MICRO-FLOAT STOCKS
