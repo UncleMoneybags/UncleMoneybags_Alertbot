@@ -2760,15 +2760,23 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             if not skip_warming_up:
                 # Verify real-time price is ACTUALLY above VWAP (not just from criteria check)
                 # 🚨 PRE-MARKET RELAXATION: Allow price >= VWAP (not just >) to catch moves like GURE
-                session_type_wu = get_session_type(datetime.now(timezone.utc))
-                if session_type_wu == "premarket":
-                    if real_time_price_wu < vwap_wu:
-                        logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price ${real_time_price_wu:.2f} below VWAP ${vwap_wu:.2f}")
-                        skip_warming_up = True
+                # 🚨 SAFETY: Guard against None values to prevent crashes
+                if vwap_wu is None:
+                    logger.info(f"[WARMING UP BLOCKED] {symbol} - VWAP is None, cannot validate")
+                    skip_warming_up = True
+                elif real_time_price_wu is None:
+                    logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price is None")
+                    skip_warming_up = True
                 else:
-                    if real_time_price_wu <= vwap_wu:
-                        logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price ${real_time_price_wu:.2f} NOT above VWAP ${vwap_wu:.2f}")
-                        skip_warming_up = True
+                    session_type_wu = get_session_type(datetime.now(timezone.utc))
+                    if session_type_wu == "premarket":
+                        if real_time_price_wu < vwap_wu:
+                            logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price ${real_time_price_wu:.2f} below VWAP ${vwap_wu:.2f}")
+                            skip_warming_up = True
+                    else:
+                        if real_time_price_wu <= vwap_wu:
+                            logger.info(f"[WARMING UP BLOCKED] {symbol} - Real-time price ${real_time_price_wu:.2f} NOT above VWAP ${vwap_wu:.2f}")
+                            skip_warming_up = True
             
             # Only send warming up alert if not skipped
             if not skip_warming_up:
@@ -3087,12 +3095,13 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             )
 
             # DEBUG: Show VWAP reclaim detection logic (using VWAP baseline BEFORE current candle)
+            vwap_before_str = f"{vwap_before:.2f}" if vwap_before is not None else "N/A"
             if symbol in ["OCTO", "GRND", "EQS", "PALI"]:
                 logger.info(
-                    f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < vwap_before={vwap_before:.2f} = {prev_below_vwap} | curr_close={curr_close:.2f} > vwap_before={vwap_before:.2f} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
+                    f"[💎 VWAP RECLAIM DEBUG] {symbol} | is_true_crossover={is_true_crossover} | prev_close={prev_close:.2f} < vwap_before={vwap_before_str} = {prev_below_vwap} | curr_close={curr_close:.2f} > vwap_before={vwap_before_str} = {curr_above_vwap} | volume={curr_candle['volume']} | rvol={rvol:.2f}"
                 )
             logger.info(
-                f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap_before={vwap_before:.2f} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap_before={vwap_before:.2f} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
+                f"[VWAP RECLAIM] {symbol} | Prev: close={prev_close:.2f} vwap_before={vwap_before_str} below={prev_below_vwap} | Curr: close={curr_close:.2f} vwap_before={vwap_before_str} above={curr_above_vwap} | CROSSOVER={is_true_crossover}"
             )
             # Use stored EMAs
             emas = get_stored_emas(symbol, [5, 8, 13])
@@ -3435,6 +3444,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                 
                 # Verify real-time price is ACTUALLY above VWAP (not just from get_display_price fallback)
                 # 🚨 PRE-MARKET RELAXATION: Allow price >= VWAP (not just >) to catch moves like GURE
+                # 🚨 SAFETY: Guard against None values to prevent crashes
+                if vwap_value is None:
+                    logger.info(f"[EMA STACK BLOCKED] {symbol} - VWAP is None, cannot validate")
+                    return
                 if session_type == "premarket":
                     if real_time_price_ema < vwap_value:
                         logger.info(f"[EMA STACK BLOCKED] {symbol} - Real-time price ${real_time_price_ema:.2f} below VWAP ${vwap_value:.2f}")
@@ -3462,7 +3475,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                         "real_time_price": last_trade_price.get(symbol)
                     })
                 price_str = fmt_price(alert_price)
-                ema_display = f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_value:.2f}"
+                vwap_display = f"{vwap_value:.2f}" if vwap_value is not None else "N/A"
+                ema_display = f"EMA5: {ema5:.2f}, EMA8: {ema8:.2f}, EMA13: {ema13:.2f}, VWAP: {vwap_display}"
 
                 alert_text = (
                     f"⚡️ <b>{escape_html(symbol)}</b> EMA Stack [{session_type}]\n"
