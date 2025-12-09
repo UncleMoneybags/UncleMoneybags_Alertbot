@@ -1100,17 +1100,28 @@ def vwap_candles_numpy(candles):
         return None  # Return None on error so alerts are blocked until valid VWAP
 
 
-def get_valid_vwap(symbol):
+def get_valid_vwap(symbol, allow_fallback=False):
     """🚨 CENTRALIZED VWAP GUARD: Returns valid VWAP or None if insufficient data
     
     Pre-market (4am-9:30am ET): Relaxed to 1 candle minimum
     Regular session: Requires 3 candles minimum
+    
+    NEW: If allow_fallback=True, returns estimated VWAP from regular candles when vwap_candles is empty
     """
     # 🚨 PRE-MARKET RELAXATION: Allow VWAP with just 1 candle to catch early movers like GURE
     session_type = get_session_type(datetime.now(timezone.utc))
     min_candles = 1 if session_type == "premarket" else 3
     
     if not vwap_candles[symbol] or len(vwap_candles[symbol]) < min_candles:
+        # 🚨 FIX: If vwap_candles is empty but regular candles exist, estimate VWAP from candles
+        # This prevents missing alerts on stocks like OCG where vwap_candles fails to populate
+        if allow_fallback and symbol in candles and len(candles[symbol]) >= min_candles:
+            logger.warning(
+                f"[VWAP FALLBACK] {symbol} - Using regular candles for VWAP estimation (vwap_candles empty but candles has {len(candles[symbol])})"
+            )
+            # Use regular candles for VWAP calculation
+            return vwap_candles_numpy(list(candles[symbol])[-20:])  # Last 20 candles max
+        
         logger.info(
             f"[VWAP GUARD] {symbol} - Insufficient VWAP data ({len(vwap_candles[symbol]) if symbol in vwap_candles else 0} candles, need {min_candles} for {session_type})"
         )
@@ -1883,8 +1894,8 @@ async def send_best_alert(symbol):
         
         if alert_price and alert_price > 0:
             try:
-                # Get VWAP for this symbol
-                vwap_value = get_valid_vwap(symbol)
+                # Get VWAP for this symbol (use fallback when vwap_candles is empty)
+                vwap_value = get_valid_vwap(symbol, allow_fallback=True)
                 
                 # Get EMAs (5, 8, 13) - Note: EMA21 not stored, use EMA13 as closest
                 emas = get_stored_emas(symbol, periods=[5, 8, 13])
@@ -2645,7 +2656,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         lows = [c['low'] for c in candles_list[-30:]]
         volumes = [c['volume'] for c in candles_list[-30:]]
         # 🚨 CRITICAL FIX: Use centralized VWAP guard for perfect setup
-        vwap_value = get_valid_vwap(symbol)
+        vwap_value = get_valid_vwap(symbol, allow_fallback=True)  # 🚨 FIX: Use fallback when vwap_candles is empty
         if vwap_value is None:
             logger.info(
                 f"[VWAP GUARD] {symbol} - Skipping perfect setup - insufficient VWAP data"
@@ -2675,7 +2686,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         current_price_wu = last_trade_price.get(symbol)  # Real-time market price
         price_move_wu = (close_wu - open_wu) / open_wu if open_wu > 0 else 0
         # 🚨 CRITICAL FIX: Use centralized VWAP guard for warming up alerts
-        vwap_wu = get_valid_vwap(symbol)
+        vwap_wu = get_valid_vwap(symbol, allow_fallback=True)  # 🚨 FIX: Use fallback when vwap_candles is empty
         if vwap_wu is None:
             logger.info(
                 f"[VWAP GUARD] {symbol} - Skipping warming up - insufficient VWAP data"
@@ -2909,8 +2920,8 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             and  # CONFIRMED: 5% move - established momentum!
             current_price_rn is not None and current_price_rn >= 0.10
             and  # Use real-time price
-            current_price_rn is not None and current_price_rn > vwap_rn
-            and  # Above VWAP
+            current_price_rn is not None and vwap_rn is not None and current_price_rn > vwap_rn
+            and  # 🚨 FIX: Added vwap_rn None check to prevent TypeError crash
             price_rising_trend
             and  # At least 2 out of 3 candles rising
             volume_rising_trend
@@ -3344,7 +3355,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
             ema13 = emas['ema13']
             ema200 = emas.get('ema200') if use_200_ema else None
             # 🚨 CRITICAL FIX: Use centralized VWAP guard for EMA stack
-            vwap_value = get_valid_vwap(symbol)
+            vwap_value = get_valid_vwap(symbol, allow_fallback=True)  # 🚨 FIX: Use fallback when vwap_candles is empty
             if vwap_value is None:
                 logger.info(
                     f"[VWAP GUARD] {symbol} - Blocking EMA stack alert - insufficient VWAP data"
