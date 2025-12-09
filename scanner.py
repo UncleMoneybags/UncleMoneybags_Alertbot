@@ -2697,9 +2697,21 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         min_vol_wu = get_min_volume_for_float(float_shares)  # 🚨 Adaptive: 7.5k for micro-floats, 25k for regular
         min_dollar_volume_wu = get_min_dollar_volume_for_price(current_price_wu if current_price_wu else close_wu)
         
-        # Session-aware thresholds (keep 2% for all - no garbage)
+        # Session-aware thresholds with PENNY STOCK FILTER
         session_type_warm = get_session_type(datetime.now(timezone.utc))
-        min_price_move_wu = 0.02  # Keep 2% for quality alerts
+        
+        # 🚨 PENNY STOCK FILTER: Sub-$1 stocks need stricter thresholds to avoid micro-movement noise
+        # At $0.41, a 2% move is only $0.008 (basically noise) - require 4% AND $0.03 minimum
+        current_check_price = current_price_wu if current_price_wu else close_wu
+        if current_check_price < 1.00:
+            min_price_move_wu = 0.04  # 4% for sub-$1 stocks (stricter)
+            min_absolute_move = 0.03  # $0.03 minimum absolute change
+            absolute_move = abs(close_wu - open_wu)
+            if absolute_move < min_absolute_move:
+                logger.info(f"[WARMING UP BLOCKED] {symbol} - Sub-$1 stock: ${absolute_move:.3f} move < ${min_absolute_move} minimum")
+                skip_warming_up = True
+        else:
+            min_price_move_wu = 0.02  # Keep 2% for stocks >= $1
         
         # 🚨 PRE-MARKET RELAXATION: Allow price >= VWAP (not just >) to catch moves like GURE
         if session_type_warm == "premarket":
@@ -2732,7 +2744,7 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         logger.info(
             f"[WARMING UP DEBUG] {symbol} | "
             f"Volume={volume_wu} (avg5={avg_vol_5:.0f}, req={1.5 * avg_vol_5:.0f}), "
-            f"PriceMove={price_move_wu*100:.2f}% (req=2%+), "
+            f"PriceMove={price_move_wu*100:.2f}% (req={min_price_move_wu*100:.0f}%+), "
             f"Green={has_green_candle}, Rising={rising_from_prev}, Momentum={early_momentum}, "
             f"Real-time=${current_price_wu or 0:.3f}, VWAP={vwap_str_wu}, "
             f"DollarVol=${dollar_volume_wu:.0f}")
