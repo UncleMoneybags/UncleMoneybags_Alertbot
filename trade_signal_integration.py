@@ -14,11 +14,10 @@ Two integration methods:
 import os
 import asyncio
 import aiohttp
-import json
 import logging
-from datetime import datetime
 from typing import Optional, Dict, Any, List
 from collections import deque
+from urllib.parse import quote_plus
 
 from trade_signal_manager import TradeSignalManager, OpenPosition
 
@@ -39,6 +38,9 @@ PRICE_CHECK_INTERVAL = 5
 # Polygon API for live prices
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY')
 
+# Module-level init lock to avoid concurrent init/start races
+_init_lock = asyncio.Lock()
+
 
 # =============================================================================
 # Alert Queue - Scanner deposits alerts here
@@ -48,6 +50,9 @@ class AlertQueue:
     """
     Thread-safe queue for scanner to deposit alerts.
     The integration layer picks them up and processes them.
+
+    Note: __len__ is not async-safe; use the async length() method when an
+    accurate, race-free count is required.
     """
     
     def __init__(self, maxlen: int = 1000):
@@ -66,7 +71,13 @@ class AlertQueue:
             self._queue.clear()
             return alerts
     
+    async def length(self) -> int:
+        """Async-safe length"""
+        async with self._lock:
+            return len(self._queue)
+    
     def __len__(self):
+        # Best-effort, may race with concurrent push/pop_all.
         return len(self._queue)
 
 
@@ -84,39 +95,89 @@ class PriceFeed:
     def __init__(self, http_session: aiohttp.ClientSession):
         self.session = http_session
         self.api_key = POLYGON_API_KEY
+        if not self.api_key:
+            logger.warning("[PriceFeed] POLYGON_API_KEY is not set; live price fetching will be disabled.")
+        # Conservative defaults for retries
+        self._max_retries = 3
+        self._backoff_base = 0.5  # seconds
     
     async def get_price(self, symbol: str) -> Optional[float]:
-        """Get current price for a symbol from Polygon"""
-        if not self.api_key:
+        """Get current price for a symbol from Polygon with retry/backoff"""
+        if not self.api_key or not self.session:
             return None
         
-        url = f"https://api.polygon.io/v2/last/trade/{symbol}"
+        # Be safe with symbol formatting for URL path
+        symbol_safe = quote_plus(symbol.strip().upper())
+        url = f"https://api.polygon.io/v2/last/trade/{symbol_safe}"
         params = {"apiKey": self.api_key}
         
-        try:
-            async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("status") == "OK" and data.get("results"):
-                        return data["results"].get("p")  # price
-        except Exception as e:
-            logger.debug(f"Price fetch error for {symbol}: {e}")
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with self.session.get(url, params=params, timeout=timeout) as resp:
+                    status = resp.status
+                    if status == 200:
+                        # Parse robustly and cast to float when possible
+                        data = await resp.json()
+                        results = data.get("results") or {}
+                        p = None
+                        if isinstance(results, dict):
+                            p = results.get("p")
+                        # Some responses might include a top-level 'price' or other keys
+                        if p is None:
+                            p = data.get("price") or data.get("last") or data.get("last_trade_price")
+                        if p is None:
+                            logger.debug(f"[PriceFeed] No price found for {symbol} in response: {data}")
+                            return None
+                        try:
+                            price = float(p)
+                            if price <= 0:
+                                logger.debug(f"[PriceFeed] Non-positive price for {symbol}: {price}")
+                                return None
+                            return price
+                        except (TypeError, ValueError):
+                            logger.debug(f"[PriceFeed] Unable to cast price to float for {symbol}: {p}")
+                            return None
+                    elif status in (429, 500, 502, 503, 504):
+                        # Retryable server/rate-limit errors
+                        text = await resp.text()
+                        logger.debug(f"[PriceFeed] Retryable response {status} for {symbol}: {text}")
+                        if attempt < self._max_retries:
+                            await asyncio.sleep(self._backoff_base * (2 ** (attempt - 1)))
+                            continue
+                        return None
+                    else:
+                        # Non-retryable error
+                        text = await resp.text()
+                        logger.debug(f"[PriceFeed] Non-200 response for {symbol}: {status} - {text}")
+                        return None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"[PriceFeed] Exception fetching price for {symbol} (attempt {attempt}): {e}")
+                if attempt < self._max_retries:
+                    await asyncio.sleep(self._backoff_base * (2 ** (attempt - 1)))
+                    continue
+                return None
         
         return None
     
     async def get_prices_batch(self, symbols: List[str]) -> Dict[str, float]:
-        """Get prices for multiple symbols"""
-        results = {}
+        """Get prices for multiple symbols (limited concurrency, chunked)"""
+        results: Dict[str, float] = {}
         
-        # Fetch in parallel (max 10 at a time to avoid rate limits)
-        for i in range(0, len(symbols), 10):
-            batch = symbols[i:i+10]
+        # Process in small batches to limit concurrent requests / rate limits
+        batch_size = 10
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
             tasks = [self.get_price(sym) for sym in batch]
             prices = await asyncio.gather(*tasks, return_exceptions=True)
-            
             for sym, price in zip(batch, prices):
-                if isinstance(price, float) and price > 0:
-                    results[sym] = price
+                if isinstance(price, (int, float)) and price > 0:
+                    results[sym] = float(price)
+                else:
+                    # Keep debug log for missing prices to aid diagnostics
+                    logger.debug(f"[PriceFeed] No valid price for {sym}: {price}")
         
         return results
 
@@ -139,34 +200,53 @@ class TradeSignalIntegration:
         self.http_session: Optional[aiohttp.ClientSession] = None
         self._running = False
         self._tasks: List[asyncio.Task] = []
+        self._start_lock = asyncio.Lock()
     
     async def start(self):
         """Initialize and start the integration"""
-        logger.info("[Integration] Starting trade signal integration...")
-        
-        # Create HTTP session
-        self.http_session = aiohttp.ClientSession()
-        
-        # Initialize trade manager
-        self.trade_manager = TradeSignalManager(
-            telegram_token=TELEGRAM_BOT_TOKEN,
-            telegram_chat_id=TELEGRAM_CHAT_ID,
-            discord_webhook_url=DISCORD_WEBHOOK_URL,
-            http_session=self.http_session,
-            signals_chat_id=TELEGRAM_SIGNALS_CHAT_ID
-        )
-        await self.trade_manager.initialize()
-        
-        # Initialize price feed
-        self.price_feed = PriceFeed(self.http_session)
-        
-        self._running = True
-        
-        # Start background tasks
-        self._tasks.append(asyncio.create_task(self._alert_processor_loop()))
-        self._tasks.append(asyncio.create_task(self._price_monitor_loop()))
-        
-        logger.info("[Integration] Trade signal integration started")
+        async with self._start_lock:
+            if self._running:
+                logger.debug("[Integration] start() called but integration already running")
+                return
+            
+            logger.info("[Integration] Starting trade signal integration...")
+            
+            # Create HTTP session with sensible defaults (connection limit + timeouts)
+            connector = aiohttp.TCPConnector(limit=30)
+            timeout = aiohttp.ClientTimeout(total=10)
+            self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+            
+            try:
+                # Initialize trade manager
+                self.trade_manager = TradeSignalManager(
+                    telegram_token=TELEGRAM_BOT_TOKEN,
+                    telegram_chat_id=TELEGRAM_CHAT_ID,
+                    discord_webhook_url=DISCORD_WEBHOOK_URL,
+                    http_session=self.http_session,
+                    signals_chat_id=TELEGRAM_SIGNALS_CHAT_ID
+                )
+                await self.trade_manager.initialize()
+                
+                # Initialize price feed
+                self.price_feed = PriceFeed(self.http_session)
+                
+                self._running = True
+                
+                # Start background tasks
+                self._tasks.append(asyncio.create_task(self._alert_processor_loop()))
+                self._tasks.append(asyncio.create_task(self._price_monitor_loop()))
+                
+                logger.info("[Integration] Trade signal integration started")
+            except Exception:
+                # Ensure we close the session on failure to avoid resource leaks
+                if self.http_session:
+                    try:
+                        await self.http_session.close()
+                    except Exception:
+                        logger.exception("[Integration] Error closing HTTP session during start() failure")
+                    self.http_session = None
+                logger.exception("[Integration] Failed to start integration")
+                raise
     
     async def stop(self):
         """Stop the integration"""
@@ -179,13 +259,23 @@ class TradeSignalIntegration:
         
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
         
-        # Cleanup
+        # Cleanup trade manager
         if self.trade_manager:
-            await self.trade_manager.cleanup()
+            try:
+                await self.trade_manager.cleanup()
+            except Exception:
+                logger.exception("[Integration] Error while cleaning up trade manager")
+            self.trade_manager = None
         
+        # Close HTTP session
         if self.http_session:
-            await self.http_session.close()
+            try:
+                await self.http_session.close()
+            except Exception:
+                logger.exception("[Integration] Error closing HTTP session")
+            self.http_session = None
         
         logger.info("[Integration] Trade signal integration stopped")
     
@@ -203,7 +293,7 @@ class TradeSignalIntegration:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[Integration] Alert processor error: {e}")
+                logger.error(f"[Integration] Alert processor error: {e}", exc_info=True)
                 await asyncio.sleep(1)
     
     async def _process_alert(self, alert: Dict[str, Any]):
@@ -228,8 +318,9 @@ class TradeSignalIntegration:
             session_high = alert.get('session_high')
             opening_range_high = alert.get('opening_range_high')
             
-            if not symbol or not price:
-                logger.warning(f"[Integration] Invalid alert: {alert}")
+            # Validate inputs (avoid rejecting valid price 0.0)
+            if not symbol or price is None:
+                logger.warning(f"[Integration] Invalid alert (missing symbol or price): {alert}")
                 return
             
             if not self.trade_manager:
@@ -260,7 +351,7 @@ class TradeSignalIntegration:
                 logger.info(f"[Integration] Created position for {symbol}")
             
         except Exception as e:
-            logger.error(f"[Integration] Error processing alert: {e}")
+            logger.error(f"[Integration] Error processing alert: {e}", exc_info=True)
     
     async def _price_monitor_loop(self):
         """Monitor prices for open positions"""
@@ -289,7 +380,7 @@ class TradeSignalIntegration:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[Integration] Price monitor error: {e}")
+                logger.error(f"[Integration] Price monitor error: {e}", exc_info=True)
                 await asyncio.sleep(5)
     
     # =========================================================================
@@ -309,14 +400,6 @@ class TradeSignalIntegration:
         """
         Direct method to process a scanner alert.
         Call this from your scanner wrapper instead of using the queue.
-        
-        Example:
-            position = await integration.on_scanner_alert(
-                symbol="MULN",
-                price=2.50,
-                rvol=4.5,
-                alert_type="Volume Spike"
-            )
         """
         if not self.trade_manager:
             logger.error("[Integration] Trade manager not initialized")
@@ -332,23 +415,23 @@ class TradeSignalIntegration:
             recent_candles=recent_candles
         )
     
-    async def on_price_update(self, symbol: str, price: float) -> List:
+    async def on_price_update(self, symbol: str, price: float) -> List[Any]:
         """
         Direct method to update price for a position (tick-level).
         Call this when you receive a trade tick in your scanner.
-        Returns list of ClosedTrade objects if any positions were closed.
+        Returns list of ClosedTrade-like objects if any positions were closed.
         """
         if not self.trade_manager:
             return []
         
         return await self.trade_manager.update_price(symbol, price)
     
-    async def on_bar_update(self, symbol: str, open_p: float, high: float, low: float, close_p: float) -> List:
+    async def on_bar_update(self, symbol: str, open_p: float, high: float, low: float, close_p: float) -> List[Any]:
         """
         Direct method to update price using bar data (OHLC).
         Use this when you receive 1m/5m bars instead of ticks.
         Better detection of intrabar TP/SL hits.
-        Returns list of ClosedTrade objects if any positions were closed.
+        Returns list of ClosedTrade-like objects if any positions were closed.
         """
         if not self.trade_manager:
             return []
@@ -373,9 +456,10 @@ _integration: Optional[TradeSignalIntegration] = None
 async def init_trade_signals() -> TradeSignalIntegration:
     """Initialize the trade signal integration (call once at startup)"""
     global _integration
-    if _integration is None:
-        _integration = TradeSignalIntegration()
-        await _integration.start()
+    async with _init_lock:
+        if _integration is None:
+            _integration = TradeSignalIntegration()
+            await _integration.start()
     return _integration
 
 
@@ -397,19 +481,10 @@ async def queue_alert(
 ):
     """
     Queue an alert for processing.
-    
-    Call this from scanner.py when you send an alert:
-    
+
+    Use this from scanner.py when you send an alert:
         from trade_signal_integration import queue_alert
-        
-        # After sending Telegram/Discord alert:
-        await queue_alert(
-            symbol=symbol,
-            price=price,
-            rvol=rvol,
-            alert_type="Volume Spike",
-            ml_score=score
-        )
+        await queue_alert(symbol=symbol, price=price, rvol=rvol, alert_type="Volume Spike", ml_score=score)
     """
     await alert_queue.push({
         'symbol': symbol,
