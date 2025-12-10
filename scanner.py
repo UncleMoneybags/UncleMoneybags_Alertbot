@@ -46,15 +46,11 @@ def cleanup_resources():
     io_executor = globals().get("io_executor")
     
     try:
-        # SYNC-ONLY: Close HTTP session connector directly (no async/await)
+        # NOTE: http_session.close() and connector.close() are coroutines in aiohttp 3.x+
+        # Cannot await in sync atexit handler. Main cleanup at end of main() handles this.
+        # This handler is for executor shutdown only.
         if http_session:
-            try:
-                # Close connector to release sockets synchronously
-                if hasattr(http_session, "connector") and http_session.connector:
-                    http_session.connector.close()
-                logger.info("[ATEXIT] Closed HTTP session connector (sync)")
-            except Exception as e:
-                logger.debug(f"[ATEXIT] HTTP connector close attempt: {e}")
+            logger.debug("[ATEXIT] HTTP session cleanup skipped (handled by async main)")
         
         # Shutdown executor with wait=True (executor.shutdown is synchronous and safe)
         if io_executor:
@@ -1887,10 +1883,12 @@ async def send_best_alert(symbol):
         )
         
         # 🚀 QUEUE BUY SIGNAL: Send to TradeSignalManager for TP/SL calculation
+        logger.info(f"[BUY SIGNAL DEBUG] Starting queue process for {symbol}")
         alert_price = best_alert.get('price', last_trade_price.get(symbol))
         alert_rvol = best_alert.get('rvol', 1.0)
         alert_type = best_alert.get('type', 'Unknown')
         ml_score = best_alert.get('ml_score', best_alert['score'] / 100.0)
+        logger.info(f"[BUY SIGNAL DEBUG] {symbol} | price={alert_price} | rvol={alert_rvol} | type={alert_type}")
         
         if alert_price and alert_price > 0:
             try:
@@ -1940,7 +1938,9 @@ async def send_best_alert(symbol):
                 )
                 logger.info(f"[BUY SIGNAL] Queued {symbol} @ ${alert_price:.4f} | RVOL: {alert_rvol:.1f} | Type: {alert_type} | PDH: {pdh} | PDL: {pdl}")
             except Exception as e:
-                logger.error(f"[BUY SIGNAL] Failed to queue {symbol}: {e}")
+                logger.error(f"[BUY SIGNAL] Failed to queue {symbol}: {e}", exc_info=True)
+        else:
+            logger.warning(f"[BUY SIGNAL SKIPPED] {symbol} - No valid price (alert_price={alert_price})")
     else:
         logger.info(
             f"[ALERT SKIPPED] {symbol} | Best score: {best_alert['score']} (threshold: 20)"
@@ -5145,8 +5145,25 @@ async def main():
     logger.info("[HTTP SESSION] Created reusable HTTP session for better performance")
     
     # 🚀 Initialize Trade Signal Integration (Buy signals with TP levels)
-    trade_signal_integration = await init_trade_signals()
-    logger.info("[TRADE SIGNALS] ✅ Buy signal integration initialized")
+    # CRITICAL: This must succeed for buy signals to work
+    trade_signal_integration = None
+    for attempt in range(3):
+        try:
+            logger.info(f"[TRADE SIGNALS] Initializing buy signal integration (attempt {attempt + 1}/3)...")
+            trade_signal_integration = await init_trade_signals()
+            logger.info("[TRADE SIGNALS] ✅ Buy signal integration initialized successfully!")
+            logger.info(f"[TRADE SIGNALS] Integration object: {trade_signal_integration}")
+            break
+        except Exception as e:
+            logger.error(f"[TRADE SIGNALS] ❌ Failed to initialize (attempt {attempt + 1}/3): {e}", exc_info=True)
+            if attempt < 2:
+                await asyncio.sleep(2)
+    
+    if trade_signal_integration is None:
+        logger.critical("[TRADE SIGNALS] ❌ CRITICAL: Buy signal integration FAILED after 3 attempts!")
+        logger.critical("[TRADE SIGNALS] Scanner will continue but NO BUY SIGNALS will be sent!")
+    else:
+        logger.info("[TRADE SIGNALS] ✅ Ready to process buy signals")
     
     logger.info("Main event loop running. Press Ctrl+C to exit.")
     ingest_task = asyncio.create_task(ingest_polygon_events())
