@@ -21,7 +21,10 @@ from urllib.parse import quote_plus
 
 from trade_signal_manager import TradeSignalManager, OpenPosition
 
+# Respect configurable log level
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger(__name__)
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # =============================================================================
 # Configuration
@@ -63,12 +66,14 @@ class AlertQueue:
         """Add an alert to the queue"""
         async with self._lock:
             self._queue.append(alert)
+            logger.debug("[AlertQueue] Queued alert: %s", alert)
     
     async def pop_all(self) -> List[Dict[str, Any]]:
         """Get and clear all pending alerts"""
         async with self._lock:
             alerts = list(self._queue)
             self._queue.clear()
+            logger.debug("[AlertQueue] Popped %d alerts", len(alerts))
             return alerts
     
     async def length(self) -> int:
@@ -104,6 +109,7 @@ class PriceFeed:
     async def get_price(self, symbol: str) -> Optional[float]:
         """Get current price for a symbol from Polygon with retry/backoff"""
         if not self.api_key or not self.session:
+            logger.debug("[PriceFeed] No API key or session; skipping price fetch for %s", symbol)
             return None
         
         # Be safe with symbol formatting for URL path
@@ -123,38 +129,36 @@ class PriceFeed:
                         p = None
                         if isinstance(results, dict):
                             p = results.get("p")
-                        # Some responses might include a top-level 'price' or other keys
                         if p is None:
                             p = data.get("price") or data.get("last") or data.get("last_trade_price")
                         if p is None:
-                            logger.debug(f"[PriceFeed] No price found for {symbol} in response: {data}")
+                            logger.debug("[PriceFeed] No price found for %s in response: %s", symbol, data)
                             return None
                         try:
                             price = float(p)
                             if price <= 0:
-                                logger.debug(f"[PriceFeed] Non-positive price for {symbol}: {price}")
+                                logger.debug("[PriceFeed] Non-positive price for %s: %s", symbol, price)
                                 return None
+                            logger.debug("[PriceFeed] Fetched price for %s: %s", symbol, price)
                             return price
                         except (TypeError, ValueError):
-                            logger.debug(f"[PriceFeed] Unable to cast price to float for {symbol}: {p}")
+                            logger.debug("[PriceFeed] Unable to cast price to float for %s: %s", symbol, p)
                             return None
                     elif status in (429, 500, 502, 503, 504):
-                        # Retryable server/rate-limit errors
                         text = await resp.text()
-                        logger.debug(f"[PriceFeed] Retryable response {status} for {symbol}: {text}")
+                        logger.debug("[PriceFeed] Retryable response %s for %s: %s", status, symbol, text)
                         if attempt < self._max_retries:
                             await asyncio.sleep(self._backoff_base * (2 ** (attempt - 1)))
                             continue
                         return None
                     else:
-                        # Non-retryable error
                         text = await resp.text()
-                        logger.debug(f"[PriceFeed] Non-200 response for {symbol}: {status} - {text}")
+                        logger.debug("[PriceFeed] Non-200 response for %s: %s - %s", symbol, status, text)
                         return None
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.debug(f"[PriceFeed] Exception fetching price for {symbol} (attempt {attempt}): {e}")
+                logger.debug("[PriceFeed] Exception fetching price for %s (attempt %d): %s", symbol, attempt, e)
                 if attempt < self._max_retries:
                     await asyncio.sleep(self._backoff_base * (2 ** (attempt - 1)))
                     continue
@@ -176,8 +180,7 @@ class PriceFeed:
                 if isinstance(price, (int, float)) and price > 0:
                     results[sym] = float(price)
                 else:
-                    # Keep debug log for missing prices to aid diagnostics
-                    logger.debug(f"[PriceFeed] No valid price for {sym}: {price}")
+                    logger.debug("[PriceFeed] No valid price for %s: %s", sym, price)
         
         return results
 
@@ -211,13 +214,11 @@ class TradeSignalIntegration:
             
             logger.info("[Integration] Starting trade signal integration...")
             
-            # Create HTTP session with sensible defaults (connection limit + timeouts)
             connector = aiohttp.TCPConnector(limit=30)
             timeout = aiohttp.ClientTimeout(total=10)
             self.http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
             
             try:
-                # Initialize trade manager
                 self.trade_manager = TradeSignalManager(
                     telegram_token=TELEGRAM_BOT_TOKEN,
                     telegram_chat_id=TELEGRAM_CHAT_ID,
@@ -227,7 +228,6 @@ class TradeSignalIntegration:
                 )
                 await self.trade_manager.initialize()
                 
-                # Initialize price feed
                 self.price_feed = PriceFeed(self.http_session)
                 
                 self._running = True
@@ -238,7 +238,6 @@ class TradeSignalIntegration:
                 
                 logger.info("[Integration] Trade signal integration started")
             except Exception:
-                # Ensure we close the session on failure to avoid resource leaks
                 if self.http_session:
                     try:
                         await self.http_session.close()
@@ -285,7 +284,10 @@ class TradeSignalIntegration:
             try:
                 alerts = await alert_queue.pop_all()
                 
+                if alerts:
+                    logger.debug("[Integration] Processing %d alerts", len(alerts))
                 for alert in alerts:
+                    logger.debug("[Integration] _process_alert incoming: %s", alert)
                     await self._process_alert(alert)
                 
                 await asyncio.sleep(0.5)  # Check every 500ms
@@ -293,7 +295,7 @@ class TradeSignalIntegration:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[Integration] Alert processor error: {e}", exc_info=True)
+                logger.error("[Integration] Alert processor error: %s", e, exc_info=True)
                 await asyncio.sleep(1)
     
     async def _process_alert(self, alert: Dict[str, Any]):
@@ -320,7 +322,7 @@ class TradeSignalIntegration:
             
             # Validate inputs (avoid rejecting valid price 0.0)
             if not symbol or price is None:
-                logger.warning(f"[Integration] Invalid alert (missing symbol or price): {alert}")
+                logger.warning("[Integration] Invalid alert (missing symbol or price): %s", alert)
                 return
             
             if not self.trade_manager:
@@ -328,6 +330,7 @@ class TradeSignalIntegration:
                 return
             
             # Pass to trade manager with all key levels
+            logger.debug("[Integration] forwarding alert to trade_manager.handle_alert: %s %s", symbol, price)
             position = await self.trade_manager.handle_alert(
                 symbol=symbol,
                 price=price,
@@ -348,10 +351,10 @@ class TradeSignalIntegration:
             )
             
             if position:
-                logger.info(f"[Integration] Created position for {symbol}")
+                logger.info("[Integration] Created position for %s", symbol)
             
         except Exception as e:
-            logger.error(f"[Integration] Error processing alert: {e}", exc_info=True)
+            logger.error("[Integration] Error processing alert: %s", e, exc_info=True)
     
     async def _price_monitor_loop(self):
         """Monitor prices for open positions"""
@@ -371,8 +374,8 @@ class TradeSignalIntegration:
                         closed_list = await self.trade_manager.update_price(symbol, price)
                         for closed in closed_list:
                             logger.info(
-                                f"[Integration] Position closed: {symbol} | "
-                                f"P/L: {closed.pnl_pct:+.1f}% | Reason: {closed.exit_reason}"
+                                "[Integration] Position closed: %s | P/L: %+.1f%% | Reason: %s",
+                                symbol, closed.pnl_pct, closed.exit_reason
                             )
                 
                 await asyncio.sleep(PRICE_CHECK_INTERVAL)
@@ -380,7 +383,7 @@ class TradeSignalIntegration:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[Integration] Price monitor error: {e}", exc_info=True)
+                logger.error("[Integration] Price monitor error: %s", e, exc_info=True)
                 await asyncio.sleep(5)
     
     # =========================================================================
@@ -401,6 +404,7 @@ class TradeSignalIntegration:
         Direct method to process a scanner alert.
         Call this from your scanner wrapper instead of using the queue.
         """
+        logger.debug("[Integration] on_scanner_alert called: %s %s", symbol, price)
         if not self.trade_manager:
             logger.error("[Integration] Trade manager not initialized")
             return None
@@ -486,6 +490,7 @@ async def queue_alert(
         from trade_signal_integration import queue_alert
         await queue_alert(symbol=symbol, price=price, rvol=rvol, alert_type="Volume Spike", ml_score=score)
     """
+    logger.debug("[Integration] queue_alert called: %s %s", symbol, price)
     await alert_queue.push({
         'symbol': symbol,
         'price': price,
