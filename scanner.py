@@ -110,6 +110,17 @@ last_trade_price = defaultdict(lambda: None)
 last_trade_volume = defaultdict(lambda: 0)
 last_trade_time = defaultdict(lambda: None)
 
+# 🚨 RAW TRADE DATA: Always updated unconditionally from trade ticks (no eligibility filter)
+# Used by on_new_candle() for accurate price data regardless of eligibility state
+# Fixes VMAR-type missed alerts where stale price prevented alerts on runners
+raw_last_trade_price = defaultdict(lambda: None)
+raw_last_trade_volume = defaultdict(lambda: 0)
+raw_last_trade_time = defaultdict(lambda: None)
+
+# 🚨 ELIGIBILITY STATE CACHE: Track eligibility separately from price data
+# {symbol: {'eligible': bool, 'reason': str, 'last_checked': datetime, 'float_shares': float}}
+eligibility_state = defaultdict(lambda: {'eligible': None, 'reason': None, 'last_checked': None, 'float_shares': None})
+
 # 🎯 GRANDFATHERING: Track entry price when stock first becomes eligible
 # Once eligible, keep monitoring even if price runs past $15 threshold
 entry_price = defaultdict(lambda: None)
@@ -609,6 +620,87 @@ def is_eligible(symbol, last_price, float_shares, use_entry_price=False):
         )
 
     return True
+
+
+async def update_and_get_eligibility(symbol, price, float_shares=None):
+    """Two-track eligibility helper: updates cache and returns eligibility status.
+    
+    This decouples raw price tracking from eligibility filtering:
+    - Raw price data (raw_last_trade_price) is ALWAYS updated from trade ticks
+    - Eligibility is evaluated separately and cached here
+    - Alerts use raw price data but are gated by eligibility status
+    
+    Args:
+        symbol: Stock ticker
+        price: Current price (for filter checks)
+        float_shares: Float shares (optional, will fetch if None)
+    
+    Returns:
+        dict: {'eligible': bool, 'reason': str, 'float_shares': float}
+    """
+    now = datetime.now(timezone.utc)
+    state = eligibility_state[symbol]
+    
+    # Get float shares if not provided (reuse cached value if recent)
+    if float_shares is None:
+        if state['float_shares'] is not None and state['last_checked'] is not None:
+            # Reuse cached float if checked within last 5 minutes
+            cache_age = (now - state['last_checked']).total_seconds()
+            if cache_age < 300:
+                float_shares = state['float_shares']
+        
+        if float_shares is None:
+            # Need to fetch float data
+            float_shares = await get_float_shares(symbol)
+    
+    # Check eligibility
+    eligible = is_eligible(symbol, price, float_shares)
+    
+    # Determine reason if not eligible
+    reason = None
+    if not eligible:
+        if price is None:
+            reason = "price_none"
+        elif price < MIN_PRICE_THRESHOLD:
+            reason = f"price_too_low (${price:.4f})"
+        elif price > PRICE_THRESHOLD:
+            reason = f"price_too_high (${price:.2f})"
+        elif is_etf(symbol) or is_warrant(symbol):
+            reason = "etf_or_warrant"
+        elif ticker_type_cache.get(symbol) in ['ETF', 'ETN', 'WARRANT', 'FUND', 'UNIT', 'SP']:
+            reason = f"polygon_type_{ticker_type_cache.get(symbol)}"
+        elif float_shares is not None and not (MIN_FLOAT_SHARES <= float_shares <= MAX_FLOAT_SHARES):
+            reason = f"float_out_of_range ({float_shares/1e6:.1f}M)"
+        else:
+            reason = "unknown"
+    
+    # Update cache
+    eligibility_state[symbol] = {
+        'eligible': eligible,
+        'reason': reason,
+        'last_checked': now,
+        'float_shares': float_shares
+    }
+    
+    return eligibility_state[symbol]
+
+
+def get_cached_eligibility(symbol, max_age_seconds=60):
+    """Get cached eligibility without async call (for fast-path checks).
+    
+    Returns:
+        dict or None: Cached state if fresh enough, None if stale/missing
+    """
+    state = eligibility_state[symbol]
+    if state['eligible'] is None or state['last_checked'] is None:
+        return None
+    
+    now = datetime.now(timezone.utc)
+    cache_age = (now - state['last_checked']).total_seconds()
+    if cache_age > max_age_seconds:
+        return None
+    
+    return state
 
 
 # --- Time-of-Day Volume Profile for RVOL Spike Alerts ---
@@ -1124,8 +1216,8 @@ def get_valid_vwap(symbol, allow_fallback=False):
         return None
 
     # 🚨 CRITICAL VALIDATION: Ensure all candle data is valid before VWAP calculation
-    candles = vwap_candles[symbol]
-    for i, candle in enumerate(candles):
+    symbol_vwap_candles = vwap_candles[symbol]  # Don't shadow global 'candles'
+    for i, candle in enumerate(symbol_vwap_candles):
         # Validate required fields exist and are positive
         required_fields = ['high', 'low', 'close', 'volume']
         for field in required_fields:
@@ -2170,9 +2262,14 @@ def get_display_price(symbol, fallback, fallback_time=None, max_age_seconds=MAX_
     
     CRITICAL: Always validates fallback (candle close) against last_trade_price to detect 
     corrupted candles. If candle close deviates >10% from last trade, uses last trade instead.
+    
+    🚨 FIX: Uses raw_last_trade_price which is always updated from T.* events,
+    even when eligibility filters would normally block updates to last_trade_price.
+    This ensures accurate price data for alerts on all stocks.
     """
-    trade_price = last_trade_price.get(symbol)
-    trade_time = last_trade_time.get(symbol)
+    # 🚨 FIX: Use raw prices which are always updated (regardless of eligibility)
+    trade_price = raw_last_trade_price.get(symbol)
+    trade_time = raw_last_trade_time.get(symbol)
     now = datetime.now(timezone.utc)
     
     # 🚨 OUTLIER DETECTION: Validate fallback (candle close) against last trade price
@@ -2521,6 +2618,11 @@ def enforce_symbol_limit(symbol):
         last_trade_price.pop(lru_symbol, None)
         last_trade_volume.pop(lru_symbol, None)
         last_trade_time.pop(lru_symbol, None)
+        # 🚨 TWO-TRACK: Also evict raw price caches and eligibility state
+        raw_last_trade_price.pop(lru_symbol, None)
+        raw_last_trade_volume.pop(lru_symbol, None)
+        raw_last_trade_time.pop(lru_symbol, None)
+        eligibility_state.pop(lru_symbol, None)
         entry_price.pop(lru_symbol, None)
         rvol_history.pop(lru_symbol, None)
         local_candle_builder.pop(lru_symbol, None)
@@ -2555,6 +2657,19 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
     # If ticker type not in cache, fetch it in background - future checks will be instant
     if symbol not in ticker_type_cache:
         safe_create_task(get_ticker_type(symbol))  # 🔒 Use safe_create_task (guarded)
+    
+    # 🚨 TWO-TRACK ELIGIBILITY: Use raw price data but gate alerts by eligibility status
+    # Get the freshest price from raw_last_trade_price (always updated from T.* events)
+    # This fixes VMAR-type missed alerts where eligibility filter blocked price updates
+    current_raw_price = raw_last_trade_price.get(symbol) or close
+    
+    # Check eligibility using the helper (reuses cached float data when possible)
+    eligibility = await update_and_get_eligibility(symbol, current_raw_price)
+    if not eligibility['eligible']:
+        # Log only occasionally to avoid spam
+        if hash(symbol) % 100 == 0:
+            logger.debug(f"[ON_NEW_CANDLE SKIP] {symbol} not eligible: {eligibility['reason']}")
+        return  # Skip alert processing for ineligible stocks
 
     # Only reset state once per day at 04:00 ET (not on every calendar day change)
     if current_session_date != today_ny:
@@ -3199,8 +3314,10 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
         vwap_value = vwap_candles_numpy(vwap_candles[symbol])
     
     vwap_str = f"{vwap_value:.4f}" if vwap_value is not None else "N/A (calculating)"
+    # 🚨 FIX: Use raw_last_trade_price for accurate price display (always updated from T.* events)
+    raw_price = raw_last_trade_price.get(symbol)
     logger.info(
-        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_str} | Last Trade={last_trade_price.get(symbol)} | Candle Close={close} | Candle Volume={volume}"
+        f"[ALERT DEBUG] {symbol} | Alert Type: volume_spike | VWAP={vwap_str} | Raw Trade={raw_price} | Candle Close={close} | Candle Volume={volume}"
     )
     # Use stored EMAs for Volume Spike
     emas = get_stored_emas(symbol, [5, 8, 13])
@@ -3806,6 +3923,13 @@ async def ingest_polygon_events():
                                 if trade_age_seconds > MAX_TRADE_AGE_SECONDS:
                                     logger.debug(f"[STALE TRADE] {symbol} - Trade is {trade_age_seconds:.1f}s old, rejecting (limit: {MAX_TRADE_AGE_SECONDS}s)")
                                     continue
+
+                                # 🚨 TWO-TRACK PRICE PIPELINE: Always update raw prices UNCONDITIONALLY
+                                # This ensures on_new_candle() always has fresh price data regardless of eligibility
+                                # Fixes VMAR-type missed alerts where stale last_trade_price prevented alerts
+                                raw_last_trade_price[symbol] = price
+                                raw_last_trade_volume[symbol] = size
+                                raw_last_trade_time[symbol] = trade_time
 
                                 # 🚨 LOCAL CANDLE AGGREGATION: Build 1-min candles from trades BEFORE eligibility filters
                                 # This ensures we build candles for ALL stocks, then on_new_candle() filters them
