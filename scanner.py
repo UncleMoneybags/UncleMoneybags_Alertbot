@@ -96,12 +96,29 @@ def safe_create_task(coro):
         logger.debug(f"[SAFE_TASK] No running loop to schedule task")
         return None
 
+# 🚀 PERFORMANCE: Reuse timezone object (avoid repeated pytz.timezone calls)
+NY_TZ = pytz.timezone("America/New_York")
+
 # 🚀 PERFORMANCE: Reusable HTTP session (30-50% faster than creating new sessions)
 http_session = None
 
 # 🚀 PERFORMANCE: Thread pool executor for blocking I/O operations (pickle, CSV, JSON)
 # Prevents blocking the event loop during disk writes
 io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="io_worker")
+
+# 🚨 GRACEFUL SHUTDOWN: Flag to signal all tasks to stop
+shutdown_event = None  # Set to asyncio.Event() in main()
+
+
+async def parse_html_async(html):
+    """🚀 PERFORMANCE: Offload BeautifulSoup parsing to thread pool.
+    
+    BeautifulSoup parsing is CPU-bound and blocks the event loop.
+    This wraps it in run_in_executor to keep WebSocket responsive.
+    """
+    from bs4 import BeautifulSoup
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(io_executor, lambda: BeautifulSoup(html, 'html.parser'))
 
 # 🚀 PERFORMANCE: Semaphore to limit concurrent API calls (prevents 429 rate limiting)
 api_semaphore = asyncio.Semaphore(20)  # Max 20 concurrent API requests
@@ -385,8 +402,8 @@ async def get_ticker_type(symbol):
         return None
 
 
-load_float_cache()
-load_ticker_type_cache()
+# 🚨 FIX: Cache loading moved to main() to avoid blocking I/O at import time
+# load_float_cache() and load_ticker_type_cache() are now called after locks are created
 # --- END FLOAT PATCH ---
 
 
@@ -1256,19 +1273,24 @@ def get_valid_vwap(symbol, allow_fallback=False):
         return None
 
     # Verify VWAP is within reasonable range of current prices
-    # 🚨 FIX: Convert deque to list before slicing to prevent "sequence index must be integer, not 'slice'" error
-    candles_list = list(candles) if isinstance(candles, deque) else candles
+    # 🚨 FIX: Use symbol-specific candles deque, not the global candles dict
+    if symbol not in candles or not candles[symbol]:
+        logger.info(f"[VWAP GUARD] {symbol} - No candle history available for price validation")
+        return vwap_val  # Return VWAP anyway, just skip price range validation
+    
+    candles_list = list(candles[symbol])
     recent_prices = [candle['close'] for candle in candles_list[-3:]]
-    min_recent = min(recent_prices)
-    max_recent = max(recent_prices)
-    if not (min_recent * 0.5 <= vwap_val <= max_recent *
-            2.0):  # VWAP should be within 50%-200% of recent prices
-        logger.warning(
-            f"[VWAP WARNING] {symbol} - VWAP {vwap_val:.4f} seems out of range compared to recent prices {min_recent:.4f}-{max_recent:.4f}"
-        )
+    if recent_prices:
+        min_recent = min(recent_prices)
+        max_recent = max(recent_prices)
+        if not (min_recent * 0.5 <= vwap_val <= max_recent *
+                2.0):  # VWAP should be within 50%-200% of recent prices
+            logger.warning(
+                f"[VWAP WARNING] {symbol} - VWAP {vwap_val:.4f} seems out of range compared to recent prices {min_recent:.4f}-{max_recent:.4f}"
+            )
 
     logger.info(
-        f"[VWAP VALIDATED] {symbol} - VWAP={vwap_val:.4f} from {len(candles)} candles"
+        f"[VWAP VALIDATED] {symbol} - VWAP={vwap_val:.4f} from {len(symbol_vwap_candles)} candles"
     )
     return vwap_val
 
@@ -1337,29 +1359,30 @@ def polygon_time_to_utc(ts):
     """🚨 CRITICAL FIX: Auto-detect timestamp scale with CORRECT thresholds
     
     Real 2024-2025 timestamps:
-    - seconds ~ 1e9 (10 digits)
-    - milliseconds ~ 1e12 (13 digits)  
-    - microseconds ~ 1e15 (16 digits)
-    - nanoseconds ~ 1e18 (19 digits)
+    - seconds ~ 10**9 (10 digits)
+    - milliseconds ~ 10**12 (13 digits)  
+    - microseconds ~ 10**15 (16 digits)
+    - nanoseconds ~ 10**18 (19 digits)
     
     Wrong thresholds caused candle boundaries off, VWAP miscalculations, stale timestamps.
+    🚨 FIX: Use integer thresholds (10**18) instead of float (1e18) to avoid precision issues.
     """
     try:
         ts = int(ts) if not isinstance(ts, int) else ts
     except Exception:  # 🚨 FIX: Never use bare except
         raise ValueError(f"Invalid timestamp: {ts}")
     
-    # Auto-detect scale based on magnitude (correct thresholds)
-    if ts >= 1e18:  # 🚨 FIXED: 19+ digits = nanoseconds (was >1e14)
-        return datetime.fromtimestamp(ts / 1_000_000_000, tz=timezone.utc)
-    elif ts >= 1e15:  # 16+ digits = microseconds (was >1e14)
-        return datetime.fromtimestamp(ts / 1_000_000, tz=timezone.utc)
-    elif ts >= 1e12:  # 13 digits = milliseconds (was >1e11)
-        return datetime.fromtimestamp(ts / 1_000, tz=timezone.utc)
-    elif ts >= 1e9:  # 10 digits = seconds (was >1e9)
+    # Auto-detect scale based on magnitude (integer thresholds for precision)
+    if ts >= 10**18:  # 🚨 FIXED: 19+ digits = nanoseconds (integer threshold)
+        return datetime.fromtimestamp(ts // 1_000_000_000, tz=timezone.utc) + timedelta(microseconds=(ts % 1_000_000_000) // 1000)
+    elif ts >= 10**15:  # 16+ digits = microseconds
+        return datetime.fromtimestamp(ts // 1_000_000, tz=timezone.utc) + timedelta(microseconds=ts % 1_000_000)
+    elif ts >= 10**12:  # 13 digits = milliseconds
+        return datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+    elif ts >= 10**9:  # 10 digits = seconds
         return datetime.fromtimestamp(ts, tz=timezone.utc)
     else:  # Fallback to milliseconds for anything smaller
-        return datetime.fromtimestamp(ts / 1_000, tz=timezone.utc)
+        return datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
 
 
 logging.basicConfig(level=logging.INFO,
@@ -3090,12 +3113,14 @@ async def on_new_candle(symbol, open_, high, low, close, volume, start_time):
                     f"Current Price: ${price_str} (+{price_move_rn*100:.1f}%)")
 
                 # Add to pending alerts instead of sending immediately
+                # 🚨 FIX: Use calculated rvol from alert_data, not undefined rvol_rn
+                rvol_runner = alert_data.get('rvol', 2.0)
                 pending_alerts[symbol].append({
                     'type': 'runner',
                     'score': score,
                     'message': alert_text,
                     'price': alert_price,
-                    'rvol': rvol_rn if 'rvol_rn' in dir() else 2.0
+                    'rvol': rvol_runner
                 })
 
                 # Send the best alert for this symbol
@@ -4095,6 +4120,11 @@ async def ingest_polygon_events():
                                 last_trade_price[symbol] = price
                                 last_trade_volume[symbol] = size
                                 last_trade_time[symbol] = trade_time  # Use Polygon's timestamp, not now()
+                                
+                                # 🚨 FIX: Update LRU access time so trade activity keeps symbols from eviction
+                                # (Copilot review: symbols with trades but no candles weren't getting LRU updates)
+                                symbol_last_access[symbol] = datetime.now(timezone.utc)
+                                
                                 logger.debug(
                                     f"[TRADE EVENT] {symbol} | Price={price} | Size={size} | Time={trade_time} | Age={trade_age_seconds:.1f}s"
                                 )
@@ -4502,14 +4532,13 @@ async def check_nasdaq_halt_status(symbol):
     """Check if stock is currently listed on NASDAQ halt page.
     Returns True if stock is STILL HALTED, False if resumed/not found.
     """
-    from bs4 import BeautifulSoup
-    
     try:
         async with http_session.get("https://www.nasdaqtrader.com/trader.aspx?id=tradehalts", 
                                      timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status == 200:
                 html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
+                # 🚀 FIX: Offload BeautifulSoup to thread pool (CPU-bound)
+                soup = await parse_html_async(html)
                 table = soup.find('table', {'id': 'Trading_Halts'})
                 
                 if table:
@@ -4536,8 +4565,6 @@ async def verify_halt_on_nasdaq(symbol, halt_time_str):
     
     🚀 PERFORMANCE: Reuses global http_session instead of creating new session.
     """
-    from bs4 import BeautifulSoup
-    
     try:
         logger.info(f"[HALT VERIFY] Waiting 10s to verify {symbol} halt at {halt_time_str}...")
         await asyncio.sleep(10)  # Wait 10 seconds
@@ -4547,7 +4574,8 @@ async def verify_halt_on_nasdaq(symbol, halt_time_str):
                                      timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status == 200:
                 html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
+                # 🚀 FIX: Offload BeautifulSoup to thread pool (CPU-bound)
+                soup = await parse_html_async(html)
                 table = soup.find('table', {'id': 'Trading_Halts'})
                 
                 if table:
@@ -4862,8 +4890,8 @@ async def nasdaq_halt_monitor():
                         html = await response.text()
                         
                         # Parse halt data (NASDAQ uses table format)
-                        from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(html, 'html.parser')
+                        # 🚀 FIX: Offload BeautifulSoup to thread pool (CPU-bound)
+                        soup = await parse_html_async(html)
                         
                         # 🔍 DEBUG: Log NASDAQ scrape status
                         table = soup.find('table', {'id': 'Trading_Halts'})
@@ -5227,9 +5255,30 @@ async def main():
     vwap_lock = asyncio.Lock()  # 🚨 FIX: Lock for VWAP cumulative sum writes
     logger.info("[STARTUP] ✅ Async locks initialized\n")
     
+    # 🚨 FIX: Load caches AFTER locks are created (moved from module level)
+    # This avoids blocking I/O at import time and ensures locks exist
+    load_float_cache()
+    load_ticker_type_cache()
+    logger.info("[STARTUP] ✅ Caches loaded from disk\n")
+    
     # 🚨 Register atexit cleanup AFTER executor/session are defined
     atexit.register(cleanup_resources)
     logger.info("[STARTUP] ✅ Cleanup handlers registered\n")
+    
+    # 🚨 FIX: Add signal handlers for graceful async shutdown (SIGINT/SIGTERM)
+    # This allows proper cleanup of aiohttp sessions and executor on Ctrl+C or kill
+    global shutdown_event
+    shutdown_event = asyncio.Event()
+    
+    def signal_handler(sig, frame):
+        """Handle shutdown signals by setting the shutdown event."""
+        logger.info(f"[SHUTDOWN] Received signal {sig}, initiating graceful shutdown...")
+        shutdown_event.set()
+    
+    import signal
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    logger.info("[STARTUP] ✅ Signal handlers registered (SIGINT/SIGTERM)\n")
     
     # ✅ STARTUP: Check critical dependencies
     logger.info("[STARTUP] Checking dependencies...")
